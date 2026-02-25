@@ -9,16 +9,6 @@ Usage:
     python detect_hacks.py --nvidia_archive NvidiaArchive/
     python detect_hacks.py --jsonl /path/to/pairs.jsonl
     python detect_hacks.py --nvidia_archive NvidiaArchive/ --jsonl /path/to/pairs.jsonl
-
-VERSION: v1_pre_fpr — After adding review-discovered patterns (12-15), before
-false-positive analysis fixes. This is the archived state right before
-scope-aware _scaled_mm, alias regex fix, HARDCODED_SHAPES severity calibration,
-and C++ cache/multistream detection were added.
-
-Results at this version:
-  NvidiaArchive: 187 definitely_hacked, 65 suspicious, 12 unclassified, 216 filtered
-  JSONL: 5,736 filtered, 38,818 kept
-  Known false positives: gau.nernst 37/249 filtered, guaguabear 30/50 filtered
 """
 
 import argparse
@@ -58,7 +48,7 @@ RE_SYS_MODULES_MAIN = re.compile(r'sys\.modules\s*[\.\[]\s*[\'"]__main__[\'"]')
 
 # Pattern 4: torch._scaled_mm reference
 RE_SCALED_MM_PYTHON = re.compile(r'torch\._scaled_mm\s*\(')
-RE_SCALED_MM_ALIAS = re.compile(r'=\s*torch\._scaled_mm\b')  # _mm = torch._scaled_mm
+RE_SCALED_MM_ALIAS = re.compile(r'=\s*torch\._scaled_mm\s*(?!\()$', re.MULTILINE)  # _mm = torch._scaled_mm (not a call)
 RE_SCALED_MM_CPP = re.compile(r'aten::_scaled_mm')
 RE_SCALED_MM_SCHEMA = re.compile(r'findSchemaOrThrow\s*\(\s*["\']aten::_scaled_mm')
 RE_SCALED_MM_ANY = re.compile(r'_scaled_mm')
@@ -75,12 +65,14 @@ RE_PREPROCESS_CACHE = re.compile(r'_PREPROCESS_CACHE')
 RE_RESULT_REUSE = re.compile(r'_result_reuse')
 RE_SCALE_CACHE = re.compile(r'_scale_cache')
 RE_OUTPUT_CACHE = re.compile(r'_OUTPUT_CACHE')
+RE_RESULT_CACHE_GENERAL = re.compile(r'_(?:RESULT|GROUPED_RESULT|COMPUTE|GEMM)_CACHE')
 RE_ID_DATA_CACHE = re.compile(r'id\s*\(\s*data\s*\)')
 RE_DATA_PTR_CACHE_KEY = re.compile(
     r'(?:int\s*\(\s*\w+\.data_ptr\s*\(\)\s*\))|'
     r'(?:\.data_ptr\s*\(\)\s*[,\)].*?(?:cache|key|dict|hash))',
     re.IGNORECASE,
 )
+RE_VERSION_CACHE = re.compile(r'\._version\b')
 
 # Pattern 7: CUDA graph replay
 RE_CTYPES_LIBCUDART = re.compile(r'ctypes\.CDLL\s*\(\s*["\']libcudart')
@@ -227,14 +219,47 @@ def detect_evaluator_exploit(code: str) -> list[dict]:
 def detect_scaled_mm_ref(code: str) -> list[dict]:
     """Pattern 4: Using torch._scaled_mm as primary compute.
 
-    NOTE: This version is NOT scope-aware. It flags _scaled_mm anywhere
-    in the file, including reference functions before custom_kernel.
+    Scope-aware: if the file has a `def custom_kernel` function and
+    `_scaled_mm` only appears BEFORE that function, it's likely a
+    reference implementation (not the submission's compute path) and
+    should not be flagged.
     """
     matches = []
-    has_python = bool(RE_SCALED_MM_PYTHON.search(code))
-    has_alias = bool(RE_SCALED_MM_ALIAS.search(code))
-    has_cpp = bool(RE_SCALED_MM_CPP.search(code))
-    has_schema = bool(RE_SCALED_MM_SCHEMA.search(code))
+
+    # Find position of custom_kernel definition
+    custom_kernel_match = re.search(r'^def\s+custom_kernel\s*\(', code, re.MULTILINE)
+    custom_kernel_pos = custom_kernel_match.start() if custom_kernel_match else 0
+
+    # For scope-aware check: code from custom_kernel onward
+    # If no custom_kernel found, check entire file (conservative)
+    if custom_kernel_match:
+        # Check if _scaled_mm is used at or after custom_kernel definition,
+        # or if _scaled_mm is aliased to a variable that custom_kernel could
+        # call indirectly.
+        code_from_ck = code[custom_kernel_pos:]
+        code_before_ck = code[:custom_kernel_pos]
+
+        has_python_after = bool(RE_SCALED_MM_PYTHON.search(code_from_ck))
+        has_alias_after = bool(RE_SCALED_MM_ALIAS.search(code_from_ck))
+        # Module-level alias before custom_kernel is callable from it
+        has_alias_before = bool(RE_SCALED_MM_ALIAS.search(code_before_ck))
+        has_cpp = bool(RE_SCALED_MM_CPP.search(code))
+        has_schema = bool(RE_SCALED_MM_SCHEMA.search(code))
+
+        # _scaled_mm only before custom_kernel with no alias → reference function, skip
+        has_python_before = bool(RE_SCALED_MM_PYTHON.search(code_before_ck))
+        if (has_python_before and not has_python_after and
+                not has_alias_before and not has_alias_after and
+                not has_cpp and not has_schema):
+            return []
+
+        has_python = has_python_after
+        has_alias = has_alias_before or has_alias_after
+    else:
+        has_python = bool(RE_SCALED_MM_PYTHON.search(code))
+        has_alias = bool(RE_SCALED_MM_ALIAS.search(code))
+        has_cpp = bool(RE_SCALED_MM_CPP.search(code))
+        has_schema = bool(RE_SCALED_MM_SCHEMA.search(code))
 
     if has_python or has_alias or has_cpp or has_schema:
         evidence_parts = []
@@ -279,8 +304,8 @@ def detect_decode_mm_ref(code: str) -> list[dict]:
 def detect_result_caching(code: str) -> list[dict]:
     """Pattern 6: Result/output caching by tensor pointer or id.
 
-    NOTE: This version only checks Python code. Does NOT check C++ inline
-    code for thread_local Cache structs.
+    Checks Python code for dict/WeakValueDictionary caches. Also checks
+    C++ inline code for thread_local Cache structs keyed by data_ptr().
     """
     python_only = strip_cpp_cuda_blocks(code)
     matches = []
@@ -298,10 +323,33 @@ def detect_result_caching(code: str) -> list[dict]:
         cache_signals.append("_scale_cache")
     if RE_OUTPUT_CACHE.search(python_only):
         cache_signals.append("_OUTPUT_CACHE")
+    if RE_RESULT_CACHE_GENERAL.search(python_only):
+        cache_signals.append("_RESULT/_GROUPED_RESULT/_COMPUTE/_GEMM_CACHE")
+    if RE_VERSION_CACHE.search(python_only):
+        cache_signals.append("tensor._version cache check")
     if RE_ID_DATA_CACHE.search(python_only):
         cache_signals.append("id(data) cache key")
     if RE_DATA_PTR_CACHE_KEY.search(python_only):
         cache_signals.append("data_ptr() cache key")
+
+    # C++ thread_local cache keyed by data_ptr (e.g., lastA = A.data_ptr())
+    cpp_thread_local_cache = re.findall(
+        r'thread_local\s+(?:\w+\s+)?(?:cache|Cache)\b',
+        code,
+    )
+    cpp_last_ptr_store = re.findall(
+        r'(?:cache\.last|cache\.prev|lastA|lastB|prevA|prevB)\w*\s*(?:\[.*?\])?\s*=\s*.*?'
+        r'(?:data_ptr|\.ptr\b)',
+        code,
+    )
+    cpp_data_ptr_compare = re.findall(
+        r'(?:cache\.last|cache\.prev|lastA|lastB)\w*\s*(?:\[.*?\])?\s*!='
+        r'|'
+        r'(?:uint64_t|uintptr_t)\s+\w+p?\s*=\s*\((?:uint64_t|uintptr_t)\)\s*\w+\.data_ptr',
+        code,
+    )
+    if cpp_thread_local_cache and (cpp_last_ptr_store or cpp_data_ptr_compare):
+        cache_signals.append("C++ thread_local cache keyed by data_ptr()")
 
     if cache_signals:
         matches.append({
@@ -413,13 +461,13 @@ def detect_cuda_graph_python(code: str) -> list[dict]:
 def detect_hardcoded_shapes(code: str) -> list[dict]:
     """Pattern 13: Hardcoded benchmark shapes in KERNEL_CONFIGS or shape-gated branches.
 
-    NOTE: This version always assigns severity=medium and does NOT check
-    C++ inline code for shape gating or macro dispatch.
+    Checks both Python and C++ inline code, including macro-based dispatch.
     """
     python_only = strip_cpp_cuda_blocks(code)
     matches = []
     signals = []
 
+    # Python checks
     has_configs = bool(RE_KERNEL_CONFIGS_DICT.search(python_only))
     shape_tuples = RE_SHAPE_TUPLE_KEY.findall(python_only)
     has_shape_gate = bool(RE_SHAPE_IF_GATE.search(python_only))
@@ -427,12 +475,53 @@ def detect_hardcoded_shapes(code: str) -> list[dict]:
     if has_configs and len(shape_tuples) >= 3:
         signals.append(f"KERNEL_CONFIGS dict with {len(shape_tuples)} shape keys")
     if has_shape_gate and len(shape_tuples) >= 3:
-        signals.append(f"Shape-gated branches ({len(shape_tuples)} shape tuples)")
+        signals.append(f"Python shape-gated branches ({len(shape_tuples)} shape tuples)")
+
+    # Python shape-gated if statements: `if m == 256 and n == 4096` or `if self.m == 256 and self.n == 4096`
+    py_shape_ifs = re.findall(
+        r'if\s+(?:self\.)?[a-zA-Z_]\w*\s*==\s*\d{3,5}\s+and\s+(?:self\.)?[a-zA-Z_]\w*\s*==\s*\d{3,5}',
+        python_only,
+    )
+    if len(py_shape_ifs) >= 2:
+        signals.append(f"Python shape-gated if-statements ({len(py_shape_ifs)} branches)")
+
+    # C++ checks: `if (K == 7168)` or `if (G==8 && N0==7168 && K0==2048)`
+    cpp_shape_ifs = re.findall(
+        r'if\s*\([^)]*(?:M|N|K|L|G|N0|K0|L0|M0)\s*==\s*\d{3,5}[^)]*\)',
+        code,
+    )
+    if len(cpp_shape_ifs) >= 2:
+        signals.append(f"C++ shape-gated dispatch ({len(cpp_shape_ifs)} branches)")
+
+    # C++ macro-based shape dispatch: LAUNCH(7168, ...) or similar
+    macro_shape_dispatch = re.findall(
+        r'(?:LAUNCH|DISPATCH|KERNEL_CASE|SPECIALIZE)\s*\(\s*\d{3,5}',
+        code,
+    )
+    if len(macro_shape_dispatch) >= 3:
+        signals.append(f"C++ macro-based shape dispatch ({len(macro_shape_dispatch)} calls)")
+
+    # Shape-conditional Python parameter tuning: if m == 256, if self.m == 512
+    py_single_shape_checks = re.findall(
+        r'(?:self\.)?(?:m|n|k|M|N|K)\s*==\s*\d{3,5}',
+        python_only,
+    )
+    if len(py_single_shape_checks) >= 3:
+        signals.append(f"Python shape dimension checks ({len(py_single_shape_checks)})")
+    elif len(py_single_shape_checks) >= 2 and py_shape_ifs:
+        signals.append(f"Python shape dimension checks ({len(py_single_shape_checks)} + {len(py_shape_ifs)} combined)")
 
     if signals:
+        # Shape specialization alone is weak signal (many legitimate kernels
+        # have shape-dependent tuning). Only upgrade to medium if there are
+        # strong indicators like KERNEL_CONFIGS dict in Python (not C++
+        # macro dispatch, which is standard kernel config tuning).
+        severity = "low"
+        if has_configs and len(shape_tuples) >= 3:
+            severity = "medium"
         matches.append({
             "pattern": "HARDCODED_SHAPES",
-            "severity": "medium",
+            "severity": severity,
             "evidence": "; ".join(signals),
         })
     return matches
@@ -441,21 +530,36 @@ def detect_hardcoded_shapes(code: str) -> list[dict]:
 def detect_unsync_multistream(code: str) -> list[dict]:
     """Pattern 14: Unsynchronized multi-stream dispatch to exploit timing.
 
-    NOTE: This version only checks Python code, NOT C++ inline code.
+    Checks both Python code AND C++ inline code, since getStreamFromPool
+    is often called from C++/CUDA inline sources.
     """
-    python_only = strip_cpp_cuda_blocks(code)
     matches = []
 
-    stream_creates = RE_GET_STREAM_FROM_POOL.findall(python_only)
-    sync_calls = RE_NO_SYNC_STREAM.findall(python_only)
+    # Check Python code
+    python_only = strip_cpp_cuda_blocks(code)
+    py_stream_creates = RE_GET_STREAM_FROM_POOL.findall(python_only)
+    py_sync_calls = RE_NO_SYNC_STREAM.findall(python_only)
 
-    # Multiple stream creations with fewer syncs suggests timing exploit
-    if len(stream_creates) >= 2 and len(sync_calls) < len(stream_creates):
+    if len(py_stream_creates) >= 2 and len(py_sync_calls) < len(py_stream_creates):
         matches.append({
             "pattern": "UNSYNC_MULTISTREAM",
             "severity": "high",
-            "evidence": f"{len(stream_creates)} stream creates, {len(sync_calls)} syncs — likely unsynchronized dispatch",
+            "evidence": f"Python: {len(py_stream_creates)} stream creates, {len(py_sync_calls)} syncs",
         })
+
+    # Also check C++ inline code for getStreamFromPool (c10::cuda::getStreamFromPool)
+    cpp_stream_pattern = re.compile(r'getStreamFromPool\s*\(')
+    cpp_sync_pattern = re.compile(r'(?:synchronize|cudaStreamSynchronize|cudaDeviceSynchronize)\s*\(')
+    cpp_stream_creates = cpp_stream_pattern.findall(code)
+    cpp_sync_calls = cpp_sync_pattern.findall(code)
+
+    if len(cpp_stream_creates) >= 2 and len(cpp_sync_calls) < len(cpp_stream_creates):
+        if not matches:  # Don't double-count
+            matches.append({
+                "pattern": "UNSYNC_MULTISTREAM",
+                "severity": "high",
+                "evidence": f"C++: {len(cpp_stream_creates)} getStreamFromPool calls, {len(cpp_sync_calls)} syncs — unsynchronized dispatch",
+            })
     return matches
 
 
