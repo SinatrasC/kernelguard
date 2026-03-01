@@ -1357,8 +1357,12 @@ def scan_jsonl(jsonl_path: str, results_path: str, cleaned_path: str, summary_pa
                 p["field"] = "baseline_code"
                 all_patterns.append(p)
 
-            classification, should_filter = classify(all_patterns)
-            reason = filter_reason(all_patterns) if should_filter else None
+            # Classification label uses all patterns; should_filter driven by improved_code only.
+            # baseline_code may carry forward old reference code that improved_code has since replaced.
+            classification, _ = classify(all_patterns)
+            improved_only = [p for p in all_patterns if p.get("field") == "improved_code"]
+            _, should_filter = classify(improved_only)
+            reason = filter_reason(improved_only) if should_filter else None
 
             result = {
                 "id": entry_id,
@@ -1414,8 +1418,10 @@ def scan_jsonl(jsonl_path: str, results_path: str, cleaned_path: str, summary_pa
             })
         if extra_patterns:
             r["matched_patterns"].extend(extra_patterns)
-            r["classification"], r["should_filter"] = classify(r["matched_patterns"])
-            r["filter_reason"] = filter_reason(r["matched_patterns"]) if r["should_filter"] else None
+            r["classification"], _ = classify(r["matched_patterns"])
+            _imp_only = [p for p in r["matched_patterns"] if p.get("field") == "improved_code"]
+            _, r["should_filter"] = classify(_imp_only)
+            r["filter_reason"] = filter_reason(_imp_only) if r["should_filter"] else None
 
     # Second pass: write results and cleaned JSONL
     print(f"  Writing results...")
