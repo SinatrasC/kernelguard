@@ -44,7 +44,21 @@ RE_RANKED_BENCHMARK_STR = re.compile(r'["\'].*?Ranked\s+Benchmark.*?["\']', re.D
 RE_MAIN_TIME_KERNEL = re.compile(r'main\.time_kernel\s*=')
 RE_MAIN_CLONE_DATA = re.compile(r'main\._clone_data\s*=')
 RE_MAIN_CLEAR_L2 = re.compile(r'main\.clear_l2_cache\s*=')
-RE_SYS_MODULES_MAIN = re.compile(r'sys\.modules\s*[\.\[]\s*[\'"]__main__[\'"]')
+RE_SYS_MODULES_MAIN = re.compile(
+    r'sys\.modules(?:\s*\[\s*[\'"]__main__[\'"]\s*\]|\.get\s*\(\s*[\'"]__main__[\'"]\s*\))',
+)
+RE_MAIN_ALIAS_FROM_GET = re.compile(
+    r'(\w+)\s*=\s*sys\.modules\.get\s*\(\s*[\'"]__main__[\'"]\s*\)',
+)
+RE_MAIN_ALIAS_FROM_INDEX = re.compile(
+    r'(\w+)\s*=\s*sys\.modules\s*\[\s*[\'"]__main__[\'"]\s*\]',
+)
+RE_MAIN_ATTR_PATCH = re.compile(
+    r'(\w+)\.(time_kernel|_clone_data|clear_l2_cache)\s*=',
+)
+RE_MAIN_SETATTR_PATCH = re.compile(
+    r'setattr\s*\(\s*(\w+)\s*,\s*[\'"](time_kernel|_clone_data|clear_l2_cache)[\'"]\s*,',
+)
 
 # Pattern 4: torch._scaled_mm reference
 RE_SCALED_MM_PYTHON = re.compile(r'torch\._scaled_mm\s*\(')
@@ -73,6 +87,22 @@ RE_DATA_PTR_CACHE_KEY = re.compile(
     re.IGNORECASE,
 )
 RE_VERSION_CACHE = re.compile(r'\._version\b')
+RE_CACHE_GET_ASSIGN = re.compile(
+    r'(\w+)\s*=\s*(\w*(?:cache|reuse)\w*)\.get\s*\(',
+    re.IGNORECASE,
+)
+RE_RETURN_CACHE_INDEX = re.compile(
+    r'return\s+\w*(?:cache|reuse)\w*\s*\[',
+    re.IGNORECASE,
+)
+RE_CACHE_STORE_OUTPUT = re.compile(
+    r'\w*(?:cache|reuse)\w*\s*\[[^\]]+\]\s*=\s*(?:result|output|out|c_ref|c)\b',
+    re.IGNORECASE,
+)
+RE_CPP_CACHE_FAST_RETURN = re.compile(
+    r'if\s*\([^)]*(?:cache\.last|cache\.prev|lastA|lastB|prevA|prevB)[^)]*\)\s*(?:\{[^{}]{0,200}?\breturn\b|return\b)',
+    re.DOTALL,
+)
 
 # Pattern 7: CUDA graph replay
 RE_CTYPES_LIBCUDART = re.compile(r'ctypes\.CDLL\s*\(\s*["\']libcudart')
@@ -104,6 +134,7 @@ RE_CUDA_GRAPH_CACHE_KEY = re.compile(
     r'(?:graph|cache|dict).*?data_ptr\s*\(\)',
     re.IGNORECASE | re.DOTALL,
 )
+RE_GRAPH_CACHE_NAME = re.compile(r'\b(?:_graph_cache|graph_cache)\b', re.IGNORECASE)
 
 # Pattern 13: Hardcoded benchmark shapes (KERNEL_CONFIGS gated by exact dimensions)
 RE_KERNEL_CONFIGS_DICT = re.compile(r'KERNEL_CONFIGS\s*=\s*\{')
@@ -115,6 +146,13 @@ RE_SHAPE_IF_GATE = re.compile(
 # Pattern 14: Unsynchronized multi-stream dispatch
 RE_GET_STREAM_FROM_POOL = re.compile(r'getStreamFromPool|get_stream_from_pool|torch\.cuda\.Stream\s*\(')
 RE_NO_SYNC_STREAM = re.compile(r'(?:stream|s)\d*\.synchronize\s*\(\)')
+RE_STREAM_WAIT_EVENT = re.compile(r'\.wait_event\s*\(')
+RE_STREAM_WAIT_STREAM = re.compile(r'\.wait_stream\s*\(')
+RE_TORCH_CUDA_SYNCHRONIZE = re.compile(r'torch\.cuda\.synchronize\s*\(')
+RE_CPP_STREAM_SYNC = re.compile(
+    r'(?:cudaStreamSynchronize|cudaDeviceSynchronize|cudaEventSynchronize|cudaStreamWaitEvent)\s*\(',
+)
+RE_CPP_METHOD_SYNC = re.compile(r'\.(?:synchronize|wait_event|wait_stream)\s*\(')
 
 # Pattern 15: cudaEventDisableTiming
 RE_CUDA_EVENT_DISABLE_TIMING = re.compile(r'cudaEventDisableTiming|disable_timing\s*=\s*True')
@@ -136,6 +174,35 @@ def strip_cpp_cuda_blocks(code: str) -> str:
             return '""""""'  # empty triple-quoted string
         return match.group(0)
     return RE_TRIPLE_QUOTED.sub(replacer, code)
+
+
+def extract_function_block(code: str, func_name: str) -> str:
+    """Best-effort extraction of a Python function block from source text."""
+    lines = code.splitlines()
+    func_re = re.compile(rf'^\s*def\s+{re.escape(func_name)}\s*\(')
+    for i, line in enumerate(lines):
+        if not func_re.match(line):
+            continue
+        base_indent = len(line) - len(line.lstrip())
+        block = [line]
+        for nxt in lines[i + 1:]:
+            stripped = nxt.strip()
+            cur_indent = len(nxt) - len(nxt.lstrip())
+            if stripped and cur_indent <= base_indent and re.match(r'^\s*(def|class)\s+\w+', nxt):
+                break
+            block.append(nxt)
+        return "\n".join(block)
+    return ""
+
+
+def find_main_aliases(code: str) -> set[str]:
+    """Collect local variable aliases bound to sys.modules['__main__']."""
+    aliases = {"main"}
+    for m in RE_MAIN_ALIAS_FROM_GET.finditer(code):
+        aliases.add(m.group(1))
+    for m in RE_MAIN_ALIAS_FROM_INDEX.finditer(code):
+        aliases.add(m.group(1))
+    return aliases
 
 
 # ---------------------------------------------------------------------------
@@ -195,24 +262,35 @@ def detect_print_injection(code: str) -> list[dict]:
 def detect_evaluator_exploit(code: str) -> list[dict]:
     """Pattern 3: Patching evaluator internals (main.time_kernel, etc.)."""
     matches = []
+    seen = set()
+
+    def add_match(evidence: str):
+        if evidence in seen:
+            return
+        seen.add(evidence)
+        matches.append({
+            "pattern": "EVALUATOR_EXPLOIT",
+            "severity": "critical",
+            "evidence": evidence,
+        })
+
     if RE_MAIN_TIME_KERNEL.search(code):
-        matches.append({
-            "pattern": "EVALUATOR_EXPLOIT",
-            "severity": "critical",
-            "evidence": "main.time_kernel patched",
-        })
+        add_match("main.time_kernel patched")
     if RE_MAIN_CLONE_DATA.search(code):
-        matches.append({
-            "pattern": "EVALUATOR_EXPLOIT",
-            "severity": "critical",
-            "evidence": "main._clone_data patched",
-        })
+        add_match("main._clone_data patched")
     if RE_MAIN_CLEAR_L2.search(code):
-        matches.append({
-            "pattern": "EVALUATOR_EXPLOIT",
-            "severity": "critical",
-            "evidence": "main.clear_l2_cache patched",
-        })
+        add_match("main.clear_l2_cache patched")
+
+    aliases = find_main_aliases(code)
+    if RE_SYS_MODULES_MAIN.search(code):
+        for m in RE_MAIN_ATTR_PATCH.finditer(code):
+            obj, attr = m.group(1), m.group(2)
+            if obj in aliases and obj != "main":
+                add_match(f"{obj}.{attr} patched via __main__ alias")
+        for m in RE_MAIN_SETATTR_PATCH.finditer(code):
+            obj, attr = m.group(1), m.group(2)
+            if obj in aliases:
+                add_match(f"setattr({obj}, '{attr}', ...) on __main__ alias")
     return matches
 
 
@@ -282,21 +360,36 @@ def detect_scaled_mm_ref(code: str) -> list[dict]:
 def detect_decode_mm_ref(code: str) -> list[dict]:
     """Pattern 5: FP4 decode + torch.mm/bmm as main compute path."""
     python_only = strip_cpp_cuda_blocks(code)
+    custom_kernel_code = extract_function_block(python_only, "custom_kernel")
     matches = []
 
-    has_mm = bool(RE_TORCH_MM.search(python_only))
-    has_bmm = bool(RE_TORCH_BMM.search(python_only))
+    # Tighten scope: only count mm/bmm/matmul used in submission entrypoint.
+    if not custom_kernel_code:
+        return matches
 
-    if has_mm or has_bmm:
+    has_mm = bool(RE_TORCH_MM.search(custom_kernel_code))
+    has_bmm = bool(RE_TORCH_BMM.search(custom_kernel_code))
+    has_matmul = bool(RE_TORCH_MATMUL.search(custom_kernel_code))
+
+    if has_mm or has_bmm or has_matmul:
         ops = []
         if has_mm:
             ops.append("torch.mm")
         if has_bmm:
             ops.append("torch.bmm")
+        if has_matmul:
+            ops.append("torch.matmul")
+        has_decode_context = bool(
+            re.search(r'\b(?:fp4|decode|sfa|sfb|scale_a|scale_b|to_blocked)\b', python_only, re.IGNORECASE),
+        )
+        severity = "high" if has_decode_context else "medium"
+        evidence = f"{', '.join(ops)} used inside custom_kernel"
+        if not has_decode_context:
+            evidence += " (no explicit FP4 decode context found)"
         matches.append({
             "pattern": "DECODE_MM_REF",
-            "severity": "high",
-            "evidence": f"{', '.join(ops)} used as compute path in Python code",
+            "severity": severity,
+            "evidence": evidence,
         })
     return matches
 
@@ -310,27 +403,46 @@ def detect_result_caching(code: str) -> list[dict]:
     python_only = strip_cpp_cuda_blocks(code)
     matches = []
 
-    cache_signals = []
+    weak_signals = []
+    strong_signals = []
+
     if RE_WEAK_VALUE_DICT.search(python_only):
-        cache_signals.append("WeakValueDictionary")
+        weak_signals.append("WeakValueDictionary")
     if RE_DECODED_CACHE.search(python_only):
-        cache_signals.append("_decoded_cache")
+        weak_signals.append("_decoded_cache")
     if RE_PREPROCESS_CACHE.search(python_only):
-        cache_signals.append("_PREPROCESS_CACHE")
-    if RE_RESULT_REUSE.search(python_only):
-        cache_signals.append("_result_reuse")
+        weak_signals.append("_PREPROCESS_CACHE")
     if RE_SCALE_CACHE.search(python_only):
-        cache_signals.append("_scale_cache")
-    if RE_OUTPUT_CACHE.search(python_only):
-        cache_signals.append("_OUTPUT_CACHE")
+        weak_signals.append("_scale_cache")
     if RE_RESULT_CACHE_GENERAL.search(python_only):
-        cache_signals.append("_RESULT/_GROUPED_RESULT/_COMPUTE/_GEMM_CACHE")
+        weak_signals.append("_RESULT/_GROUPED_RESULT/_COMPUTE/_GEMM_CACHE")
     if RE_VERSION_CACHE.search(python_only):
-        cache_signals.append("tensor._version cache check")
+        weak_signals.append("tensor._version cache check")
+
+    if RE_RESULT_REUSE.search(python_only):
+        strong_signals.append("_result_reuse")
+    if RE_OUTPUT_CACHE.search(python_only):
+        strong_signals.append("_OUTPUT_CACHE")
     if RE_ID_DATA_CACHE.search(python_only):
-        cache_signals.append("id(data) cache key")
+        strong_signals.append("id(data) cache key")
     if RE_DATA_PTR_CACHE_KEY.search(python_only):
-        cache_signals.append("data_ptr() cache key")
+        strong_signals.append("data_ptr() cache key")
+    if RE_RETURN_CACHE_INDEX.search(python_only):
+        strong_signals.append("direct return from cache[...]")
+    if RE_CACHE_STORE_OUTPUT.search(python_only):
+        strong_signals.append("cache[...] stores output/result tensor")
+
+    for var, cache_name in RE_CACHE_GET_ASSIGN.findall(python_only):
+        if re.search(
+            rf'if\s+{re.escape(var)}\s+is\s+not\s+None\s*:[\s\S]{{0,300}}?\breturn\s+{re.escape(var)}\b',
+            python_only,
+        ):
+            strong_signals.append(f"{cache_name}.get(...) then return cached value")
+        elif re.search(
+            rf'if\s+{re.escape(var)}\s*:[\s\S]{{0,300}}?\breturn\s+{re.escape(var)}\b',
+            python_only,
+        ):
+            strong_signals.append(f"{cache_name}.get(...) guarded return")
 
     # C++ thread_local cache keyed by data_ptr (e.g., lastA = A.data_ptr())
     cpp_thread_local_cache = re.findall(
@@ -349,13 +461,25 @@ def detect_result_caching(code: str) -> list[dict]:
         code,
     )
     if cpp_thread_local_cache and (cpp_last_ptr_store or cpp_data_ptr_compare):
-        cache_signals.append("C++ thread_local cache keyed by data_ptr()")
+        if RE_CPP_CACHE_FAST_RETURN.search(code):
+            strong_signals.append("C++ pointer cache fast-return path")
+        else:
+            weak_signals.append("C++ thread_local cache keyed by data_ptr()")
 
-    if cache_signals:
+    strong_signals = list(dict.fromkeys(strong_signals))
+    weak_signals = list(dict.fromkeys(weak_signals))
+
+    if strong_signals or weak_signals:
+        evidence_parts = []
+        severity = "high" if strong_signals else "medium"
+        if strong_signals:
+            evidence_parts.append("Strong cache signals: " + ", ".join(strong_signals))
+        if weak_signals:
+            evidence_parts.append("Weak cache signals: " + ", ".join(weak_signals))
         matches.append({
             "pattern": "RESULT_CACHING",
-            "severity": "high",
-            "evidence": "Cache signals: " + ", ".join(cache_signals),
+            "severity": severity,
+            "evidence": "; ".join(evidence_parts),
         })
     return matches
 
@@ -364,22 +488,39 @@ def detect_cuda_graph_replay(code: str) -> list[dict]:
     """Pattern 7: CUDA graph replay via ctypes libcudart."""
     matches = []
     signals = []
-    if RE_CTYPES_LIBCUDART.search(code):
+    has_ctypes = bool(RE_CTYPES_LIBCUDART.search(code))
+    has_create = bool(RE_CUDA_GRAPH_CREATE.search(code))
+    has_launch = bool(RE_CUDA_GRAPH_LAUNCH.search(code))
+    has_instantiate = bool(RE_CUDA_GRAPH_INSTANTIATE.search(code))
+    has_capture = bool(RE_CUDA_STREAM_CAPTURE.search(code))
+
+    if has_ctypes:
         signals.append("ctypes.CDLL(libcudart)")
-    if RE_CUDA_GRAPH_CREATE.search(code):
+    if has_create:
         signals.append("cudaGraphCreate")
-    if RE_CUDA_GRAPH_LAUNCH.search(code):
+    if has_launch:
         signals.append("cudaGraphLaunch")
-    if RE_CUDA_GRAPH_INSTANTIATE.search(code):
+    if has_instantiate:
         signals.append("cudaGraphInstantiate")
-    if RE_CUDA_STREAM_CAPTURE.search(code):
+    if has_capture:
         signals.append("cudaStreamBeginCapture")
 
     if signals:
+        severity = "medium"
+        reasons = []
+        if has_launch and has_instantiate:
+            severity = "high"
+            reasons.append("instantiate+launch replay path")
+        if has_ctypes and (has_launch or has_instantiate):
+            severity = "high"
+            reasons.append("ctypes graph launch path")
+        evidence = "CUDA graph API: " + ", ".join(signals)
+        if reasons:
+            evidence += " (" + ", ".join(reasons) + ")"
         matches.append({
             "pattern": "CUDA_GRAPH_REPLAY",
-            "severity": "medium",
-            "evidence": "CUDA graph API: " + ", ".join(signals),
+            "severity": severity,
+            "evidence": evidence,
         })
     return matches
 
@@ -440,6 +581,7 @@ def detect_cuda_graph_python(code: str) -> list[dict]:
     has_graph = bool(RE_CUDA_GRAPH_PYTHON.search(python_only))
     has_replay = bool(RE_CUDA_GRAPH_REPLAY.search(python_only))
     has_cache_key = bool(RE_CUDA_GRAPH_CACHE_KEY.search(python_only))
+    has_graph_cache = bool(RE_GRAPH_CACHE_NAME.search(python_only))
 
     if has_graph:
         signals.append("torch.cuda.CUDAGraph()")
@@ -447,12 +589,17 @@ def detect_cuda_graph_python(code: str) -> list[dict]:
         signals.append(".replay()")
     if has_cache_key:
         signals.append("data_ptr() as graph cache key")
+    if has_graph_cache:
+        signals.append("graph cache dict")
 
     # Need at least CUDAGraph + replay or CUDAGraph + cache key
     if has_graph and (has_replay or has_cache_key):
+        severity = "medium"
+        if has_replay and (has_cache_key or has_graph_cache):
+            severity = "high"
         matches.append({
             "pattern": "CUDA_GRAPH_PYTHON",
-            "severity": "medium",
+            "severity": severity,
             "evidence": "Python CUDAGraph caching: " + ", ".join(signals),
         })
     return matches
@@ -533,34 +680,57 @@ def detect_unsync_multistream(code: str) -> list[dict]:
     Checks both Python code AND C++ inline code, since getStreamFromPool
     is often called from C++/CUDA inline sources.
     """
-    matches = []
-
     # Check Python code
     python_only = strip_cpp_cuda_blocks(code)
-    py_stream_creates = RE_GET_STREAM_FROM_POOL.findall(python_only)
-    py_sync_calls = RE_NO_SYNC_STREAM.findall(python_only)
+    py_stream_creates = len(RE_GET_STREAM_FROM_POOL.findall(python_only))
+    py_sync_calls = (
+        len(RE_NO_SYNC_STREAM.findall(python_only)) +
+        len(RE_STREAM_WAIT_EVENT.findall(python_only)) +
+        len(RE_STREAM_WAIT_STREAM.findall(python_only)) +
+        len(RE_TORCH_CUDA_SYNCHRONIZE.findall(python_only))
+    )
 
-    if len(py_stream_creates) >= 2 and len(py_sync_calls) < len(py_stream_creates):
-        matches.append({
-            "pattern": "UNSYNC_MULTISTREAM",
-            "severity": "high",
-            "evidence": f"Python: {len(py_stream_creates)} stream creates, {len(py_sync_calls)} syncs",
-        })
+    candidates = []
+    if py_stream_creates >= 2:
+        if py_sync_calls == 0:
+            candidates.append((
+                "high",
+                f"Python: {py_stream_creates} stream creates, no sync/wait primitives",
+            ))
+        elif py_sync_calls < py_stream_creates:
+            candidates.append((
+                "medium",
+                f"Python: {py_stream_creates} stream creates, {py_sync_calls} sync/wait calls",
+            ))
 
     # Also check C++ inline code for getStreamFromPool (c10::cuda::getStreamFromPool)
     cpp_stream_pattern = re.compile(r'getStreamFromPool\s*\(')
-    cpp_sync_pattern = re.compile(r'(?:synchronize|cudaStreamSynchronize|cudaDeviceSynchronize)\s*\(')
-    cpp_stream_creates = cpp_stream_pattern.findall(code)
-    cpp_sync_calls = cpp_sync_pattern.findall(code)
+    cpp_stream_creates = len(cpp_stream_pattern.findall(code))
+    cpp_sync_calls = len(RE_CPP_STREAM_SYNC.findall(code)) + len(RE_CPP_METHOD_SYNC.findall(code))
 
-    if len(cpp_stream_creates) >= 2 and len(cpp_sync_calls) < len(cpp_stream_creates):
-        if not matches:  # Don't double-count
-            matches.append({
-                "pattern": "UNSYNC_MULTISTREAM",
-                "severity": "high",
-                "evidence": f"C++: {len(cpp_stream_creates)} getStreamFromPool calls, {len(cpp_sync_calls)} syncs — unsynchronized dispatch",
-            })
-    return matches
+    if cpp_stream_creates >= 2:
+        if cpp_sync_calls == 0:
+            candidates.append((
+                "high",
+                f"C++: {cpp_stream_creates} getStreamFromPool calls, no sync/wait primitives",
+            ))
+        elif cpp_sync_calls < cpp_stream_creates:
+            candidates.append((
+                "medium",
+                f"C++: {cpp_stream_creates} getStreamFromPool calls, {cpp_sync_calls} sync/wait calls",
+            ))
+
+    if not candidates:
+        return []
+
+    severity_rank = {"high": 2, "medium": 1}
+    top_severity = max(candidates, key=lambda c: severity_rank[c[0]])[0]
+    evidence = " | ".join(msg for sev, msg in candidates if sev == top_severity)
+    return [{
+        "pattern": "UNSYNC_MULTISTREAM",
+        "severity": top_severity,
+        "evidence": evidence,
+    }]
 
 
 def detect_cuda_event_disable_timing(code: str) -> list[dict]:
