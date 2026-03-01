@@ -15,6 +15,7 @@ import argparse
 import glob
 import hashlib
 import json
+import multiprocessing as mp
 import os
 import re
 import sys
@@ -1176,6 +1177,84 @@ def analyze_code(code: str, metadata: Optional[dict] = None, field: str = "code"
 
 
 # ---------------------------------------------------------------------------
+# Top-level worker functions (must be module-level for multiprocessing pickling)
+# ---------------------------------------------------------------------------
+
+def _worker_jsonl(args: tuple) -> Optional[dict]:
+    """Analyze one JSONL pair entry.  Returns result dict or None on parse error."""
+    line_num, line = args
+    line = line.strip()
+    if not line:
+        return None
+    try:
+        entry = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+
+    entry_id = entry.get("id", f"line_{line_num}")
+    user = entry.get("user", "unknown")
+    problem = entry.get("problem_name", "unknown")
+    metadata = {
+        "improved_score": entry.get("improved_score"),
+        "baseline_score": entry.get("baseline_score"),
+    }
+
+    r_imp = analyze_code(entry.get("improved_code", ""), metadata,
+                         field="improved_code", compute_structural_hash=False)
+    r_base = analyze_code(entry.get("baseline_code", ""), metadata,
+                          field="baseline_code", compute_structural_hash=False)
+
+    all_patterns = []
+    for p in r_imp["matched_patterns"]:
+        p["field"] = "improved_code"
+        all_patterns.append(p)
+    for p in r_base["matched_patterns"]:
+        p["field"] = "baseline_code"
+        all_patterns.append(p)
+
+    classification, _ = classify(all_patterns)
+    improved_only = [p for p in all_patterns if p["field"] == "improved_code"]
+    _, should_filter = classify(improved_only)
+    reason = filter_reason(improved_only) if should_filter else None
+
+    return {
+        "id": entry_id,
+        "user": user,
+        "problem_name": problem,
+        "classification": classification,
+        "should_filter": should_filter,
+        "filter_reason": reason,
+        "matched_patterns": all_patterns,
+        "improved_score": entry.get("improved_score"),
+        "baseline_score": entry.get("baseline_score"),
+        "code_hash_improved": r_imp["code_hash"],
+        "code_hash_baseline": r_base["code_hash"],
+        "_line_num": line_num,
+    }
+
+
+def _worker_parquet(args: tuple) -> dict:
+    """Analyze one parquet submission row."""
+    sub_id, leaderboard_id, user_id, user_name, problem_name, score, passed, code = args
+    metadata = {"score": score, "user": user_name, "problem": problem_name}
+    r = analyze_code(code or "", metadata, field="code", compute_structural_hash=False)
+    return {
+        "submission_id": int(sub_id),
+        "leaderboard_id": int(leaderboard_id),
+        "user_id": str(user_id),
+        "user": str(user_name),
+        "problem_name": str(problem_name),
+        "score": float(score) if score is not None else None,
+        "passed": bool(passed),
+        "classification": r["classification"],
+        "should_filter": r["should_filter"],
+        "filter_reason": r.get("filter_reason"),
+        "matched_patterns": r["matched_patterns"],
+        "code_hash": r["code_hash"],
+    }
+
+
+# ---------------------------------------------------------------------------
 # Mode A: NvidiaArchive directory scan
 # ---------------------------------------------------------------------------
 
@@ -1298,104 +1377,60 @@ def scan_nvidia_archive(directory: str, output_path: str):
 # Mode B: JSONL dataset scan
 # ---------------------------------------------------------------------------
 
-def scan_jsonl(jsonl_path: str, results_path: str, cleaned_path: str, summary_path: str):
-    """Stream-process JSONL dataset and output detection results + cleaned file."""
-    print(f"Scanning {jsonl_path}")
+def scan_jsonl(jsonl_path: str, results_path: str, cleaned_path: str, summary_path: str,
+               workers: int = 0):
+    """Stream-process JSONL dataset and output detection results + cleaned file.
 
-    total = 0
-    filtered = 0
-    kept = 0
-    classifications = Counter()
-    patterns_improved = Counter()
-    patterns_baseline = Counter()
+    workers: number of parallel worker processes (0 = os.cpu_count()).
+    """
+    n_workers = workers if workers > 0 else (os.cpu_count() or 1)
+    print(f"Scanning {jsonl_path}  [{n_workers} workers]")
+
+    # Read all lines upfront so we can distribute to the pool.
+    # Memory cost: ~300MB for 44K entries; acceptable.
+    with open(jsonl_path, "r") as fin:
+        raw_lines = list(enumerate(fin, 1))  # [(line_num, line), ...]
+
+    total_lines = len(raw_lines)
+    print(f"  Loaded {total_lines} lines, dispatching to pool...")
+
+    all_results: list[dict] = []
+    hash_groups_improved: dict = defaultdict(list)
+    hash_groups_baseline: dict = defaultdict(list)
+    patterns_improved: Counter = Counter()
+    patterns_baseline: Counter = Counter()
     per_user = defaultdict(lambda: {"total": 0, "filtered": 0})
     per_problem = defaultdict(lambda: {"total": 0, "filtered": 0})
-    hash_groups_improved = defaultdict(list)
-    hash_groups_baseline = defaultdict(list)
-    # Near-clone (structural hash) detection is skipped in JSONL mode: identifier
-    # normalization via regex callbacks is too slow for 44K × 2 entries.  Exact
-    # duplicate detection via code_hash is used instead.
-    all_results = []
 
-    # First pass: analyze and collect hashes
-    with open(jsonl_path, "r") as fin:
-        for line_num, line in enumerate(fin, 1):
-            line = line.strip()
-            if not line:
+    chunksize = max(1, total_lines // (n_workers * 8))
+    done = 0
+
+    with mp.Pool(n_workers) as pool:
+        for result in pool.imap_unordered(_worker_jsonl, raw_lines, chunksize=chunksize):
+            if result is None:
                 continue
-            try:
-                entry = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-
-            total += 1
-            entry_id = entry.get("id", f"line_{line_num}")
-            user = entry.get("user", "unknown")
-            problem = entry.get("problem_name", "unknown")
-
-            metadata = {
-                "improved_score": entry.get("improved_score"),
-                "baseline_score": entry.get("baseline_score"),
-            }
-
-            # Analyze improved_code (skip structural hash for performance)
-            improved_code = entry.get("improved_code", "")
-            improved_result = analyze_code(improved_code, metadata, field="improved_code",
-                                           compute_structural_hash=False)
-
-            # Analyze baseline_code (skip structural hash for performance)
-            baseline_code = entry.get("baseline_code", "")
-            baseline_result = analyze_code(baseline_code, metadata, field="baseline_code",
-                                           compute_structural_hash=False)
-
-            # Merge results
-            all_patterns = []
-            for p in improved_result["matched_patterns"]:
-                p["field"] = "improved_code"
-                all_patterns.append(p)
-            for p in baseline_result["matched_patterns"]:
-                p["field"] = "baseline_code"
-                all_patterns.append(p)
-
-            # Classification label uses all patterns; should_filter driven by improved_code only.
-            # baseline_code may carry forward old reference code that improved_code has since replaced.
-            classification, _ = classify(all_patterns)
-            improved_only = [p for p in all_patterns if p.get("field") == "improved_code"]
-            _, should_filter = classify(improved_only)
-            reason = filter_reason(improved_only) if should_filter else None
-
-            result = {
-                "id": entry_id,
-                "user": user,
-                "problem_name": problem,
-                "classification": classification,
-                "should_filter": should_filter,
-                "filter_reason": reason,
-                "matched_patterns": all_patterns,
-                "improved_score": entry.get("improved_score"),
-                "baseline_score": entry.get("baseline_score"),
-                "code_hash_improved": improved_result["code_hash"],
-                "code_hash_baseline": baseline_result["code_hash"],
-                "_line_num": line_num,
-            }
-
             all_results.append(result)
-            hash_groups_improved[improved_result["code_hash"]].append(entry_id)
-            hash_groups_baseline[baseline_result["code_hash"]].append(entry_id)
+            hash_groups_improved[result["code_hash_improved"]].append(result["id"])
+            hash_groups_baseline[result["code_hash_baseline"]].append(result["id"])
+            for p in result["matched_patterns"]:
+                if p["field"] == "improved_code":
+                    patterns_improved[p["pattern"]] += 1
+                else:
+                    patterns_baseline[p["pattern"]] += 1
+            per_user[result["user"]]["total"] += 1
+            per_problem[result["problem_name"]]["total"] += 1
+            done += 1
+            if done % 5000 == 0:
+                print(f"  Processed {done}/{total_lines}...")
 
-            # Track stats
-            for p in improved_result["matched_patterns"]:
-                patterns_improved[p["pattern"]] += 1
-            for p in baseline_result["matched_patterns"]:
-                patterns_baseline[p["pattern"]] += 1
-
-            per_user[user]["total"] += 1
-            per_problem[problem]["total"] += 1
-
-            if total % 5000 == 0:
-                print(f"  Processed {total} entries...")
-
+    # Sort by original line order for deterministic output
+    all_results.sort(key=lambda r: r["_line_num"])
+    total = len(all_results)
     print(f"  Processed {total} entries total")
+
+    filtered = 0
+    kept = 0
+    classifications: Counter = Counter()
 
     # Add exact-duplicate detection (NEAR_CLONE_SPAM skipped in JSONL mode for performance)
     for r in all_results:
@@ -1502,6 +1537,145 @@ def scan_jsonl(jsonl_path: str, results_path: str, cleaned_path: str, summary_pa
 
 
 # ---------------------------------------------------------------------------
+# Mode C: Parquet dataset scan
+# ---------------------------------------------------------------------------
+
+def scan_parquet(parquet_path: str, results_path: str, best_path: str, summary_path: str,
+                 workers: int = 0):
+    """Scan a submission parquet file using parallel workers.
+
+    Outputs per-submission results and a best-per-user-per-problem summary.
+    workers: number of parallel worker processes (0 = os.cpu_count()).
+    """
+    try:
+        import pandas as pd
+    except ImportError:
+        sys.exit("pandas is required for --parquet mode: pip install pandas pyarrow")
+
+    n_workers = workers if workers > 0 else (os.cpu_count() or 1)
+    print(f"Scanning {parquet_path}  [{n_workers} workers]")
+
+    cols = ["submission_id", "leaderboard_id", "user_id", "user_name",
+            "problem_name", "score", "passed", "code"]
+    df = pd.read_parquet(parquet_path, columns=cols)
+    total = len(df)
+    print(f"  Loaded {total} rows: {df['problem_name'].nunique()} problems, "
+          f"{df['user_id'].nunique()} users")
+
+    # Build worker args as plain tuples (picklable, no pandas objects)
+    worker_args = [
+        (row.submission_id, row.leaderboard_id, row.user_id, row.user_name,
+         row.problem_name, row.score, row.passed, row.code or "")
+        for row in df.itertuples(index=False)
+    ]
+
+    chunksize = max(1, total // (n_workers * 8))
+    all_results: list[dict] = []
+    hash_groups: dict = defaultdict(list)
+    done = 0
+
+    with mp.Pool(n_workers) as pool:
+        for result in pool.imap_unordered(_worker_parquet, worker_args, chunksize=chunksize):
+            all_results.append(result)
+            hash_groups[result["code_hash"]].append(result["submission_id"])
+            done += 1
+            if done % 10000 == 0:
+                print(f"  Processed {done}/{total}...")
+
+    print(f"  Processed {done} submissions total")
+
+    # Attach duplicate spam
+    for r in all_results:
+        ch = r["code_hash"]
+        if len(hash_groups.get(ch, [])) > 1:
+            r["matched_patterns"].append({
+                "pattern": "DUPLICATE_SPAM",
+                "severity": "medium",
+                "evidence": f"code hash {ch} shared by {len(hash_groups[ch])} submissions",
+                "field": "code",
+            })
+            r["classification"], r["should_filter"] = classify(r["matched_patterns"])
+            r["filter_reason"] = filter_reason(r["matched_patterns"]) if r["should_filter"] else None
+
+    # Sort by submission_id for deterministic output
+    all_results.sort(key=lambda r: r["submission_id"])
+
+    # Write per-submission results
+    with open(results_path, "w") as f:
+        for r in all_results:
+            f.write(json.dumps(r) + "\n")
+
+    # Best-per-user-per-problem: highest passing score, else highest score
+    best: dict[tuple, dict] = {}
+    for r in all_results:
+        key = (r["user_id"], r["problem_name"])
+        prev = best.get(key)
+        sc = r.get("score") or 0.0
+        if prev is None:
+            best[key] = r
+        else:
+            prev_sc = prev.get("score") or 0.0
+            # Prefer passing; among passing prefer lower score (faster); non-passing prefer lower too
+            if (r.get("passed") and not prev.get("passed")) or \
+               (r.get("passed") == prev.get("passed") and sc < prev_sc):
+                best[key] = r
+
+    with open(best_path, "w") as f:
+        for r in sorted(best.values(), key=lambda r: (r["problem_name"], r.get("score") or 0)):
+            f.write(json.dumps(r) + "\n")
+
+    # Summary stats
+    classifications: Counter = Counter(r["classification"] for r in all_results)
+    filtered_count = sum(1 for r in all_results if r["should_filter"])
+    patterns_all: Counter = Counter(
+        p["pattern"] for r in all_results for p in r["matched_patterns"]
+    )
+    filter_reason_counts: Counter = Counter(
+        r["filter_reason"] for r in all_results if r["should_filter"] and r.get("filter_reason")
+    )
+    per_problem: Counter = Counter(r["problem_name"] for r in all_results)
+    best_classifications: Counter = Counter(r["classification"] for r in best.values())
+    best_filtered = sum(1 for r in best.values() if r["should_filter"])
+
+    summary = {
+        "source_file": parquet_path,
+        "total_submissions": total,
+        "classifications": dict(classifications),
+        "filtered": filtered_count,
+        "filter_reason_breakdown": dict(sorted(filter_reason_counts.items(), key=lambda x: -x[1])),
+        "pattern_hits": dict(sorted(patterns_all.items(), key=lambda x: -x[1])),
+        "per_problem": dict(per_problem),
+        "best_per_user_total": len(best),
+        "best_per_user_classifications": dict(best_classifications),
+        "best_per_user_filtered": best_filtered,
+    }
+
+    with open(summary_path, "w") as f:
+        json.dump(summary, f, indent=2)
+
+    print(f"\n{'='*60}")
+    print(f"Parquet Scan Results")
+    print(f"{'='*60}")
+    print(f"Total submissions: {total}")
+    print(f"\nClassifications:")
+    for cls, count in sorted(classifications.items(), key=lambda x: -x[1]):
+        print(f"  {cls}: {count}")
+    print(f"\nPattern hits:")
+    for pat, count in sorted(patterns_all.items(), key=lambda x: -x[1])[:15]:
+        print(f"  {pat}: {count}")
+    print(f"\nFiltered: {filtered_count} ({100*filtered_count/total:.1f}%)")
+    print(f"\nFilter reason breakdown:")
+    for reason, count in sorted(filter_reason_counts.items(), key=lambda x: -x[1]):
+        print(f"  {reason}: {count}")
+    print(f"\nBest-per-user ({len(best)} entries): {best_filtered} filtered ({100*best_filtered/len(best):.1f}%)")
+    print(f"\nResults:  {results_path}")
+    print(f"Best:     {best_path}")
+    print(f"Summary:  {summary_path}")
+
+    return all_results
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -1509,11 +1683,14 @@ def main():
     parser = argparse.ArgumentParser(description="Hacky Kernel Fingerprinting Pipeline")
     parser.add_argument("--nvidia_archive", type=str, help="Path to NvidiaArchive directory")
     parser.add_argument("--jsonl", type=str, help="Path to JSONL dataset")
+    parser.add_argument("--parquet", type=str, help="Path to submission parquet file")
     parser.add_argument("--output-dir", type=str, default=".", help="Output directory")
+    parser.add_argument("--workers", type=int, default=0,
+                        help="Parallel worker processes (default: os.cpu_count())")
     args = parser.parse_args()
 
-    if not args.nvidia_archive and not args.jsonl:
-        parser.error("Must specify --nvidia_archive and/or --jsonl")
+    if not args.nvidia_archive and not args.jsonl and not args.parquet:
+        parser.error("Must specify at least one of --nvidia_archive, --jsonl, --parquet")
 
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -1525,7 +1702,14 @@ def main():
         results_path = os.path.join(args.output_dir, "detection_results_jsonl.jsonl")
         cleaned_path = os.path.join(args.output_dir, "cleaned_pairs.jsonl")
         summary_path = os.path.join(args.output_dir, "detection_summary.json")
-        scan_jsonl(args.jsonl, results_path, cleaned_path, summary_path)
+        scan_jsonl(args.jsonl, results_path, cleaned_path, summary_path, workers=args.workers)
+
+    if args.parquet:
+        stem = os.path.splitext(os.path.basename(args.parquet))[0]
+        results_path = os.path.join(args.output_dir, f"detection_results_{stem}.jsonl")
+        best_path = os.path.join(args.output_dir, f"detection_results_{stem}_best.jsonl")
+        summary_path = os.path.join(args.output_dir, f"detection_summary_{stem}.json")
+        scan_parquet(args.parquet, results_path, best_path, summary_path, workers=args.workers)
 
 
 if __name__ == "__main__":
