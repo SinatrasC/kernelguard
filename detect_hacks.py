@@ -87,7 +87,7 @@ RE_OUTPUT_CACHE = re.compile(r'_OUTPUT_CACHE')
 RE_RESULT_CACHE_GENERAL = re.compile(r'_(?:RESULT|GROUPED_RESULT|COMPUTE|GEMM)_CACHE')
 RE_ID_DATA_CACHE = re.compile(r'id\s*\(\s*data\s*\)')
 RE_DATA_PTR_CACHE_KEY = re.compile(
-    r'(?:int\s*\(\s*\w+\.data_ptr\s*\(\)\s*\))|'
+    r'(?:\w+\s*\[\s*int\s*\(\s*\w+\.data_ptr\s*\(\)\s*\)\s*\])|'  # cache[int(A.data_ptr())]
     r'(?:\.data_ptr\s*\(\)\s*[,\)].*?(?:cache|key|dict|hash))',
     re.IGNORECASE,
 )
@@ -173,11 +173,22 @@ RE_TRIPLE_QUOTED = re.compile(r'(?:r)?(?:"""|\'\'\')(.*?)(?:"""|\'\'\')', re.DOT
 # Utility: strip C++/CUDA inline source from Python code
 # ---------------------------------------------------------------------------
 
+_LARGE_LITERAL_THRESHOLD = 2000  # chars; blobs larger than this are stripped
+
+
 def strip_cpp_cuda_blocks(code: str) -> str:
-    """Remove C/CUDA source literals from Python code for Python-only analysis."""
+    """Remove C/CUDA source literals and large data blobs from Python code.
+
+    Strips triple-quoted strings that either:
+    - Contain C++/CUDA source markers (__global__, #include, etc.), OR
+    - Are larger than _LARGE_LITERAL_THRESHOLD characters (e.g. base64 blobs,
+      embedded source code, lookup tables).  These blobs are never hacking
+      indicators and their long all-word-char content causes catastrophic
+      backtracking in patterns like (\\w+)\\s*=\\s*literal.
+    """
     def replacer(match):
         content = match.group(1)
-        if RE_CPP_MARKERS.search(content):
+        if len(content) > _LARGE_LITERAL_THRESHOLD or RE_CPP_MARKERS.search(content):
             return '""""""'  # empty triple-quoted string
         return match.group(0)
     return RE_TRIPLE_QUOTED.sub(replacer, code)
@@ -318,6 +329,11 @@ def detect_evaluator_exploit(code: str) -> list[dict]:
             "evidence": evidence,
         })
 
+    # Strip large data blobs (base64, lookup tables) before pattern matching.
+    # Blobs cause O(n²) backtracking in patterns like (\w+)\s*=\s*literal when
+    # they form very long single-line word runs (e.g. 129KB base64 strings).
+    code = strip_cpp_cuda_blocks(code)
+
     if RE_MAIN_TIME_KERNEL.search(code):
         add_match("main.time_kernel patched")
     if RE_MAIN_CLONE_DATA.search(code):
@@ -404,21 +420,70 @@ def detect_scaled_mm_ref(code: str) -> list[dict]:
                     if re.search(rf'\breturn\s+{re.escape(var)}\b', after):
                         compute_helpers.add(fn)
             if compute_helpers:
-                matches.append({
-                    "pattern": "SCALED_MM_REF",
-                    "severity": "high",
-                    "evidence": f"custom_kernel returns output of _scaled_mm helper(s): {', '.join(sorted(compute_helpers))}",
-                })
+                # Distinguish pure delegation from benchmark-shape if/else fallback.
+                # Two conditions must BOTH hold to downgrade to medium:
+                # 1. There is a primary non-ref compute branch (more return paths than
+                #    just the ref-helper returns) → ref call is a shape-gated fallback.
+                # 2. All compute helpers have "ref" in their name — only the evaluator's
+                #    own ref_kernel (or similar) counts as a true correctness fallback.
+                #    A custom-named helper (e.g. cublas_kernel, fast_path) that wraps
+                #    _scaled_mm is still a hack regardless of branching.
+                total_returns = len(re.findall(r'\breturn\b', ck_active))
+                # Count return paths that go through a ref helper — both direct
+                # ("return ref_kernel(data)") and assign-then-return
+                # ("results = ref_kernel(data); return results").
+                ref_path_returns = 0
+                for fn in compute_helpers:
+                    ref_path_returns += len(
+                        re.findall(rf'\breturn\s+{re.escape(fn)}\s*\(', ck_active)
+                    )
+                    for am in re.finditer(rf'\b(\w+)\s*=\s*{re.escape(fn)}\s*\(', ck_active):
+                        var = am.group(1)
+                        if re.search(rf'\breturn\s+{re.escape(var)}\b', ck_active[am.end():]):
+                            ref_path_returns += 1
+                has_primary_custom_path = total_returns > ref_path_returns
+                all_helpers_are_ref_named = all(
+                    'ref' in fn.lower() for fn in compute_helpers
+                )
+                if has_primary_custom_path and all_helpers_are_ref_named:
+                    matches.append({
+                        "pattern": "SCALED_MM_REF",
+                        "severity": "medium",
+                        "evidence": (
+                            f"_scaled_mm helper(s) used as shape-gated fallback in custom_kernel: "
+                            f"{', '.join(sorted(compute_helpers))} "
+                            f"(primary path is custom, ref only in conditional branch)"
+                        ),
+                    })
+                else:
+                    matches.append({
+                        "pattern": "SCALED_MM_REF",
+                        "severity": "high",
+                        "evidence": f"custom_kernel returns output of _scaled_mm helper(s): {', '.join(sorted(compute_helpers))}",
+                    })
                 return matches
-            # Helper called for validation only (result not returned) → low-confidence medium
+            # Helper called for validation only (result not returned).
+            # If called as a bare statement (no assignment), the helper writes
+            # into an in-place output argument — treat as low severity.
+            # Otherwise (assigned but not returned) it is a medium signal.
             validation_calls = {fn for fn in helper_funcs_with_mm
                                 if re.search(rf'\b{re.escape(fn)}\s*\(', ck_active)}
             if validation_calls:
-                matches.append({
-                    "pattern": "SCALED_MM_REF",
-                    "severity": "medium",
-                    "evidence": f"_scaled_mm helper(s) called in custom_kernel but result not returned: {', '.join(sorted(validation_calls))}",
-                })
+                inplace = {fn for fn in validation_calls
+                           if re.search(rf'^\s*{re.escape(fn)}\s*\(', ck_active, re.MULTILINE)}
+                non_inplace = validation_calls - inplace
+                if non_inplace:
+                    matches.append({
+                        "pattern": "SCALED_MM_REF",
+                        "severity": "medium",
+                        "evidence": f"_scaled_mm helper(s) called in custom_kernel but result not returned: {', '.join(sorted(non_inplace))}",
+                    })
+                if inplace:
+                    matches.append({
+                        "pattern": "SCALED_MM_REF",
+                        "severity": "low",
+                        "evidence": f"_scaled_mm helper(s) called as in-place mutation (result discarded): {', '.join(sorted(inplace))}",
+                    })
                 return matches
             # Helper defined but not called from custom_kernel (e.g. commented-out) → medium
             if helper_funcs_with_mm:
@@ -546,28 +611,35 @@ def detect_result_caching(code: str) -> list[dict]:
     if RE_VERSION_CACHE.search(python_only):
         weak_signals.append("tensor._version cache check")
 
-    if RE_RESULT_REUSE.search(python_active):
+    # Scope all strong-signal checks to custom_kernel body.
+    # Helper functions that cache compilation artifacts (TensorMap, compiled kernels,
+    # plan descriptors, etc.) return those objects from caches, but that is legitimate —
+    # only a cache inside custom_kernel itself indicates result caching.
+    ck_body_active = extract_function_block(python_active, "custom_kernel")
+    cache_scope = ck_body_active if ck_body_active else python_active
+
+    if RE_RESULT_REUSE.search(cache_scope):
         strong_signals.append("_result_reuse")
-    if RE_OUTPUT_CACHE.search(python_active):
+    if RE_OUTPUT_CACHE.search(cache_scope):
         strong_signals.append("_OUTPUT_CACHE")
-    if RE_ID_DATA_CACHE.search(python_active):
+    if RE_ID_DATA_CACHE.search(cache_scope):
         strong_signals.append("id(data) cache key")
-    if RE_DATA_PTR_CACHE_KEY.search(python_active):
+    if RE_DATA_PTR_CACHE_KEY.search(cache_scope):
         strong_signals.append("data_ptr() cache key")
-    if RE_RETURN_CACHE_INDEX.search(python_active):
+    if RE_RETURN_CACHE_INDEX.search(cache_scope):
         strong_signals.append("direct return from cache[...]")
-    if RE_CACHE_STORE_OUTPUT.search(python_active):
+    if RE_CACHE_STORE_OUTPUT.search(cache_scope):
         strong_signals.append("cache[...] stores output/result tensor")
 
-    for var, cache_name in RE_CACHE_GET_ASSIGN.findall(python_active):
+    for var, cache_name in RE_CACHE_GET_ASSIGN.findall(cache_scope):
         if re.search(
             rf'if\s+{re.escape(var)}\s+is\s+not\s+None\s*:[\s\S]{{0,300}}?\breturn\s+{re.escape(var)}\b',
-            python_active,
+            cache_scope,
         ):
             strong_signals.append(f"{cache_name}.get(...) then return cached value")
         elif re.search(
             rf'if\s+{re.escape(var)}\s*:[\s\S]{{0,300}}?\breturn\s+{re.escape(var)}\b',
-            python_active,
+            cache_scope,
         ):
             strong_signals.append(f"{cache_name}.get(...) guarded return")
 
@@ -786,13 +858,9 @@ def detect_hardcoded_shapes(code: str) -> list[dict]:
         signals.append(f"Python shape dimension checks ({len(py_single_shape_checks)} + {len(py_shape_ifs)} combined)")
 
     if signals:
-        # Shape specialization alone is weak signal (many legitimate kernels
-        # have shape-dependent tuning). Only upgrade to medium if there are
-        # strong indicators like KERNEL_CONFIGS dict in Python (not C++
-        # macro dispatch, which is standard kernel config tuning).
+        # Shape specialization is a weak signal (legitimate kernels tune per
+        # shape). Keep at low — KERNEL_CONFIGS alone does not indicate hacking.
         severity = "low"
-        if has_configs and len(shape_tuples) >= 3:
-            severity = "medium"
         matches.append({
             "pattern": "HARDCODED_SHAPES",
             "severity": severity,
@@ -1066,8 +1134,13 @@ def code_hash(code: str) -> str:
 # Analyze a single code sample
 # ---------------------------------------------------------------------------
 
-def analyze_code(code: str, metadata: Optional[dict] = None, field: str = "code") -> dict:
-    """Run all detectors on a code sample, return result dict."""
+def analyze_code(code: str, metadata: Optional[dict] = None, field: str = "code",
+                 compute_structural_hash: bool = True) -> dict:
+    """Run all detectors on a code sample, return result dict.
+
+    compute_structural_hash: set False for JSONL bulk mode (expensive identifier
+    normalization is impractical at 44K × 2 entries; exact dedup suffices there).
+    """
     all_matches = []
     for detector in CODE_DETECTORS:
         hits = detector(code)
@@ -1084,13 +1157,14 @@ def analyze_code(code: str, metadata: Optional[dict] = None, field: str = "code"
     classification, should_filter = classify(all_matches)
 
     reason = filter_reason(all_matches) if should_filter else None
+    sh = structural_hash(code) if compute_structural_hash else ""
     return {
         "matched_patterns": all_matches,
         "classification": classification,
         "should_filter": should_filter,
         "filter_reason": reason,
         "code_hash": code_hash(code),
-        "structural_hash": structural_hash(code),
+        "structural_hash": sh,
     }
 
 
@@ -1231,8 +1305,9 @@ def scan_jsonl(jsonl_path: str, results_path: str, cleaned_path: str, summary_pa
     per_problem = defaultdict(lambda: {"total": 0, "filtered": 0})
     hash_groups_improved = defaultdict(list)
     hash_groups_baseline = defaultdict(list)
-    struct_groups_improved = defaultdict(list)
-    struct_groups_baseline = defaultdict(list)
+    # Near-clone (structural hash) detection is skipped in JSONL mode: identifier
+    # normalization via regex callbacks is too slow for 44K × 2 entries.  Exact
+    # duplicate detection via code_hash is used instead.
     all_results = []
 
     # First pass: analyze and collect hashes
@@ -1256,13 +1331,15 @@ def scan_jsonl(jsonl_path: str, results_path: str, cleaned_path: str, summary_pa
                 "baseline_score": entry.get("baseline_score"),
             }
 
-            # Analyze improved_code
+            # Analyze improved_code (skip structural hash for performance)
             improved_code = entry.get("improved_code", "")
-            improved_result = analyze_code(improved_code, metadata, field="improved_code")
+            improved_result = analyze_code(improved_code, metadata, field="improved_code",
+                                           compute_structural_hash=False)
 
-            # Analyze baseline_code
+            # Analyze baseline_code (skip structural hash for performance)
             baseline_code = entry.get("baseline_code", "")
-            baseline_result = analyze_code(baseline_code, metadata, field="baseline_code")
+            baseline_result = analyze_code(baseline_code, metadata, field="baseline_code",
+                                           compute_structural_hash=False)
 
             # Merge results
             all_patterns = []
@@ -1288,16 +1365,12 @@ def scan_jsonl(jsonl_path: str, results_path: str, cleaned_path: str, summary_pa
                 "baseline_score": entry.get("baseline_score"),
                 "code_hash_improved": improved_result["code_hash"],
                 "code_hash_baseline": baseline_result["code_hash"],
-                "structural_hash_improved": improved_result["structural_hash"],
-                "structural_hash_baseline": baseline_result["structural_hash"],
                 "_line_num": line_num,
             }
 
             all_results.append(result)
             hash_groups_improved[improved_result["code_hash"]].append(entry_id)
             hash_groups_baseline[baseline_result["code_hash"]].append(entry_id)
-            struct_groups_improved[improved_result["structural_hash"]].append(entry_id)
-            struct_groups_baseline[baseline_result["structural_hash"]].append(entry_id)
 
             # Track stats
             for p in improved_result["matched_patterns"]:
@@ -1313,42 +1386,23 @@ def scan_jsonl(jsonl_path: str, results_path: str, cleaned_path: str, summary_pa
 
     print(f"  Processed {total} entries total")
 
-    # Add duplicate / near-clone detection
+    # Add exact-duplicate detection (NEAR_CLONE_SPAM skipped in JSONL mode for performance)
     for r in all_results:
         extra_patterns = []
         ch_imp = r["code_hash_improved"]
         ch_base = r["code_hash_baseline"]
-        sh_imp = r["structural_hash_improved"]
-        sh_base = r["structural_hash_baseline"]
-        # Exact duplicates take priority
-        imp_exact = len(hash_groups_improved.get(ch_imp, [])) > 1
-        base_exact = len(hash_groups_baseline.get(ch_base, [])) > 1
-        if imp_exact:
+        if len(hash_groups_improved.get(ch_imp, [])) > 1:
             extra_patterns.append({
                 "pattern": "DUPLICATE_SPAM",
                 "severity": "medium",
                 "evidence": f"improved_code hash {ch_imp} shared by {len(hash_groups_improved[ch_imp])} entries",
                 "field": "improved_code",
             })
-        elif len(struct_groups_improved.get(sh_imp, [])) > 1:
-            extra_patterns.append({
-                "pattern": "NEAR_CLONE_SPAM",
-                "severity": "medium",
-                "evidence": f"improved_code structural hash {sh_imp} shared by {len(struct_groups_improved[sh_imp])} entries (trivial rename)",
-                "field": "improved_code",
-            })
-        if base_exact:
+        if len(hash_groups_baseline.get(ch_base, [])) > 1:
             extra_patterns.append({
                 "pattern": "DUPLICATE_SPAM",
                 "severity": "medium",
                 "evidence": f"baseline_code hash {ch_base} shared by {len(hash_groups_baseline[ch_base])} entries",
-                "field": "baseline_code",
-            })
-        elif len(struct_groups_baseline.get(sh_base, [])) > 1:
-            extra_patterns.append({
-                "pattern": "NEAR_CLONE_SPAM",
-                "severity": "medium",
-                "evidence": f"baseline_code structural hash {sh_base} shared by {len(struct_groups_baseline[sh_base])} entries (trivial rename)",
                 "field": "baseline_code",
             })
         if extra_patterns:
