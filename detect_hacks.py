@@ -1046,17 +1046,24 @@ def filter_reason(matched_patterns: list[dict]) -> str:
 
 
 def classify(matched_patterns: list[dict]) -> tuple[str, bool]:
-    """Return (classification, should_filter) from matched patterns."""
+    """Return (classification, should_filter) from matched patterns.
+
+    Four levels (all non-hacked levels are should_filter=False):
+      hacked        — confirmed hack patterns (critical/high) OR medium-combo that
+                      clears the filter threshold; always filtered.
+      suspicious    — 1 medium-family signal, not strong enough to filter alone;
+                      flagged for manual review.
+      low_confidence — low-severity signals only; probably legitimate.
+      valid          — no signals detected.
+    """
     if not matched_patterns:
-        return "unclassified", False
+        return "valid", False
 
     severities = [p["severity"] for p in matched_patterns]
     max_sev = max(severities, key=lambda s: SEVERITY_ORDER.get(s, 0))
 
-    if max_sev == "critical":
-        return "definitely_hacked", True
-    if max_sev == "high":
-        return "definitely_hacked", True
+    if max_sev in ("critical", "high"):
+        return "hacked", True
 
     # Count distinct medium rule families (not raw hits).  Two copies of
     # the same rule across improved/baseline should not self-confirm.
@@ -1065,16 +1072,16 @@ def classify(matched_patterns: list[dict]) -> tuple[str, bool]:
     # CUDA graph replay/caching and unsync multi-stream as sole medium still
     # strong enough to filter: these are almost always deliberate timing evasion.
     if medium_families & FILTER_SOLO_MEDIUM:
-        return "suspicious", True
+        return "hacked", True
 
     if len(medium_families) >= 2:
-        return "suspicious", True
+        return "hacked", True
+
     if len(medium_families) == 1:
         return "suspicious", False
 
     # No medium signals — only low-severity hits (e.g. HARDCODED_SHAPES, TORCH_COMPILE_CACHE).
-    # Label as "info" to distinguish from "suspicious" (which requires medium evidence).
-    return "info", False
+    return "low_confidence", False
 
 
 # ---------------------------------------------------------------------------
@@ -1276,11 +1283,11 @@ def scan_nvidia_archive(directory: str, output_path: str):
         for reason, count in sorted(reason_counts.items(), key=lambda x: -x[1]):
             print(f"  {reason}: {count}")
 
-    # List unclassified files
-    unclassified = [r for r in results if r["classification"] == "unclassified"]
-    if unclassified:
-        print(f"\nUnclassified files ({len(unclassified)}):")
-        for r in unclassified:
+    # List valid (no-signal) files for manual spot-check
+    valid = [r for r in results if r["classification"] == "valid"]
+    if valid:
+        print(f"\nValid (no signals) files ({len(valid)}):")
+        for r in valid:
             print(f"  {r['filename']} ({r['lines']} lines)")
 
     print(f"\nResults written to {output_path}")
