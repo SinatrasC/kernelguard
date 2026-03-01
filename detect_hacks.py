@@ -27,6 +27,9 @@ from typing import Any, Optional
 
 # Pattern 1: Timer monkey-patching
 RE_CUDA_EVENT_ASSIGN = re.compile(r'torch\.cuda\.Event\s*=\s*')
+RE_CUDA_EVENT_SETATTR = re.compile(r'setattr\s*\(\s*torch\.cuda\s*,\s*[\'"]Event[\'"]\s*,')
+RE_ELAPSED_TIME_METHOD_PATCH = re.compile(r'torch\.cuda\.Event\.elapsed_time\s*=')
+RE_CUDA_SYNCHRONIZE_PATCH = re.compile(r'torch\.cuda\.synchronize\s*=')
 RE_DUMMY_FAKE_EVENT = re.compile(r'class\s+_?(?:Dummy|Fake|Mock|Stub|Noop)\w*Event', re.IGNORECASE)
 RE_ELAPSED_TIME_FAKE = re.compile(r'def\s+elapsed_time\s*\([^)]*\)\s*:')
 
@@ -34,6 +37,8 @@ RE_ELAPSED_TIME_FAKE = re.compile(r'def\s+elapsed_time\s*\([^)]*\)\s*:')
 RE_EMIT_FAKE_BENCH = re.compile(r'def\s+_?emit_fake_benchmark')
 RE_BUILTINS_PRINT_ASSIGN = re.compile(r'builtins\.print\s*=')
 RE_PATCHED_PRINT = re.compile(r'_(?:patched|real|orig|original)_print')
+RE_SYS_STDOUT_REPLACE = re.compile(r'sys\.stdout\s*=')
+RE_SYS_STDERR_REPLACE = re.compile(r'sys\.stderr\s*=')
 RE_RANKED_BENCHMARK_PRINT = re.compile(
     r'(?:print|sys\.stdout\.write)\s*\([^)]*(?:Ranked\s+Benchmark)',
     re.DOTALL,
@@ -91,8 +96,10 @@ RE_CACHE_GET_ASSIGN = re.compile(
     r'(\w+)\s*=\s*(\w*(?:cache|reuse)\w*)\.get\s*\(',
     re.IGNORECASE,
 )
+# "return cache[...]" but exclude compiled-kernel / module caches (legitimate)
 RE_RETURN_CACHE_INDEX = re.compile(
-    r'return\s+\w*(?:cache|reuse)\w*\s*\[',
+    r'return\s+(?!_?(?:compiled|kernel|module|func|op)_?\w*cache)'
+    r'\w*(?:cache|reuse)\w*\s*\[',
     re.IGNORECASE,
 )
 RE_CACHE_STORE_OUTPUT = re.compile(
@@ -195,12 +202,18 @@ def extract_function_block(code: str, func_name: str) -> str:
     return ""
 
 
+RE_IMPORT_MAIN_AS = re.compile(r'import\s+__main__\s+as\s+(\w+)')
+RE_FROM_IMPORT_MAIN = re.compile(r'from\s+__main__\s+import\s+')
+
+
 def find_main_aliases(code: str) -> set[str]:
     """Collect local variable aliases bound to sys.modules['__main__']."""
     aliases = {"main"}
     for m in RE_MAIN_ALIAS_FROM_GET.finditer(code):
         aliases.add(m.group(1))
     for m in RE_MAIN_ALIAS_FROM_INDEX.finditer(code):
+        aliases.add(m.group(1))
+    for m in RE_IMPORT_MAIN_AS.finditer(code):
         aliases.add(m.group(1))
     return aliases
 
@@ -217,6 +230,24 @@ def detect_timer_monkeypatch(code: str) -> list[dict]:
             "pattern": "TIMER_MONKEYPATCH",
             "severity": "critical",
             "evidence": "torch.cuda.Event reassigned",
+        })
+    if RE_CUDA_EVENT_SETATTR.search(code):
+        matches.append({
+            "pattern": "TIMER_MONKEYPATCH",
+            "severity": "critical",
+            "evidence": "setattr(torch.cuda, 'Event', ...) patching",
+        })
+    if RE_ELAPSED_TIME_METHOD_PATCH.search(code):
+        matches.append({
+            "pattern": "TIMER_MONKEYPATCH",
+            "severity": "critical",
+            "evidence": "torch.cuda.Event.elapsed_time method patched",
+        })
+    if RE_CUDA_SYNCHRONIZE_PATCH.search(code):
+        matches.append({
+            "pattern": "TIMER_MONKEYPATCH",
+            "severity": "critical",
+            "evidence": "torch.cuda.synchronize patched",
         })
     if RE_DUMMY_FAKE_EVENT.search(code):
         matches.append({
@@ -247,6 +278,19 @@ def detect_print_injection(code: str) -> list[dict]:
             "pattern": "PRINT_INJECTION",
             "severity": "critical",
             "evidence": "Print patching variable (_patched_print/_real_print)",
+        })
+    # sys.stdout/stderr replacement
+    if RE_SYS_STDOUT_REPLACE.search(code):
+        matches.append({
+            "pattern": "PRINT_INJECTION",
+            "severity": "critical",
+            "evidence": "sys.stdout reassigned",
+        })
+    if RE_SYS_STDERR_REPLACE.search(code):
+        matches.append({
+            "pattern": "PRINT_INJECTION",
+            "severity": "high",
+            "evidence": "sys.stderr reassigned",
         })
     # Check for "Ranked Benchmark" in print calls (not in C++ code)
     python_only = strip_cpp_cuda_blocks(code)
@@ -282,15 +326,18 @@ def detect_evaluator_exploit(code: str) -> list[dict]:
         add_match("main.clear_l2_cache patched")
 
     aliases = find_main_aliases(code)
-    if RE_SYS_MODULES_MAIN.search(code):
-        for m in RE_MAIN_ATTR_PATCH.finditer(code):
-            obj, attr = m.group(1), m.group(2)
-            if obj in aliases and obj != "main":
-                add_match(f"{obj}.{attr} patched via __main__ alias")
-        for m in RE_MAIN_SETATTR_PATCH.finditer(code):
-            obj, attr = m.group(1), m.group(2)
-            if obj in aliases:
-                add_match(f"setattr({obj}, '{attr}', ...) on __main__ alias")
+    # Check for alias-based patching regardless of how __main__ was obtained
+    for m in RE_MAIN_ATTR_PATCH.finditer(code):
+        obj, attr = m.group(1), m.group(2)
+        if obj in aliases and obj != "main":
+            add_match(f"{obj}.{attr} patched via __main__ alias")
+    for m in RE_MAIN_SETATTR_PATCH.finditer(code):
+        obj, attr = m.group(1), m.group(2)
+        if obj in aliases:
+            add_match(f"setattr({obj}, '{attr}', ...) on __main__ alias")
+    # Also flag if __main__ is imported directly (unusual in a kernel submission)
+    if RE_FROM_IMPORT_MAIN.search(code):
+        add_match("from __main__ import ... (direct harness access)")
     return matches
 
 
@@ -324,11 +371,64 @@ def detect_scaled_mm_ref(code: str) -> list[dict]:
         has_cpp = bool(RE_SCALED_MM_CPP.search(code))
         has_schema = bool(RE_SCALED_MM_SCHEMA.search(code))
 
-        # _scaled_mm only before custom_kernel with no alias → reference function, skip
+        # _scaled_mm only before custom_kernel with no alias — check if
+        # custom_kernel calls a helper that uses _scaled_mm.
         has_python_before = bool(RE_SCALED_MM_PYTHON.search(code_before_ck))
         if (has_python_before and not has_python_after and
                 not has_alias_before and not has_alias_after and
                 not has_cpp and not has_schema):
+            # Find function names defined before custom_kernel that use _scaled_mm
+            helper_funcs_with_mm = set()
+            for func_m in re.finditer(r'^def\s+(\w+)\s*\(', code_before_ck, re.MULTILINE):
+                func_name = func_m.group(1)
+                func_body = extract_function_block(code_before_ck, func_name)
+                if RE_SCALED_MM_PYTHON.search(func_body):
+                    helper_funcs_with_mm.add(func_name)
+            # Strip Python comments from custom_kernel body before call-site analysis
+            # so that commented-out calls (e.g. # result = ref_kernel(data)) are ignored.
+            ck_body = extract_function_block(code, "custom_kernel")
+            ck_active = re.sub(r'#.*$', '', ck_body, flags=re.MULTILINE)
+            # Check if custom_kernel's OUTPUT comes from a helper that uses _scaled_mm.
+            # Validation-only calls (result not returned) are NOT the submission's compute.
+            compute_helpers = set()
+            for fn in helper_funcs_with_mm:
+                # Direct return: return helper(...)
+                if re.search(rf'\breturn\s+{re.escape(fn)}\s*\(', ck_active):
+                    compute_helpers.add(fn)
+                    continue
+                # Assigned return: var = helper(...) … return var
+                assign_m = re.search(rf'\b(\w+)\s*=\s*{re.escape(fn)}\s*\(', ck_active)
+                if assign_m:
+                    var = assign_m.group(1)
+                    after = ck_active[assign_m.end():]
+                    if re.search(rf'\breturn\s+{re.escape(var)}\b', after):
+                        compute_helpers.add(fn)
+            if compute_helpers:
+                matches.append({
+                    "pattern": "SCALED_MM_REF",
+                    "severity": "high",
+                    "evidence": f"custom_kernel returns output of _scaled_mm helper(s): {', '.join(sorted(compute_helpers))}",
+                })
+                return matches
+            # Helper called for validation only (result not returned) → low-confidence medium
+            validation_calls = {fn for fn in helper_funcs_with_mm
+                                if re.search(rf'\b{re.escape(fn)}\s*\(', ck_active)}
+            if validation_calls:
+                matches.append({
+                    "pattern": "SCALED_MM_REF",
+                    "severity": "medium",
+                    "evidence": f"_scaled_mm helper(s) called in custom_kernel but result not returned: {', '.join(sorted(validation_calls))}",
+                })
+                return matches
+            # Helper defined but not called from custom_kernel (e.g. commented-out) → medium
+            if helper_funcs_with_mm:
+                matches.append({
+                    "pattern": "SCALED_MM_REF",
+                    "severity": "medium",
+                    "evidence": f"_scaled_mm in helper(s) before custom_kernel: {', '.join(sorted(helper_funcs_with_mm))} (not called in active code)",
+                })
+                return matches
+            # _scaled_mm in module-level code before custom_kernel (no helper function) → likely reference
             return []
 
         has_python = has_python_after
@@ -358,7 +458,12 @@ def detect_scaled_mm_ref(code: str) -> list[dict]:
 
 
 def detect_decode_mm_ref(code: str) -> list[dict]:
-    """Pattern 5: FP4 decode + torch.mm/bmm as main compute path."""
+    """Pattern 5: FP4 decode + torch.mm/bmm as main compute path.
+
+    Only flags when mm/bmm/matmul appears to feed the output (near return
+    or assigned to a result-like variable), not when used for small
+    pre/post processing steps.
+    """
     python_only = strip_cpp_cuda_blocks(code)
     custom_kernel_code = extract_function_block(python_only, "custom_kernel")
     matches = []
@@ -379,13 +484,33 @@ def detect_decode_mm_ref(code: str) -> list[dict]:
             ops.append("torch.bmm")
         if has_matmul:
             ops.append("torch.matmul")
+
+        # Check if mm/bmm feeds the output path (return, result assignment, or
+        # is the dominant compute — more than one call suggests it IS the kernel)
+        mm_call_count = (
+            len(RE_TORCH_MM.findall(custom_kernel_code)) +
+            len(RE_TORCH_BMM.findall(custom_kernel_code)) +
+            len(RE_TORCH_MATMUL.findall(custom_kernel_code))
+        )
+        feeds_output = bool(re.search(
+            r'(?:result|output|out|c_ref|c|ret)\s*=\s*torch\.(?:mm|bmm|matmul)\s*\('
+            r'|return\s+.*?torch\.(?:mm|bmm|matmul)\s*\(',
+            custom_kernel_code,
+        ))
+
+        # If only 1 call and doesn't feed output, likely a small helper step
+        if mm_call_count == 1 and not feeds_output:
+            return matches
+
         has_decode_context = bool(
             re.search(r'\b(?:fp4|decode|sfa|sfb|scale_a|scale_b|to_blocked)\b', python_only, re.IGNORECASE),
         )
         severity = "high" if has_decode_context else "medium"
         evidence = f"{', '.join(ops)} used inside custom_kernel"
         if not has_decode_context:
-            evidence += " (no explicit FP4 decode context found)"
+            evidence += " (no explicit FP4 decode context)"
+        if feeds_output:
+            evidence += " [feeds output path]"
         matches.append({
             "pattern": "DECODE_MM_REF",
             "severity": severity,
@@ -401,6 +526,8 @@ def detect_result_caching(code: str) -> list[dict]:
     C++ inline code for thread_local Cache structs keyed by data_ptr().
     """
     python_only = strip_cpp_cuda_blocks(code)
+    # Strip Python comments to avoid matching commented-out cache code
+    python_active = re.sub(r'#.*$', '', python_only, flags=re.MULTILINE)
     matches = []
 
     weak_signals = []
@@ -419,28 +546,28 @@ def detect_result_caching(code: str) -> list[dict]:
     if RE_VERSION_CACHE.search(python_only):
         weak_signals.append("tensor._version cache check")
 
-    if RE_RESULT_REUSE.search(python_only):
+    if RE_RESULT_REUSE.search(python_active):
         strong_signals.append("_result_reuse")
-    if RE_OUTPUT_CACHE.search(python_only):
+    if RE_OUTPUT_CACHE.search(python_active):
         strong_signals.append("_OUTPUT_CACHE")
-    if RE_ID_DATA_CACHE.search(python_only):
+    if RE_ID_DATA_CACHE.search(python_active):
         strong_signals.append("id(data) cache key")
-    if RE_DATA_PTR_CACHE_KEY.search(python_only):
+    if RE_DATA_PTR_CACHE_KEY.search(python_active):
         strong_signals.append("data_ptr() cache key")
-    if RE_RETURN_CACHE_INDEX.search(python_only):
+    if RE_RETURN_CACHE_INDEX.search(python_active):
         strong_signals.append("direct return from cache[...]")
-    if RE_CACHE_STORE_OUTPUT.search(python_only):
+    if RE_CACHE_STORE_OUTPUT.search(python_active):
         strong_signals.append("cache[...] stores output/result tensor")
 
-    for var, cache_name in RE_CACHE_GET_ASSIGN.findall(python_only):
+    for var, cache_name in RE_CACHE_GET_ASSIGN.findall(python_active):
         if re.search(
             rf'if\s+{re.escape(var)}\s+is\s+not\s+None\s*:[\s\S]{{0,300}}?\breturn\s+{re.escape(var)}\b',
-            python_only,
+            python_active,
         ):
             strong_signals.append(f"{cache_name}.get(...) then return cached value")
         elif re.search(
             rf'if\s+{re.escape(var)}\s*:[\s\S]{{0,300}}?\breturn\s+{re.escape(var)}\b',
-            python_only,
+            python_active,
         ):
             strong_signals.append(f"{cache_name}.get(...) guarded return")
 
@@ -697,10 +824,11 @@ def detect_unsync_multistream(code: str) -> list[dict]:
                 "high",
                 f"Python: {py_stream_creates} stream creates, no sync/wait primitives",
             ))
-        elif py_sync_calls < py_stream_creates:
+        elif py_sync_calls * 2 < py_stream_creates:
+            # Significantly under-synchronized: fewer than half as many syncs as streams
             candidates.append((
                 "medium",
-                f"Python: {py_stream_creates} stream creates, {py_sync_calls} sync/wait calls",
+                f"Python: {py_stream_creates} stream creates, only {py_sync_calls} sync/wait calls",
             ))
 
     # Also check C++ inline code for getStreamFromPool (c10::cuda::getStreamFromPool)
@@ -714,10 +842,10 @@ def detect_unsync_multistream(code: str) -> list[dict]:
                 "high",
                 f"C++: {cpp_stream_creates} getStreamFromPool calls, no sync/wait primitives",
             ))
-        elif cpp_sync_calls < cpp_stream_creates:
+        elif cpp_sync_calls * 2 < cpp_stream_creates:
             candidates.append((
                 "medium",
-                f"C++: {cpp_stream_creates} getStreamFromPool calls, {cpp_sync_calls} sync/wait calls",
+                f"C++: {cpp_stream_creates} getStreamFromPool calls, only {cpp_sync_calls} sync/wait calls",
             ))
 
     if not candidates:
@@ -822,6 +950,33 @@ CODE_DETECTORS = [
 SEVERITY_ORDER = {"critical": 4, "high": 3, "medium": 2, "low": 1}
 
 
+FILTER_SOLO_MEDIUM = {"CUDA_GRAPH_REPLAY", "CUDA_GRAPH_PYTHON", "UNSYNC_MULTISTREAM"}
+
+
+def filter_reason(matched_patterns: list[dict]) -> str:
+    """Return a short label explaining what drove the filter decision."""
+    severities = [p["severity"] for p in matched_patterns]
+    if not severities:
+        return "none"
+    max_sev = max(severities, key=lambda s: SEVERITY_ORDER.get(s, 0))
+    if max_sev in ("critical", "high"):
+        return "high_critical"
+    medium_families = {p["pattern"] for p in matched_patterns if p["severity"] == "medium"}
+    if medium_families & FILTER_SOLO_MEDIUM:
+        non_dup = medium_families - {"DUPLICATE_SPAM"}
+        if non_dup & FILTER_SOLO_MEDIUM:
+            return "solo_medium_graph"
+    if len(medium_families) >= 2:
+        if medium_families == {"DUPLICATE_SPAM"}:
+            return "duplicate_only"
+        return "medium_combo"
+    if len(medium_families) == 1:
+        if medium_families == {"DUPLICATE_SPAM"}:
+            return "duplicate_only"
+        return "solo_medium_graph"
+    return "none"
+
+
 def classify(matched_patterns: list[dict]) -> tuple[str, bool]:
     """Return (classification, should_filter) from matched patterns."""
     if not matched_patterns:
@@ -835,13 +990,23 @@ def classify(matched_patterns: list[dict]) -> tuple[str, bool]:
     if max_sev == "high":
         return "definitely_hacked", True
 
-    medium_count = severities.count("medium")
-    if medium_count >= 2:
+    # Count distinct medium rule families (not raw hits).  Two copies of
+    # the same rule across improved/baseline should not self-confirm.
+    medium_families = {p["pattern"] for p in matched_patterns if p["severity"] == "medium"}
+
+    # CUDA graph replay/caching and unsync multi-stream as sole medium still
+    # strong enough to filter: these are almost always deliberate timing evasion.
+    if medium_families & FILTER_SOLO_MEDIUM:
         return "suspicious", True
-    if medium_count == 1:
+
+    if len(medium_families) >= 2:
+        return "suspicious", True
+    if len(medium_families) == 1:
         return "suspicious", False
 
-    return "suspicious", False
+    # No medium signals — only low-severity hits (e.g. HARDCODED_SHAPES, TORCH_COMPILE_CACHE).
+    # Label as "info" to distinguish from "suspicious" (which requires medium evidence).
+    return "info", False
 
 
 # ---------------------------------------------------------------------------
@@ -850,11 +1015,46 @@ def classify(matched_patterns: list[dict]) -> tuple[str, bool]:
 
 def normalize_code(code: str) -> str:
     """Normalize code for dedup: strip comments and collapse whitespace."""
-    # Strip Python comments
     code = re.sub(r'#.*$', '', code, flags=re.MULTILINE)
-    # Collapse whitespace
     code = re.sub(r'\s+', ' ', code)
     return code.strip()
+
+
+_IDENT_RE = re.compile(r'\b([a-zA-Z_]\w*)\b')
+_PYTHON_KEYWORDS = frozenset({
+    "False", "None", "True", "and", "as", "assert", "async", "await",
+    "break", "class", "continue", "def", "del", "elif", "else", "except",
+    "finally", "for", "from", "global", "if", "import", "in", "is",
+    "lambda", "nonlocal", "not", "or", "pass", "raise", "return", "try",
+    "while", "with", "yield",
+    # common builtins / torch names to preserve structure
+    "torch", "self", "data", "int", "float", "bool", "str", "list",
+    "dict", "set", "tuple", "len", "range", "print", "type", "super",
+    "input_t", "output_t", "custom_kernel",
+})
+
+
+def structural_hash(code: str) -> str:
+    """SHA-256 after stripping comments, collapsing whitespace, and renaming
+    non-keyword identifiers.  Catches trivial renames between near-clones."""
+    code = re.sub(r'#.*$', '', code, flags=re.MULTILINE)
+    # Map identifiers to positional placeholders (preserves structure)
+    ident_map: dict[str, str] = {}
+    counter = 0
+
+    def replace_ident(m: re.Match) -> str:
+        nonlocal counter
+        name = m.group(1)
+        if name in _PYTHON_KEYWORDS or name.startswith('__'):
+            return name
+        if name not in ident_map:
+            ident_map[name] = f"v{counter}"
+            counter += 1
+        return ident_map[name]
+
+    normalized = _IDENT_RE.sub(replace_ident, code)
+    normalized = re.sub(r'\s+', ' ', normalized).strip()
+    return hashlib.sha256(normalized.encode()).hexdigest()[:16]
 
 
 def code_hash(code: str) -> str:
@@ -883,11 +1083,14 @@ def analyze_code(code: str, metadata: Optional[dict] = None, field: str = "code"
 
     classification, should_filter = classify(all_matches)
 
+    reason = filter_reason(all_matches) if should_filter else None
     return {
         "matched_patterns": all_matches,
         "classification": classification,
         "should_filter": should_filter,
+        "filter_reason": reason,
         "code_hash": code_hash(code),
+        "structural_hash": structural_hash(code),
     }
 
 
@@ -902,6 +1105,7 @@ def scan_nvidia_archive(directory: str, output_path: str):
 
     results = []
     hash_groups = defaultdict(list)
+    struct_groups = defaultdict(list)
 
     for filepath in py_files:
         basename = os.path.basename(filepath)
@@ -932,24 +1136,38 @@ def scan_nvidia_archive(directory: str, output_path: str):
         result["lines"] = len(code.splitlines())
 
         ch = result["code_hash"]
+        sh = result["structural_hash"]
         hash_groups[ch].append(sub_id)
+        struct_groups[sh].append(sub_id)
 
         results.append(result)
 
-    # Add duplicate info
+    # Add duplicate / near-clone info
     for r in results:
         ch = r["code_hash"]
-        group = hash_groups[ch]
-        if len(group) > 1:
+        sh = r["structural_hash"]
+        exact_group = hash_groups[ch]
+        struct_group = struct_groups[sh]
+        if len(exact_group) > 1:
             r["matched_patterns"].append({
                 "pattern": "DUPLICATE_SPAM",
                 "severity": "medium",
-                "evidence": f"Code hash {ch} shared by {len(group)} submissions",
+                "evidence": f"Code hash {ch} shared by {len(exact_group)} submissions",
                 "field": "submission",
             })
-            # Reclassify if needed
-            r["classification"], r["should_filter"] = classify(r["matched_patterns"])
-            r["duplicate_count"] = len(group)
+            r["duplicate_count"] = len(exact_group)
+        elif len(struct_group) > 1:
+            # Near-clone: same structure, different identifier names
+            r["matched_patterns"].append({
+                "pattern": "NEAR_CLONE_SPAM",
+                "severity": "medium",
+                "evidence": f"Structural hash {sh} shared by {len(struct_group)} submissions (trivial rename)",
+                "field": "submission",
+            })
+            r["near_clone_count"] = len(struct_group)
+        # Reclassify after any new dedup pattern
+        r["classification"], r["should_filter"] = classify(r["matched_patterns"])
+        r["filter_reason"] = filter_reason(r["matched_patterns"]) if r["should_filter"] else None
 
     # Write results
     with open(output_path, "w") as f:
@@ -972,7 +1190,17 @@ def scan_nvidia_archive(directory: str, output_path: str):
     print(f"\nPattern hits:")
     for pat, count in sorted(patterns.items(), key=lambda x: -x[1]):
         print(f"  {pat}: {count}")
-    print(f"\nShould filter: {sum(1 for r in results if r['should_filter'])}/{len(results)}")
+    filtered_count = sum(1 for r in results if r["should_filter"])
+    print(f"\nShould filter: {filtered_count}/{len(results)}")
+
+    # Filter reason breakdown
+    reason_counts = Counter(
+        r.get("filter_reason", "none") for r in results if r["should_filter"]
+    )
+    if reason_counts:
+        print(f"\nFilter reason breakdown:")
+        for reason, count in sorted(reason_counts.items(), key=lambda x: -x[1]):
+            print(f"  {reason}: {count}")
 
     # List unclassified files
     unclassified = [r for r in results if r["classification"] == "unclassified"]
@@ -1003,6 +1231,8 @@ def scan_jsonl(jsonl_path: str, results_path: str, cleaned_path: str, summary_pa
     per_problem = defaultdict(lambda: {"total": 0, "filtered": 0})
     hash_groups_improved = defaultdict(list)
     hash_groups_baseline = defaultdict(list)
+    struct_groups_improved = defaultdict(list)
+    struct_groups_baseline = defaultdict(list)
     all_results = []
 
     # First pass: analyze and collect hashes
@@ -1044,6 +1274,7 @@ def scan_jsonl(jsonl_path: str, results_path: str, cleaned_path: str, summary_pa
                 all_patterns.append(p)
 
             classification, should_filter = classify(all_patterns)
+            reason = filter_reason(all_patterns) if should_filter else None
 
             result = {
                 "id": entry_id,
@@ -1051,17 +1282,22 @@ def scan_jsonl(jsonl_path: str, results_path: str, cleaned_path: str, summary_pa
                 "problem_name": problem,
                 "classification": classification,
                 "should_filter": should_filter,
+                "filter_reason": reason,
                 "matched_patterns": all_patterns,
                 "improved_score": entry.get("improved_score"),
                 "baseline_score": entry.get("baseline_score"),
                 "code_hash_improved": improved_result["code_hash"],
                 "code_hash_baseline": baseline_result["code_hash"],
+                "structural_hash_improved": improved_result["structural_hash"],
+                "structural_hash_baseline": baseline_result["structural_hash"],
                 "_line_num": line_num,
             }
 
             all_results.append(result)
             hash_groups_improved[improved_result["code_hash"]].append(entry_id)
             hash_groups_baseline[baseline_result["code_hash"]].append(entry_id)
+            struct_groups_improved[improved_result["structural_hash"]].append(entry_id)
+            struct_groups_baseline[baseline_result["structural_hash"]].append(entry_id)
 
             # Track stats
             for p in improved_result["matched_patterns"]:
@@ -1077,28 +1313,48 @@ def scan_jsonl(jsonl_path: str, results_path: str, cleaned_path: str, summary_pa
 
     print(f"  Processed {total} entries total")
 
-    # Add duplicate detection
+    # Add duplicate / near-clone detection
     for r in all_results:
-        dup_patterns = []
+        extra_patterns = []
         ch_imp = r["code_hash_improved"]
         ch_base = r["code_hash_baseline"]
-        if len(hash_groups_improved.get(ch_imp, [])) > 1:
-            dup_patterns.append({
+        sh_imp = r["structural_hash_improved"]
+        sh_base = r["structural_hash_baseline"]
+        # Exact duplicates take priority
+        imp_exact = len(hash_groups_improved.get(ch_imp, [])) > 1
+        base_exact = len(hash_groups_baseline.get(ch_base, [])) > 1
+        if imp_exact:
+            extra_patterns.append({
                 "pattern": "DUPLICATE_SPAM",
                 "severity": "medium",
                 "evidence": f"improved_code hash {ch_imp} shared by {len(hash_groups_improved[ch_imp])} entries",
                 "field": "improved_code",
             })
-        if len(hash_groups_baseline.get(ch_base, [])) > 1:
-            dup_patterns.append({
+        elif len(struct_groups_improved.get(sh_imp, [])) > 1:
+            extra_patterns.append({
+                "pattern": "NEAR_CLONE_SPAM",
+                "severity": "medium",
+                "evidence": f"improved_code structural hash {sh_imp} shared by {len(struct_groups_improved[sh_imp])} entries (trivial rename)",
+                "field": "improved_code",
+            })
+        if base_exact:
+            extra_patterns.append({
                 "pattern": "DUPLICATE_SPAM",
                 "severity": "medium",
                 "evidence": f"baseline_code hash {ch_base} shared by {len(hash_groups_baseline[ch_base])} entries",
                 "field": "baseline_code",
             })
-        if dup_patterns:
-            r["matched_patterns"].extend(dup_patterns)
+        elif len(struct_groups_baseline.get(sh_base, [])) > 1:
+            extra_patterns.append({
+                "pattern": "NEAR_CLONE_SPAM",
+                "severity": "medium",
+                "evidence": f"baseline_code structural hash {sh_base} shared by {len(struct_groups_baseline[sh_base])} entries (trivial rename)",
+                "field": "baseline_code",
+            })
+        if extra_patterns:
+            r["matched_patterns"].extend(extra_patterns)
             r["classification"], r["should_filter"] = classify(r["matched_patterns"])
+            r["filter_reason"] = filter_reason(r["matched_patterns"]) if r["should_filter"] else None
 
     # Second pass: write results and cleaned JSONL
     print(f"  Writing results...")
@@ -1120,6 +1376,12 @@ def scan_jsonl(jsonl_path: str, results_path: str, cleaned_path: str, summary_pa
             else:
                 filtered += 1
 
+    # Build filter reason breakdown (counts post-dedup final decisions)
+    filter_reason_counts: Counter = Counter()
+    for r in all_results:
+        if r["should_filter"] and r.get("filter_reason"):
+            filter_reason_counts[r["filter_reason"]] += 1
+
     # Write summary
     summary = {
         "source_file": jsonl_path,
@@ -1127,6 +1389,7 @@ def scan_jsonl(jsonl_path: str, results_path: str, cleaned_path: str, summary_pa
         "classifications": dict(classifications),
         "filtered": filtered,
         "kept": kept,
+        "filter_reason_breakdown": dict(sorted(filter_reason_counts.items(), key=lambda x: -x[1])),
         "pattern_hits_improved_code": dict(sorted(patterns_improved.items(), key=lambda x: -x[1])),
         "pattern_hits_baseline_code": dict(sorted(patterns_baseline.items(), key=lambda x: -x[1])),
         "per_problem": {
@@ -1161,6 +1424,9 @@ def scan_jsonl(jsonl_path: str, results_path: str, cleaned_path: str, summary_pa
     for pat, count in sorted(patterns_baseline.items(), key=lambda x: -x[1]):
         print(f"  {pat}: {count}")
     print(f"\nFiltered: {filtered}, Kept: {kept}")
+    print(f"\nFilter reason breakdown:")
+    for reason, count in sorted(filter_reason_counts.items(), key=lambda x: -x[1]):
+        print(f"  {reason}: {count}")
     print(f"\nResults: {results_path}")
     print(f"Cleaned: {cleaned_path}")
     print(f"Summary: {summary_path}")
