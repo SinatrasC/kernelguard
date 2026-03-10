@@ -12,6 +12,7 @@ Usage:
 """
 
 import argparse
+import ast
 import glob
 import hashlib
 import json
@@ -104,7 +105,7 @@ RE_RETURN_CACHE_INDEX = re.compile(
     re.IGNORECASE,
 )
 RE_CACHE_STORE_OUTPUT = re.compile(
-    r'\w*(?:cache|reuse)\w*\s*\[[^\]]+\]\s*=\s*(?:result|output|out|c_ref|c)\b',
+    r'\w*(?:cache|reuse)\w*\s*\[[^\]]+\]\s*=\s*(?:result|output|out|c_ref)\b',
     re.IGNORECASE,
 )
 RE_CPP_CACHE_FAST_RETURN = re.compile(
@@ -624,7 +625,7 @@ def detect_result_caching(code: str) -> list[dict]:
     if RE_OUTPUT_CACHE.search(cache_scope):
         strong_signals.append("_OUTPUT_CACHE")
     if RE_ID_DATA_CACHE.search(cache_scope):
-        strong_signals.append("id(data) cache key")
+        weak_signals.append("id(data) cache key")
     if RE_DATA_PTR_CACHE_KEY.search(cache_scope):
         strong_signals.append("data_ptr() cache key")
     if RE_RETURN_CACHE_INDEX.search(cache_scope):
@@ -665,6 +666,28 @@ def detect_result_caching(code: str) -> list[dict]:
             strong_signals.append("C++ pointer cache fast-return path")
         else:
             weak_signals.append("C++ thread_local cache keyed by data_ptr()")
+
+    # CUDA graph replay (CUDAGraph + .replay()) explains the cache-and-return
+    # pattern — the graph replays actual GPU computation, not cached results.
+    # Downgrade cache-return signals when CUDA graph replay is present.
+    has_cuda_graph_replay = (
+        RE_CUDA_GRAPH_PYTHON.search(python_only) and RE_CUDA_GRAPH_REPLAY.search(python_only)
+    )
+    if has_cuda_graph_replay:
+        cuda_graph_explained = {
+            "direct return from cache[...]",
+            "cache[...] stores output/result tensor",
+            "data_ptr() cache key",
+        }
+        demoted = [s for s in strong_signals if s in cuda_graph_explained]
+        strong_signals = [s for s in strong_signals if s not in cuda_graph_explained]
+        weak_signals.extend(f"{s} (CUDA graph replay)" for s in demoted)
+        # Also demote .get() guarded returns when they follow .replay()
+        strong_signals = [
+            s for s in strong_signals
+            if not (s.endswith("then return cached value") or s.endswith("guarded return"))
+            or not has_cuda_graph_replay
+        ]
 
     strong_signals = list(dict.fromkeys(strong_signals))
     weak_signals = list(dict.fromkeys(weak_signals))
@@ -792,14 +815,14 @@ def detect_cuda_graph_python(code: str) -> list[dict]:
     if has_graph_cache:
         signals.append("graph cache dict")
 
-    # Need at least CUDAGraph + replay or CUDAGraph + cache key
+    # Need at least CUDAGraph + replay or CUDAGraph + cache key.
+    # CUDA graph replay is a legitimate optimization (reduces kernel launch
+    # overhead).  Keep at medium — exploits using CUDA graphs would also
+    # have MODULE_MUTATION / GLOBALS_MUTATION which are critical/high.
     if has_graph and (has_replay or has_cache_key):
-        severity = "medium"
-        if has_replay and (has_cache_key or has_graph_cache):
-            severity = "high"
         matches.append({
             "pattern": "CUDA_GRAPH_PYTHON",
-            "severity": severity,
+            "severity": "medium",
             "evidence": "Python CUDAGraph caching: " + ", ".join(signals),
         })
     return matches
@@ -942,50 +965,725 @@ def detect_cuda_event_disable_timing(code: str) -> list[dict]:
     return matches
 
 
+# ---------------------------------------------------------------------------
+# AST-based detectors (Layer 2: structural analysis beyond regex)
+# ---------------------------------------------------------------------------
+
+# Modules that are trusted by the evaluator and must not be mutated by submissions.
+TRUSTED_MODULES = frozenset({
+    "reference", "utils", "eval", "__main__",
+})
+
+# Evaluator-critical functions that should never be replaced.
+TRUSTED_FUNCTIONS = frozenset({
+    "generate_input", "ref_kernel", "check_implementation",
+    "clear_l2_cache", "clear_l2_cache_large", "time_kernel",
+    "_clone_data", "_run_single_benchmark", "_run_single_test",
+})
+
+
+def _safe_ast_parse(code: str):
+    """Parse Python code into AST, returning None on SyntaxError.
+
+    Submissions may contain embedded C++ in triple-quoted strings which can
+    confuse the parser when the string isn't properly closed.
+    """
+    try:
+        return ast.parse(code)
+    except SyntaxError:
+        return None
+
+
+def _collect_trusted_aliases(tree: ast.AST) -> dict[str, str]:
+    """Walk AST and collect local aliases for trusted modules.
+
+    Returns mapping: local_name -> module_name
+    e.g. ``import reference as _ref`` → {"_ref": "reference"}
+         ``import reference``        → {"reference": "reference"}
+    """
+    aliases: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                mod_root = alias.name.split(".")[0]
+                if mod_root in TRUSTED_MODULES:
+                    local = alias.asname or alias.name
+                    aliases[local] = mod_root
+        elif isinstance(node, ast.ImportFrom):
+            if node.module and node.module.split(".")[0] in TRUSTED_MODULES:
+                mod_root = node.module.split(".")[0]
+                for alias in node.names:
+                    local = alias.asname or alias.name
+                    aliases[local] = mod_root
+    return aliases
+
+
+def detect_trusted_module_import(code: str) -> list[dict]:
+    """AST pattern 1: import of evaluator-trusted modules.
+
+    Catches: import reference, from reference import generate_input, etc.
+    Severity medium — the import alone is suspicious but not conclusive.
+    """
+    tree = _safe_ast_parse(code)
+    if tree is None:
+        return []
+
+    matches = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                mod_root = alias.name.split(".")[0]
+                if mod_root in TRUSTED_MODULES:
+                    matches.append({
+                        "pattern": "TRUSTED_MODULE_IMPORT",
+                        "severity": "medium",
+                        "evidence": f"import {alias.name} (trusted evaluator module)",
+                    })
+        elif isinstance(node, ast.ImportFrom):
+            if node.module and node.module.split(".")[0] in TRUSTED_MODULES:
+                names = ", ".join(a.name for a in node.names)
+                matches.append({
+                    "pattern": "TRUSTED_MODULE_IMPORT",
+                    "severity": "medium",
+                    "evidence": f"from {node.module} import {names}",
+                })
+    return matches
+
+
+def detect_module_mutation(code: str) -> list[dict]:
+    """AST pattern 2: attribute assignment to trusted modules.
+
+    Catches:
+      reference.generate_input = hooked_fn
+      _ref.ref_kernel.__code__ = fake.__code__
+      _ref_module.clear_l2_cache = noop
+    """
+    tree = _safe_ast_parse(code)
+    if tree is None:
+        return []
+
+    aliases = _collect_trusted_aliases(tree)
+    if not aliases:
+        return []
+
+    matches = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            # Direct: module.attr = value
+            if isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name):
+                if target.value.id in aliases:
+                    mod = aliases[target.value.id]
+                    attr = target.attr
+                    sev = "critical" if attr in TRUSTED_FUNCTIONS else "high"
+                    matches.append({
+                        "pattern": "MODULE_MUTATION",
+                        "severity": sev,
+                        "evidence": f"{target.value.id}.{attr} = ... (mutates trusted module '{mod}')",
+                    })
+
+            # Nested: module.func.__code__ = ...
+            if (isinstance(target, ast.Attribute)
+                    and isinstance(target.value, ast.Attribute)
+                    and isinstance(target.value.value, ast.Name)):
+                if target.value.value.id in aliases and target.attr == "__code__":
+                    mod = aliases[target.value.value.id]
+                    matches.append({
+                        "pattern": "CODE_REPLACEMENT",
+                        "severity": "critical",
+                        "evidence": (
+                            f"{target.value.value.id}.{target.value.attr}.__code__ = ... "
+                            f"(bytecode replacement on '{mod}')"
+                        ),
+                    })
+    return matches
+
+
+def detect_globals_mutation(code: str) -> list[dict]:
+    """AST pattern 3: __globals__ dict mutation.
+
+    Catches:
+      fn.__globals__['generate_input'] = hooked_fn
+      getattr(obj, '__globals__')[key] = value
+    """
+    tree = _safe_ast_parse(code)
+    if tree is None:
+        return []
+
+    matches = []
+    assigned_lines: set[int] = set()
+
+    # Pass 1: find __globals__[key] = value assignments
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if (isinstance(target, ast.Subscript)
+                        and isinstance(target.value, ast.Attribute)
+                        and target.value.attr == "__globals__"):
+                    key_name = None
+                    if isinstance(target.slice, ast.Constant) and isinstance(target.slice.value, str):
+                        key_name = target.slice.value
+                    sev = "critical" if key_name in TRUSTED_FUNCTIONS else "high"
+                    evidence = (
+                        f"__globals__['{key_name}'] = ..." if key_name
+                        else "__globals__[...] = ..."
+                    )
+                    matches.append({
+                        "pattern": "GLOBALS_MUTATION",
+                        "severity": sev,
+                        "evidence": evidence + " (mutates function's global namespace)",
+                    })
+                    assigned_lines.add(getattr(node, "lineno", -1))
+
+    # Pass 2: flag __globals__ reads (potential reconnaissance)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and node.attr == "__globals__":
+            lineno = getattr(node, "lineno", -1)
+            if lineno not in assigned_lines:
+                matches.append({
+                    "pattern": "GLOBALS_ACCESS",
+                    "severity": "high",
+                    "evidence": "__globals__ attribute accessed (potential namespace manipulation)",
+                })
+                break  # one read finding is enough
+
+    return matches
+
+
+def detect_introspection_exploit(code: str) -> list[dict]:
+    """AST pattern 4: frame introspection and sys.modules access.
+
+    Catches:
+      inspect.currentframe(), inspect.stack()
+      frame.f_back, frame.f_globals, frame.f_locals
+      sys.modules access
+    """
+    tree = _safe_ast_parse(code)
+    if tree is None:
+        return []
+
+    matches = []
+    seen_patterns: set[str] = set()
+
+    for node in ast.walk(tree):
+        # inspect.currentframe() / inspect.stack()
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if (isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "inspect"
+                    and node.func.attr in ("currentframe", "stack", "getmembers")):
+                key = f"inspect.{node.func.attr}"
+                if key not in seen_patterns:
+                    seen_patterns.add(key)
+                    matches.append({
+                        "pattern": "FRAME_INTROSPECTION",
+                        "severity": "critical",
+                        "evidence": f"inspect.{node.func.attr}() (frame walking for evaluator access)",
+                    })
+
+        # f_back, f_globals, f_locals attribute access
+        if isinstance(node, ast.Attribute) and node.attr in ("f_back", "f_globals", "f_locals"):
+            key = f".{node.attr}"
+            if key not in seen_patterns:
+                seen_patterns.add(key)
+                matches.append({
+                    "pattern": "FRAME_INTROSPECTION",
+                    "severity": "critical",
+                    "evidence": f".{node.attr} access (frame object exploitation)",
+                })
+
+        # sys.modules access
+        if (isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "sys" and node.attr == "modules"):
+            if "sys.modules" not in seen_patterns:
+                seen_patterns.add("sys.modules")
+                matches.append({
+                    "pattern": "SYS_MODULES_ACCESS",
+                    "severity": "high",
+                    "evidence": "sys.modules accessed (potential module namespace manipulation)",
+                })
+
+    return matches
+
+
+def detect_code_replacement(code: str) -> list[dict]:
+    """AST pattern 5: __code__ attribute assignment (bytecode replacement).
+
+    Catches any func.__code__ = other.__code__ regardless of module context.
+    The module-specific variant is handled by detect_module_mutation;
+    this catches the general case.
+    """
+    tree = _safe_ast_parse(code)
+    if tree is None:
+        return []
+
+    matches = []
+    assigned_lines: set[int] = set()
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Attribute) and target.attr == "__code__":
+                    lineno = getattr(node, "lineno", -1)
+                    assigned_lines.add(lineno)
+                    matches.append({
+                        "pattern": "CODE_REPLACEMENT",
+                        "severity": "critical",
+                        "evidence": f"__code__ assignment (bytecode replacement)",
+                    })
+
+    # Flag __code__ reads if no assignment found (extraction for later use)
+    if not assigned_lines:
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute) and node.attr == "__code__":
+                matches.append({
+                    "pattern": "CODE_ACCESS",
+                    "severity": "high",
+                    "evidence": "__code__ attribute read (potential bytecode extraction)",
+                })
+                break
+
+    return matches
+
+
+def detect_config_cache_exploit(code: str) -> list[dict]:
+    """AST pattern 7: config-keyed result caching inside custom_kernel.
+
+    Detects: custom_kernel that looks up a cache on entry, returns the cached
+    value WITHOUT calling any GPU kernel, and stores output into the cache
+    before the final return.
+
+    Distinguishes from legitimate workspace caching by requiring that the
+    early-return path does NOT contain any function calls (a real exploit
+    returns the cached tensor directly without computation).
+    """
+    tree = _safe_ast_parse(code)
+    if tree is None:
+        return []
+
+    matches = []
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if node.name != "custom_kernel":
+            continue
+
+        # Look for the specific pattern: cache hit → immediate return
+        # This is tighter than "any cache + any return" to avoid FPs on
+        # workspace caching where the kernel still runs after cache lookup.
+        has_cache_shortcircuit = False
+        has_cache_store = False
+
+        def _body_has_replay(body):
+            """Check if a block of statements contains a .replay() call."""
+            for s in body:
+                for n in ast.walk(s):
+                    if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                            and n.func.attr == "replay"):
+                        return True
+            return False
+
+        for child in ast.walk(node):
+            # Pattern 1: if key in cache / if cached is not None → return cached
+            # Detected via: If node where the body is [Return] and test involves cache
+            if isinstance(child, ast.If):
+                body_is_return = (
+                    len(child.body) <= 2
+                    and any(isinstance(s, ast.Return) for s in child.body)
+                )
+                # CUDA graph replay (graph.replay() + return output) is a standard
+                # optimization, not result caching — skip.
+                if body_is_return and not _body_has_replay(child.body):
+                    has_cache_shortcircuit = True
+
+            # Pattern 2: try: r = cache[key]; return r  except KeyError: pass
+            if isinstance(child, ast.Try):
+                # Check if try body is a cache lookup + return with except KeyError
+                try_has_return = any(isinstance(s, ast.Return) for s in child.body)
+                has_keyerror = any(
+                    isinstance(h.type, ast.Name) and h.type.id == "KeyError"
+                    for h in child.handlers
+                    if h.type is not None
+                )
+                if try_has_return and has_keyerror:
+                    has_cache_shortcircuit = True
+
+            # Check for cache[key] = output (store near end of function)
+            if isinstance(child, ast.Assign):
+                for target in child.targets:
+                    if isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name):
+                        has_cache_store = True
+                    # _last[0] = k pattern (list-index store)
+                    if (isinstance(target, ast.Subscript)
+                            and isinstance(target.value, ast.Name)
+                            and isinstance(target.slice, ast.Constant)
+                            and isinstance(target.slice.value, int)):
+                        has_cache_store = True
+
+        if has_cache_shortcircuit and has_cache_store:
+            matches.append({
+                "pattern": "CONFIG_CACHE_EXPLOIT",
+                "severity": "high",
+                "evidence": "custom_kernel short-circuits on cache hit + stores output (config-keyed result caching)",
+            })
+
+    return matches
+
+
+def detect_dynamic_execution(code: str) -> list[dict]:
+    """AST pattern 6: exec/eval/compile and dynamic import.
+
+    These can hide exploit code that static analysis cannot see.
+    """
+    tree = _safe_ast_parse(code)
+    if tree is None:
+        return []
+
+    matches = []
+    seen: set[str] = set()
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+
+        func_name = ""
+        if isinstance(node.func, ast.Name):
+            func_name = node.func.id
+        elif isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name):
+            func_name = f"{node.func.value.id}.{node.func.attr}"
+
+        if func_name in ("exec", "eval") and func_name not in seen:
+            seen.add(func_name)
+            matches.append({
+                "pattern": "DYNAMIC_EXECUTION",
+                "severity": "high",
+                "evidence": f"{func_name}() call (could hide exploit code)",
+            })
+        elif func_name == "importlib.reload" and func_name not in seen:
+            seen.add(func_name)
+            matches.append({
+                "pattern": "MODULE_RELOAD",
+                "severity": "high",
+                "evidence": "importlib.reload() (module state reset/manipulation)",
+            })
+
+    return matches
+
+
+def detect_thread_injection(code: str) -> list[dict]:
+    """AST pattern 8: background thread/process to offload computation.
+
+    The kernel spawns a background thread that performs the real work while
+    the main thread returns an empty/placeholder tensor immediately.  By the
+    time the correctness check runs the thread has finished.
+
+    Ref: reference exploit note: thread injection
+    """
+    tree = _safe_ast_parse(code)
+    if tree is None:
+        return []
+
+    matches = []
+    # Collect all imports to resolve aliases (e.g. `import threading as t`)
+    threading_aliases: set[str] = {"threading"}
+    mp_aliases: set[str] = {"multiprocessing"}
+    futures_aliases: set[str] = set()
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                name = alias.asname or alias.name
+                if alias.name == "threading":
+                    threading_aliases.add(name)
+                elif alias.name == "multiprocessing":
+                    mp_aliases.add(name)
+                elif alias.name == "concurrent.futures":
+                    futures_aliases.add(name)
+        elif isinstance(node, ast.ImportFrom):
+            if node.module == "threading":
+                for alias in node.names:
+                    name = alias.asname or alias.name
+                    if alias.name == "Thread":
+                        threading_aliases.add(name)
+            elif node.module == "multiprocessing":
+                for alias in node.names:
+                    name = alias.asname or alias.name
+                    if alias.name == "Process":
+                        mp_aliases.add(name)
+            elif node.module and node.module.startswith("concurrent"):
+                for alias in node.names:
+                    futures_aliases.add(alias.asname or alias.name)
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        # threading.Thread(...) or Thread(...)
+        if isinstance(node.func, ast.Attribute):
+            if (isinstance(node.func.value, ast.Name)
+                    and node.func.value.id in threading_aliases
+                    and node.func.attr == "Thread"):
+                matches.append({
+                    "pattern": "THREAD_INJECTION",
+                    "severity": "high",
+                    "evidence": f"{node.func.value.id}.Thread() — background thread offloads compute outside timing",
+                })
+            elif (isinstance(node.func.value, ast.Name)
+                    and node.func.value.id in mp_aliases
+                    and node.func.attr == "Process"):
+                matches.append({
+                    "pattern": "THREAD_INJECTION",
+                    "severity": "high",
+                    "evidence": f"{node.func.value.id}.Process() — background process offloads compute",
+                })
+            elif (isinstance(node.func.value, ast.Name)
+                    and node.func.value.id in futures_aliases
+                    and node.func.attr in ("ThreadPoolExecutor", "ProcessPoolExecutor")):
+                matches.append({
+                    "pattern": "THREAD_INJECTION",
+                    "severity": "high",
+                    "evidence": f"concurrent.futures.{node.func.attr}() — executor pool offloads compute",
+                })
+        elif isinstance(node.func, ast.Name):
+            if node.func.id == "Thread" and "Thread" in threading_aliases:
+                matches.append({
+                    "pattern": "THREAD_INJECTION",
+                    "severity": "high",
+                    "evidence": "Thread() — background thread offloads compute outside timing",
+                })
+            elif node.func.id == "Process" and "Process" in mp_aliases:
+                matches.append({
+                    "pattern": "THREAD_INJECTION",
+                    "severity": "high",
+                    "evidence": "Process() — background process offloads compute",
+                })
+
+    # Deduplicate
+    seen = set()
+    deduped = []
+    for m in matches:
+        key = m["evidence"]
+        if key not in seen:
+            seen.add(key)
+            deduped.append(m)
+    return deduped
+
+
+def detect_lazy_tensor(code: str) -> list[dict]:
+    """AST pattern 9: lazy tensor subclass that defers computation.
+
+    The kernel returns a torch.Tensor subclass whose data is not materialized.
+    Computation is deferred to __eq__, __torch_function__, or similar hooks
+    that run during the correctness check rather than during timing.
+
+    Ref: reference exploit note: lazy evaluation
+    """
+    tree = _safe_ast_parse(code)
+    if tree is None:
+        return []
+
+    matches = []
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef):
+            continue
+
+        # Check if class inherits from torch.Tensor
+        is_tensor_subclass = False
+        for base in node.bases:
+            if isinstance(base, ast.Attribute):
+                if (isinstance(base.value, ast.Name)
+                        and base.value.id == "torch" and base.attr == "Tensor"):
+                    is_tensor_subclass = True
+            elif isinstance(base, ast.Name) and base.id == "Tensor":
+                is_tensor_subclass = True
+
+        if not is_tensor_subclass:
+            continue
+
+        # Found a torch.Tensor subclass — check for suspicious methods
+        suspicious_methods = []
+        has_make_subclass = False
+
+        for child in ast.walk(node):
+            if isinstance(child, ast.FunctionDef):
+                if child.name in ("__eq__", "__torch_function__", "__torch_dispatch__"):
+                    suspicious_methods.append(child.name)
+            # _make_subclass call
+            if isinstance(child, ast.Attribute) and child.attr == "_make_subclass":
+                has_make_subclass = True
+
+        if suspicious_methods or has_make_subclass:
+            evidence_parts = [f"torch.Tensor subclass '{node.name}'"]
+            if has_make_subclass:
+                evidence_parts.append("_make_subclass()")
+            if suspicious_methods:
+                evidence_parts.append(f"deferred hooks: {', '.join(suspicious_methods)}")
+            matches.append({
+                "pattern": "LAZY_TENSOR",
+                "severity": "critical",
+                "evidence": " + ".join(evidence_parts) + " — computation deferred past timing",
+            })
+        else:
+            # Tensor subclass without known hooks — still suspicious
+            matches.append({
+                "pattern": "LAZY_TENSOR",
+                "severity": "high",
+                "evidence": f"torch.Tensor subclass '{node.name}' — may defer computation",
+            })
+
+    return matches
+
+
+def detect_precision_downgrade(code: str) -> list[dict]:
+    """AST pattern 10: silent precision downgrade for speed.
+
+    The kernel casts inputs to lower precision (fp16/bf16), computes faster,
+    then casts back to the original dtype.  This cheats the benchmark while
+    potentially passing allclose with loose tolerance.
+
+    Ref: reference exploit note: precision downgrading
+    """
+    tree = _safe_ast_parse(code)
+    if tree is None:
+        return []
+
+    matches = []
+
+    # Look inside custom_kernel (or the whole file if no custom_kernel found)
+    target_funcs = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name == "custom_kernel":
+                target_funcs.append(node)
+
+    if not target_funcs:
+        # No custom_kernel — scan top-level
+        target_funcs = [tree]
+
+    for func_node in target_funcs:
+        has_downcast = False
+        has_upcast = False
+        downcast_evidence = []
+
+        for node in ast.walk(func_node):
+            if not isinstance(node, ast.Call):
+                continue
+
+            # .half(), .bfloat16(), .float16() method calls
+            if isinstance(node.func, ast.Attribute):
+                attr = node.func.attr
+                if attr in ("half", "bfloat16", "float16"):
+                    has_downcast = True
+                    downcast_evidence.append(f".{attr}()")
+                elif attr in ("float", "double", "float32"):
+                    has_upcast = True
+                # .to(torch.float16), .to(dtype=torch.bfloat16)
+                elif attr == "to":
+                    for arg in node.args:
+                        if isinstance(arg, ast.Attribute) and isinstance(arg.value, ast.Name):
+                            if arg.value.id == "torch" and arg.attr in ("float16", "bfloat16", "half"):
+                                has_downcast = True
+                                downcast_evidence.append(f".to(torch.{arg.attr})")
+                            elif arg.value.id == "torch" and arg.attr in ("float32", "float64"):
+                                has_upcast = True
+                    for kw in node.keywords:
+                        if kw.arg == "dtype" and isinstance(kw.value, ast.Attribute):
+                            if (isinstance(kw.value.value, ast.Name)
+                                    and kw.value.value.id == "torch"
+                                    and kw.value.attr in ("float16", "bfloat16", "half")):
+                                has_downcast = True
+                                downcast_evidence.append(f".to(dtype=torch.{kw.value.attr})")
+                            elif (isinstance(kw.value.value, ast.Name)
+                                    and kw.value.value.id == "torch"
+                                    and kw.value.attr in ("float32", "float64")):
+                                has_upcast = True
+
+        if has_downcast and has_upcast:
+            evidence = ", ".join(dict.fromkeys(downcast_evidence))
+            matches.append({
+                "pattern": "PRECISION_DOWNGRADE",
+                "severity": "medium",
+                "evidence": f"Downcast ({evidence}) then upcast back — may cheat benchmark via lower precision",
+            })
+
+    return matches
+
+
+# ---------------------------------------------------------------------------
+# Score anomaly detection
+# ---------------------------------------------------------------------------
+
 def detect_score_anomaly(metadata: Optional[dict]) -> list[dict]:
-    """Score-based anomaly detection."""
+    """Score-based anomaly detection.
+
+    Works across all input modes:
+    - parquet: metadata has "score" (float)
+    - nvidia_archive: metadata has "scores" (list of floats)
+    - jsonl: metadata has "improved_score" / "baseline_score"
+    """
     if not metadata:
         return []
     matches = []
 
-    scores = metadata.get("scores", [])
+    # Normalize: collect all available scores into a unified list
+    all_scores: list[float] = []
+
+    # Parquet mode: singular "score"
+    score = metadata.get("score")
+    if score is not None and isinstance(score, (int, float)):
+        all_scores.append(score)
+
+    # NvidiaArchive mode: "scores" list
+    for s in metadata.get("scores", []):
+        if isinstance(s, (int, float)):
+            all_scores.append(s)
+
+    # JSONL mode
     improved_score = metadata.get("improved_score")
     baseline_score = metadata.get("baseline_score")
+    if improved_score is not None and isinstance(improved_score, (int, float)):
+        all_scores.append(improved_score)
 
-    # Check individual scores from NvidiaArchive format
-    for s in scores:
-        if isinstance(s, (int, float)) and s > 0:
-            if s < 1e-8:
-                matches.append({
-                    "pattern": "SCORE_IMPOSSIBLE",
-                    "severity": "critical",
-                    "evidence": f"Score {s:.2e} is physically impossible (<10ns)",
-                })
-                break
-            if s > 0.5:
-                matches.append({
-                    "pattern": "SCORE_BROKEN",
-                    "severity": "critical",
-                    "evidence": f"Score {s:.2e} suggests broken/inverted metric",
-                })
-                break
-
-    # Check JSONL scores
-    if improved_score and isinstance(improved_score, (int, float)):
-        if improved_score < 1e-8:
+    # Check score anomalies
+    for s in all_scores:
+        if not isinstance(s, (int, float)) or s <= 0:
+            continue
+        if s < 1e-8:
             matches.append({
                 "pattern": "SCORE_IMPOSSIBLE",
                 "severity": "critical",
-                "evidence": f"improved_score {improved_score:.2e} is physically impossible",
+                "evidence": f"Score {s:.2e} is physically impossible (<10ns)",
             })
-        if baseline_score and isinstance(baseline_score, (int, float)) and improved_score > 0:
-            speedup = baseline_score / improved_score
-            if speedup > 100:
-                matches.append({
-                    "pattern": "SCORE_EXTREME_SPEEDUP",
-                    "severity": "high",
-                    "evidence": f"Speedup {speedup:.1f}x over baseline is extreme",
-                })
+            break
+        if s < 5e-6:
+            matches.append({
+                "pattern": "SCORE_SUSPECT_FLOOR",
+                "severity": "high",
+                "evidence": f"Score {s:.2e}s is at/near HIP/CUDA event timing floor (~4µs)",
+            })
+            break
+        if s > 0.5:
+            matches.append({
+                "pattern": "SCORE_BROKEN",
+                "severity": "critical",
+                "evidence": f"Score {s:.2e} suggests broken/inverted metric",
+            })
+            break
+
+    # Extreme speedup check (JSONL mode)
+    if (improved_score and baseline_score
+            and isinstance(improved_score, (int, float))
+            and isinstance(baseline_score, (int, float))
+            and improved_score > 0):
+        speedup = baseline_score / improved_score
+        if speedup > 100:
+            matches.append({
+                "pattern": "SCORE_EXTREME_SPEEDUP",
+                "severity": "high",
+                "evidence": f"Speedup {speedup:.1f}x over baseline is extreme",
+            })
 
     return matches
 
@@ -995,6 +1693,7 @@ def detect_score_anomaly(metadata: Optional[dict]) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 CODE_DETECTORS = [
+    # Regex-based detectors (Layer 1)
     detect_timer_monkeypatch,
     detect_print_injection,
     detect_evaluator_exploit,
@@ -1009,6 +1708,17 @@ CODE_DETECTORS = [
     detect_hardcoded_shapes,
     detect_unsync_multistream,
     detect_cuda_event_disable_timing,
+    # AST-based detectors (Layer 2)
+    detect_trusted_module_import,
+    detect_module_mutation,
+    detect_globals_mutation,
+    detect_introspection_exploit,
+    detect_code_replacement,
+    detect_config_cache_exploit,
+    detect_dynamic_execution,
+    detect_thread_injection,
+    detect_lazy_tensor,
+    detect_precision_downgrade,
 ]
 
 
@@ -1019,7 +1729,30 @@ CODE_DETECTORS = [
 SEVERITY_ORDER = {"critical": 4, "high": 3, "medium": 2, "low": 1}
 
 
-FILTER_SOLO_MEDIUM = {"CUDA_GRAPH_REPLAY", "CUDA_GRAPH_PYTHON", "UNSYNC_MULTISTREAM"}
+FILTER_SOLO_MEDIUM = {"CUDA_GRAPH_REPLAY", "UNSYNC_MULTISTREAM"}
+DEFAULT_REFERENCE_CLASS = "default_reference"
+DEFAULT_REFERENCE_FILTER_REASON = "default_scaled_mm"
+DEFAULT_REFERENCE_ALLOWED_MEDIUM = {"DUPLICATE_SPAM"}
+
+
+def is_default_reference(matched_patterns: list[dict]) -> bool:
+    """Return True when the submission is effectively a default/reference path.
+
+    High-severity `_scaled_mm` hits are common in default/reference submissions.
+    Those rows should remain filterable, but they should not count as hacked
+    unless another independent strong signal is present.
+    """
+    strong_patterns = [
+        p["pattern"] for p in matched_patterns if p["severity"] in ("critical", "high")
+    ]
+    if not strong_patterns:
+        return False
+    if any(pattern != "SCALED_MM_REF" for pattern in strong_patterns):
+        return False
+
+    medium_families = {p["pattern"] for p in matched_patterns if p["severity"] == "medium"}
+    disqualifying_medium = medium_families - DEFAULT_REFERENCE_ALLOWED_MEDIUM - {"SCALED_MM_REF"}
+    return not disqualifying_medium
 
 
 def filter_reason(matched_patterns: list[dict]) -> str:
@@ -1027,6 +1760,8 @@ def filter_reason(matched_patterns: list[dict]) -> str:
     severities = [p["severity"] for p in matched_patterns]
     if not severities:
         return "none"
+    if is_default_reference(matched_patterns):
+        return DEFAULT_REFERENCE_FILTER_REASON
     max_sev = max(severities, key=lambda s: SEVERITY_ORDER.get(s, 0))
     if max_sev in ("critical", "high"):
         return "high_critical"
@@ -1035,30 +1770,36 @@ def filter_reason(matched_patterns: list[dict]) -> str:
         non_dup = medium_families - {"DUPLICATE_SPAM"}
         if non_dup & FILTER_SOLO_MEDIUM:
             return "solo_medium_graph"
-    if len(medium_families) >= 2:
-        if medium_families == {"DUPLICATE_SPAM"}:
-            return "duplicate_only"
+    code_mediums = medium_families - {"DUPLICATE_SPAM"}
+    if "CUDA_GRAPH_PYTHON" in code_mediums and "RESULT_CACHING" in code_mediums:
+        code_mediums.discard("CUDA_GRAPH_PYTHON")
+    if len(code_mediums) >= 2:
         return "medium_combo"
-    if len(medium_families) == 1:
-        if medium_families == {"DUPLICATE_SPAM"}:
-            return "duplicate_only"
-        return "solo_medium_graph"
+    if len(code_mediums) == 1:
+        return "solo_medium"
+    if medium_families:
+        return "duplicate_only"
     return "none"
 
 
 def classify(matched_patterns: list[dict]) -> tuple[str, bool]:
     """Return (classification, should_filter) from matched patterns.
 
-    Four levels (all non-hacked levels are should_filter=False):
-      hacked        — confirmed hack patterns (critical/high) OR medium-combo that
-                      clears the filter threshold; always filtered.
-      suspicious    — 1 medium-family signal, not strong enough to filter alone;
-                      flagged for manual review.
-      low_confidence — low-severity signals only; probably legitimate.
-      valid          — no signals detected.
+    Five levels:
+      hacked            — confirmed hack patterns (critical/high) OR medium-combo
+                          that clears the filter threshold; always filtered.
+      default_reference — default/reference behavior (primarily `_scaled_mm`)
+                          that should be filtered but not counted as hacked.
+      suspicious        — 1 medium-family signal, not strong enough to filter alone;
+                          flagged for manual review.
+      low_confidence    — low-severity signals only; probably legitimate.
+      valid             — no signals detected.
     """
     if not matched_patterns:
         return "valid", False
+
+    if is_default_reference(matched_patterns):
+        return DEFAULT_REFERENCE_CLASS, True
 
     severities = [p["severity"] for p in matched_patterns]
     max_sev = max(severities, key=lambda s: SEVERITY_ORDER.get(s, 0))
@@ -1075,10 +1816,21 @@ def classify(matched_patterns: list[dict]) -> tuple[str, bool]:
     if medium_families & FILTER_SOLO_MEDIUM:
         return "hacked", True
 
-    if len(medium_families) >= 2:
+    # DUPLICATE_SPAM is an administrative signal (same code submitted multiple
+    # times), not a code-analysis signal.  Don't let it amplify other mediums.
+    # CUDA_GRAPH_PYTHON always co-occurs with RESULT_CACHING (the cache-return
+    # pattern is inherent to CUDA graph replay) — don't double-count.
+    code_mediums = medium_families - {"DUPLICATE_SPAM"}
+    if "CUDA_GRAPH_PYTHON" in code_mediums and "RESULT_CACHING" in code_mediums:
+        code_mediums.discard("CUDA_GRAPH_PYTHON")
+    if len(code_mediums) >= 2:
         return "hacked", True
 
-    if len(medium_families) == 1:
+    if len(code_mediums) == 1:
+        return "suspicious", False
+
+    # Only DUPLICATE_SPAM left (if any) — not strong enough to filter alone.
+    if medium_families:
         return "suspicious", False
 
     # No medium signals — only low-severity hits (e.g. HARDCODED_SHAPES, TORCH_COMPILE_CACHE).
@@ -1212,9 +1964,8 @@ def _worker_jsonl(args: tuple) -> Optional[dict]:
         p["field"] = "baseline_code"
         all_patterns.append(p)
 
-    classification, _ = classify(all_patterns)
     improved_only = [p for p in all_patterns if p["field"] == "improved_code"]
-    _, should_filter = classify(improved_only)
+    classification, should_filter = classify(improved_only)
     reason = filter_reason(improved_only) if should_filter else None
 
     return {
@@ -1453,9 +2204,8 @@ def scan_jsonl(jsonl_path: str, results_path: str, cleaned_path: str, summary_pa
             })
         if extra_patterns:
             r["matched_patterns"].extend(extra_patterns)
-            r["classification"], _ = classify(r["matched_patterns"])
             _imp_only = [p for p in r["matched_patterns"] if p.get("field") == "improved_code"]
-            _, r["should_filter"] = classify(_imp_only)
+            r["classification"], r["should_filter"] = classify(_imp_only)
             r["filter_reason"] = filter_reason(_imp_only) if r["should_filter"] else None
 
     # Second pass: write results and cleaned JSONL
@@ -1540,49 +2290,67 @@ def scan_jsonl(jsonl_path: str, results_path: str, cleaned_path: str, summary_pa
 # Mode C: Parquet dataset scan
 # ---------------------------------------------------------------------------
 
+def _iter_parquet_args(pf, cols: list, batch_size: int):
+    """Generator: yield worker arg tuples one row at a time, reading the parquet in
+    arrow batches so only one batch is live in the main process at a time."""
+    for batch in pf.iter_batches(batch_size=batch_size, columns=cols):
+        for r in batch.to_pylist():
+            yield (
+                int(r["submission_id"]),
+                int(r["leaderboard_id"]),
+                str(r["user_id"]),
+                str(r["user_name"]),
+                str(r["problem_name"]),
+                float(r["score"]) if r["score"] is not None else None,
+                bool(r["passed"]),
+                str(r["code"]) if r["code"] else "",
+            )
+
+
 def scan_parquet(parquet_path: str, results_path: str, best_path: str, summary_path: str,
-                 workers: int = 0):
+                 workers: int = 0, batch_size: int = 2000):
     """Scan a submission parquet file using parallel workers.
 
-    Outputs per-submission results and a best-per-user-per-problem summary.
-    workers: number of parallel worker processes (0 = os.cpu_count()).
+    Streams via a generator so only batch_size rows are loaded at a time in the
+    main process, keeping forked worker memory usage low.
+
+    workers: parallel workers (0 = min(8, cpu_count) — capped to avoid OOM).
+    batch_size: rows per arrow read batch.
     """
     try:
-        import pandas as pd
+        import pyarrow.parquet as pq
     except ImportError:
-        sys.exit("pandas is required for --parquet mode: pip install pandas pyarrow")
+        sys.exit("pyarrow is required for --parquet mode: pip install pyarrow")
 
-    n_workers = workers if workers > 0 else (os.cpu_count() or 1)
-    print(f"Scanning {parquet_path}  [{n_workers} workers]")
+    # Default to min(8, cpu_count) — 32 workers OOMs on large files
+    n_workers = workers if workers > 0 else min(8, os.cpu_count() or 1)
+    print(f"Scanning {parquet_path}  [{n_workers} workers, batch_size={batch_size}]")
 
+    pf = pq.ParquetFile(parquet_path)
     cols = ["submission_id", "leaderboard_id", "user_id", "user_name",
             "problem_name", "score", "passed", "code"]
-    df = pd.read_parquet(parquet_path, columns=cols)
-    total = len(df)
-    print(f"  Loaded {total} rows: {df['problem_name'].nunique()} problems, "
-          f"{df['user_id'].nunique()} users")
+    total = pf.metadata.num_rows
+    print(f"  {total:,} rows in file")
 
-    # Build worker args as plain tuples (picklable, no pandas objects)
-    worker_args = [
-        (row.submission_id, row.leaderboard_id, row.user_id, row.user_name,
-         row.problem_name, row.score, row.passed, row.code or "")
-        for row in df.itertuples(index=False)
-    ]
-
-    chunksize = max(1, total // (n_workers * 8))
     all_results: list[dict] = []
     hash_groups: dict = defaultdict(list)
     done = 0
 
+    # Single imap_unordered over a generator — workers stay saturated, no idle
+    # gaps between batches.  chunksize=50 keeps IPC overhead low.
     with mp.Pool(n_workers) as pool:
-        for result in pool.imap_unordered(_worker_parquet, worker_args, chunksize=chunksize):
+        for result in pool.imap_unordered(
+            _worker_parquet,
+            _iter_parquet_args(pf, cols, batch_size),
+            chunksize=50,
+        ):
             all_results.append(result)
             hash_groups[result["code_hash"]].append(result["submission_id"])
             done += 1
             if done % 10000 == 0:
                 print(f"  Processed {done}/{total}...")
 
-    print(f"  Processed {done} submissions total")
+    print(f"  Processed {done:,} submissions total")
 
     # Attach duplicate spam
     for r in all_results:
