@@ -13,6 +13,7 @@ Usage:
 
 import argparse
 import ast
+from dataclasses import asdict, dataclass
 import glob
 import hashlib
 import json
@@ -21,6 +22,8 @@ import os
 import re
 import sys
 from collections import Counter, defaultdict
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 # ---------------------------------------------------------------------------
@@ -70,6 +73,7 @@ RE_MAIN_SETATTR_PATCH = re.compile(
 # Pattern 4: torch._scaled_mm reference
 RE_SCALED_MM_PYTHON = re.compile(r'torch\._scaled_mm\s*\(')
 RE_SCALED_MM_ALIAS = re.compile(r'=\s*torch\._scaled_mm\s*(?!\()$', re.MULTILINE)  # _mm = torch._scaled_mm (not a call)
+RE_SCALED_MM_ALIAS_ASSIGN = re.compile(r'^\s*(\w+)\s*=\s*torch\._scaled_mm\s*$', re.MULTILINE)
 RE_SCALED_MM_CPP = re.compile(r'aten::_scaled_mm')
 RE_SCALED_MM_SCHEMA = re.compile(r'findSchemaOrThrow\s*\(\s*["\']aten::_scaled_mm')
 RE_SCALED_MM_ANY = re.compile(r'_scaled_mm')
@@ -231,6 +235,24 @@ def find_main_aliases(code: str) -> set[str]:
     return aliases
 
 
+def find_scaled_mm_aliases(code: str) -> set[str]:
+    """Collect local aliases bound directly to torch._scaled_mm."""
+    aliases = set()
+    for m in re.finditer(r'^\s*(\w+)\s*=\s*torch\._scaled_mm\s*$', code, re.MULTILINE):
+        aliases.add(m.group(1))
+    return aliases
+
+
+def function_uses_scaled_mm(func_body: str, alias_names: set[str]) -> bool:
+    """Return True when a function body calls torch._scaled_mm or one of its aliases."""
+    if RE_SCALED_MM_PYTHON.search(func_body):
+        return True
+    for alias in alias_names:
+        if re.search(rf'\b{re.escape(alias)}\s*\(', func_body):
+            return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Detectors
 # ---------------------------------------------------------------------------
@@ -384,23 +406,23 @@ def detect_scaled_mm_ref(code: str) -> list[dict]:
 
         has_python_after = bool(RE_SCALED_MM_PYTHON.search(code_from_ck))
         has_alias_after = bool(RE_SCALED_MM_ALIAS.search(code_from_ck))
-        # Module-level alias before custom_kernel is callable from it
-        has_alias_before = bool(RE_SCALED_MM_ALIAS.search(code_before_ck))
+        alias_names_before = find_scaled_mm_aliases(code_before_ck)
+        has_alias_before = bool(alias_names_before)
         has_cpp = bool(RE_SCALED_MM_CPP.search(code))
         has_schema = bool(RE_SCALED_MM_SCHEMA.search(code))
 
-        # _scaled_mm only before custom_kernel with no alias — check if
-        # custom_kernel calls a helper that uses _scaled_mm.
+        # _scaled_mm only before custom_kernel — check if custom_kernel actually
+        # reaches that code path through a helper or a direct alias call.
         has_python_before = bool(RE_SCALED_MM_PYTHON.search(code_before_ck))
-        if (has_python_before and not has_python_after and
-                not has_alias_before and not has_alias_after and
+        if ((has_python_before or has_alias_before) and not has_python_after and
+                not has_alias_after and
                 not has_cpp and not has_schema):
             # Find function names defined before custom_kernel that use _scaled_mm
             helper_funcs_with_mm = set()
             for func_m in re.finditer(r'^def\s+(\w+)\s*\(', code_before_ck, re.MULTILINE):
                 func_name = func_m.group(1)
                 func_body = extract_function_block(code_before_ck, func_name)
-                if RE_SCALED_MM_PYTHON.search(func_body):
+                if function_uses_scaled_mm(func_body, alias_names_before):
                     helper_funcs_with_mm.add(func_name)
             # Strip Python comments from custom_kernel body before call-site analysis
             # so that commented-out calls (e.g. # result = ref_kernel(data)) are ignored.
@@ -421,6 +443,16 @@ def detect_scaled_mm_ref(code: str) -> list[dict]:
                     after = ck_active[assign_m.end():]
                     if re.search(rf'\breturn\s+{re.escape(var)}\b', after):
                         compute_helpers.add(fn)
+            for alias in alias_names_before:
+                if re.search(rf'\breturn\s+{re.escape(alias)}\s*\(', ck_active):
+                    compute_helpers.add(alias)
+                    continue
+                assign_m = re.search(rf'\b(\w+)\s*=\s*{re.escape(alias)}\s*\(', ck_active)
+                if assign_m:
+                    var = assign_m.group(1)
+                    after = ck_active[assign_m.end():]
+                    if re.search(rf'\breturn\s+{re.escape(var)}\b', after):
+                        compute_helpers.add(alias)
             if compute_helpers:
                 # Distinguish pure delegation from benchmark-shape if/else fallback.
                 # Two conditions must BOTH hold to downgrade to medium:
@@ -470,6 +502,10 @@ def detect_scaled_mm_ref(code: str) -> list[dict]:
             # Otherwise (assigned but not returned) it is a medium signal.
             validation_calls = {fn for fn in helper_funcs_with_mm
                                 if re.search(rf'\b{re.escape(fn)}\s*\(', ck_active)}
+            validation_calls.update(
+                alias for alias in alias_names_before
+                if re.search(rf'\b{re.escape(alias)}\s*\(', ck_active)
+            )
             if validation_calls:
                 inplace = {fn for fn in validation_calls
                            if re.search(rf'^\s*{re.escape(fn)}\s*\(', ck_active, re.MULTILINE)}
@@ -495,11 +531,12 @@ def detect_scaled_mm_ref(code: str) -> list[dict]:
                     "evidence": f"_scaled_mm in helper(s) before custom_kernel: {', '.join(sorted(helper_funcs_with_mm))} (not called in active code)",
                 })
                 return matches
-            # _scaled_mm in module-level code before custom_kernel (no helper function) → likely reference
+            # _scaled_mm or an alias only appears before custom_kernel and is never
+            # reached from it → likely reference/dead code, not the submission path.
             return []
 
         has_python = has_python_after
-        has_alias = has_alias_before or has_alias_after
+        has_alias = has_alias_after
     else:
         has_python = bool(RE_SCALED_MM_PYTHON.search(code))
         has_alias = bool(RE_SCALED_MM_ALIAS.search(code))
@@ -1247,6 +1284,186 @@ def detect_code_replacement(code: str) -> list[dict]:
     return matches
 
 
+TRUSTED_HARNESS_NAMES = frozenset({
+    "generate_input", "check_implementation", "clear_l2_cache",
+    "clear_l2_cache_large", "_clone_data", "ref_kernel",
+})
+
+
+def detect_harness_runtime_patching(code: str) -> list[dict]:
+    """AST pattern: dynamic runtime patching of trusted evaluator functions.
+
+    Targets the ooousay-style exploit family that scans `sys.modules` / `gc`
+    for live evaluator objects, then rewrites module attrs or function globals
+    through helper functions instead of direct `reference.foo = ...` syntax.
+    """
+    tree = _safe_ast_parse(code)
+    if tree is None:
+        return []
+
+    dynamic_discovery = set()
+    trusted_targets: set[str] = set()
+    globals_write = False
+    setattr_write = False
+
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "sys"
+                and node.attr == "modules"):
+            dynamic_discovery.add("sys.modules")
+        elif (isinstance(node, ast.Call)
+              and isinstance(node.func, ast.Attribute)
+              and isinstance(node.func.value, ast.Name)
+              and node.func.value.id == "gc"
+              and node.func.attr == "get_objects"):
+            dynamic_discovery.add("gc.get_objects")
+
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if node.value in TRUSTED_HARNESS_NAMES:
+                trusted_targets.add(node.value)
+
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "setattr":
+            if len(node.args) >= 2:
+                name_arg = node.args[1]
+                if isinstance(name_arg, ast.Constant) and name_arg.value in TRUSTED_HARNESS_NAMES:
+                    setattr_write = True
+                elif isinstance(name_arg, ast.Name):
+                    setattr_write = True
+
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Subscript):
+                    if any(
+                        isinstance(sub, ast.Attribute) and sub.attr == "__globals__"
+                        for sub in ast.walk(target)
+                    ):
+                        globals_write = True
+
+    if dynamic_discovery and (globals_write or setattr_write) and len(trusted_targets) >= 2:
+        channels = ", ".join(sorted(dynamic_discovery))
+        targets = ", ".join(sorted(trusted_targets))
+        return [{
+            "pattern": "HARNESS_RUNTIME_PATCHING",
+            "severity": "critical",
+            "evidence": f"dynamic harness patching via {channels} targeting {targets}",
+        }]
+    return []
+
+
+RE_REFERENCE_GENERATE_INPUT = re.compile(r'from\s+reference\s+import\s+generate_input')
+RE_PRECOMPUTE_STATE = re.compile(r'\b(?:_PRECOMPUTE_STATE|_PUBLIC_CASES|_PUBLIC_WARMUP_DUPLICATES)\b')
+RE_PRECOMPUTE_APPEND = re.compile(r'outputs\.append\s*\(\s*_compute_output\s*\(')
+RE_PRECOMPUTE_REPLAY = re.compile(r'state\.outputs\s*\[\s*state\.cursor\s*\]')
+
+
+def detect_reference_precompute_replay(code: str) -> list[dict]:
+    """Pattern: import trusted reference generator, precompute public cases, replay outputs.
+
+    This targets files that do not mutate evaluator state but still leverage
+    trusted `reference.generate_input` to synthesize benchmark cases ahead of
+    timing and then return precomputed outputs.
+    """
+    if not RE_REFERENCE_GENERATE_INPUT.search(code):
+        return []
+    if not RE_PRECOMPUTE_STATE.search(code):
+        return []
+    if len(re.findall(r'\bgenerate_input\s*\(', code)) < 2:
+        return []
+    if not RE_PRECOMPUTE_APPEND.search(code):
+        return []
+    if not RE_PRECOMPUTE_REPLAY.search(code):
+        return []
+
+    return [{
+        "pattern": "REFERENCE_PRECOMPUTE_REPLAY",
+        "severity": "critical",
+        "evidence": "trusted reference.generate_input imported, public cases precomputed, outputs replayed from precompute state",
+    }]
+
+
+def detect_pointer_replay(code: str) -> list[dict]:
+    """Pattern: single-slot output replay keyed by input pointer equality."""
+    tree = _safe_ast_parse(code)
+    if tree is None:
+        return []
+
+    def _is_data_ptr_call(expr: ast.AST | None) -> bool:
+        return (
+            isinstance(expr, ast.Call)
+            and isinstance(expr.func, ast.Attribute)
+            and expr.func.attr == "data_ptr"
+        )
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if node.name != "custom_kernel":
+            continue
+
+        pointer_aliases: set[str] = set()
+        saved_ptr = None
+        saved_out = None
+
+        for child in ast.walk(node):
+            if isinstance(child, ast.Assign):
+                if len(child.targets) == 1 and isinstance(child.targets[0], ast.Name):
+                    if _is_data_ptr_call(child.value):
+                        pointer_aliases.add(child.targets[0].id)
+
+        for child in ast.walk(node):
+            if not isinstance(child, ast.If):
+                continue
+            compare = child.test
+            if not (isinstance(compare, ast.Compare) and len(compare.ops) == 1 and isinstance(compare.ops[0], ast.Eq)):
+                continue
+            left = compare.left
+            right = compare.comparators[0]
+            pair = None
+            if isinstance(left, ast.Name) and left.id in pointer_aliases and isinstance(right, ast.Name):
+                pair = (right.id, left.id)
+            elif isinstance(right, ast.Name) and right.id in pointer_aliases and isinstance(left, ast.Name):
+                pair = (left.id, right.id)
+            elif _is_data_ptr_call(left) and isinstance(right, ast.Name):
+                pair = (right.id, None)
+            elif _is_data_ptr_call(right) and isinstance(left, ast.Name):
+                pair = (left.id, None)
+            if pair is None:
+                continue
+            returns = [stmt for stmt in child.body if isinstance(stmt, ast.Return) and isinstance(stmt.value, ast.Name)]
+            if not returns:
+                continue
+            saved_ptr = pair[0]
+            saved_out = returns[0].value.id
+            break
+
+        if not saved_ptr or not saved_out:
+            continue
+
+        stores_ptr = False
+        stores_out = False
+        for child in ast.walk(node):
+            if not isinstance(child, ast.Assign):
+                continue
+            for target in child.targets:
+                if not isinstance(target, ast.Name):
+                    continue
+                if target.id == saved_ptr:
+                    if (isinstance(child.value, ast.Name) and child.value.id in pointer_aliases) or _is_data_ptr_call(child.value):
+                        stores_ptr = True
+                elif target.id == saved_out:
+                    stores_out = True
+
+        if stores_ptr and stores_out:
+            return [{
+                "pattern": "POINTER_REPLAY",
+                "severity": "critical",
+                "evidence": "custom_kernel returns saved output when input data_ptr matches previous pointer",
+            }]
+
+    return []
+
+
 def detect_config_cache_exploit(code: str) -> list[dict]:
     """AST pattern 7: config-keyed result caching inside custom_kernel.
 
@@ -1270,59 +1487,119 @@ def detect_config_cache_exploit(code: str) -> list[dict]:
         if node.name != "custom_kernel":
             continue
 
-        # Look for the specific pattern: cache hit → immediate return
-        # This is tighter than "any cache + any return" to avoid FPs on
-        # workspace caching where the kernel still runs after cache lookup.
-        has_cache_shortcircuit = False
-        has_cache_store = False
+        def _root_name(expr: ast.AST | None) -> Optional[str]:
+            cur = expr
+            while cur is not None:
+                if isinstance(cur, ast.Name):
+                    return cur.id
+                if isinstance(cur, ast.Attribute):
+                    cur = cur.value
+                    continue
+                if isinstance(cur, ast.Subscript):
+                    cur = cur.value
+                    continue
+                break
+            return None
 
-        def _body_has_replay(body):
-            """Check if a block of statements contains a .replay() call."""
-            for s in body:
-                for n in ast.walk(s):
-                    if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
-                            and n.func.attr == "replay"):
+        def _lookup_source(expr: ast.AST | None, sources: dict[str, str]) -> Optional[str]:
+            root = _root_name(expr)
+            if root is None:
+                return None
+            return sources.get(root, root)
+
+        def _body_has_calls(body: list[ast.stmt]) -> bool:
+            for stmt in body:
+                for nested in ast.walk(stmt):
+                    if isinstance(nested, ast.Call):
                         return True
             return False
 
+        cache_reads: dict[str, str] = {}
         for child in ast.walk(node):
-            # Pattern 1: if key in cache / if cached is not None → return cached
-            # Detected via: If node where the body is [Return] and test involves cache
+            if not isinstance(child, ast.Assign):
+                continue
+            if len(child.targets) != 1 or not isinstance(child.targets[0], ast.Name):
+                continue
+            source = None
+            if (isinstance(child.value, ast.Call)
+                    and isinstance(child.value.func, ast.Attribute)
+                    and child.value.func.attr == "get"):
+                source = _root_name(child.value.func.value)
+            elif isinstance(child.value, ast.Subscript):
+                source = _root_name(child.value.value)
+            if source:
+                cache_reads[child.targets[0].id] = source
+
+        returned_roots = {
+            _lookup_source(sub.value, cache_reads)
+            for sub in ast.walk(node)
+            if isinstance(sub, ast.Return)
+        } - {None}
+        shortcircuit_containers: set[str] = set()
+        store_containers: set[str] = set()
+
+        for child in ast.walk(node):
             if isinstance(child, ast.If):
-                body_is_return = (
-                    len(child.body) <= 2
-                    and any(isinstance(s, ast.Return) for s in child.body)
-                )
-                # CUDA graph replay (graph.replay() + return output) is a standard
-                # optimization, not result caching — skip.
-                if body_is_return and not _body_has_replay(child.body):
-                    has_cache_shortcircuit = True
+                if not any(isinstance(stmt, ast.Return) for stmt in child.body):
+                    continue
+                if _body_has_calls(child.body):
+                    continue
+                return_roots = {
+                    _lookup_source(stmt.value, cache_reads)
+                    for stmt in child.body
+                    if isinstance(stmt, ast.Return)
+                } - {None}
+                if not return_roots:
+                    continue
+                test_roots = {
+                    _lookup_source(sub, cache_reads)
+                    for sub in ast.walk(child.test)
+                    if isinstance(sub, (ast.Name, ast.Attribute, ast.Subscript))
+                } - {None}
+                shortcircuit_containers.update(return_roots & test_roots)
 
-            # Pattern 2: try: r = cache[key]; return r  except KeyError: pass
             if isinstance(child, ast.Try):
-                # Check if try body is a cache lookup + return with except KeyError
-                try_has_return = any(isinstance(s, ast.Return) for s in child.body)
+                if _body_has_calls(child.body):
+                    continue
                 has_keyerror = any(
-                    isinstance(h.type, ast.Name) and h.type.id == "KeyError"
-                    for h in child.handlers
-                    if h.type is not None
+                    isinstance(handler.type, ast.Name) and handler.type.id == "KeyError"
+                    for handler in child.handlers
+                    if handler.type is not None
                 )
-                if try_has_return and has_keyerror:
-                    has_cache_shortcircuit = True
+                if not has_keyerror:
+                    continue
+                local_sources = dict(cache_reads)
+                for stmt in child.body:
+                    if not isinstance(stmt, ast.Assign):
+                        continue
+                    if len(stmt.targets) != 1 or not isinstance(stmt.targets[0], ast.Name):
+                        continue
+                    source = None
+                    if isinstance(stmt.value, ast.Subscript):
+                        source = _root_name(stmt.value.value)
+                    elif (isinstance(stmt.value, ast.Call)
+                          and isinstance(stmt.value.func, ast.Attribute)
+                          and stmt.value.func.attr == "get"):
+                        source = _root_name(stmt.value.func.value)
+                    if source:
+                        local_sources[stmt.targets[0].id] = source
+                for stmt in child.body:
+                    if isinstance(stmt, ast.Return):
+                        resolved = _lookup_source(stmt.value, local_sources)
+                        if resolved:
+                            shortcircuit_containers.add(resolved)
 
-            # Check for cache[key] = output (store near end of function)
             if isinstance(child, ast.Assign):
+                value_root = _lookup_source(child.value, cache_reads)
+                if value_root not in returned_roots:
+                    continue
                 for target in child.targets:
-                    if isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name):
-                        has_cache_store = True
-                    # _last[0] = k pattern (list-index store)
-                    if (isinstance(target, ast.Subscript)
-                            and isinstance(target.value, ast.Name)
-                            and isinstance(target.slice, ast.Constant)
-                            and isinstance(target.slice.value, int)):
-                        has_cache_store = True
+                    if isinstance(target, ast.Subscript):
+                        target_root = _root_name(target.value)
+                        if target_root:
+                            store_containers.add(target_root)
 
-        if has_cache_shortcircuit and has_cache_store:
+        if shortcircuit_containers & store_containers:
             matches.append({
                 "pattern": "CONFIG_CACHE_EXPLOIT",
                 "severity": "high",
@@ -1354,12 +1631,19 @@ def detect_dynamic_execution(code: str) -> list[dict]:
         elif isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name):
             func_name = f"{node.func.value.id}.{node.func.attr}"
 
-        if func_name in ("exec", "eval") and func_name not in seen:
+        if func_name in ("exec", "eval", "compile", "__import__") and func_name not in seen:
             seen.add(func_name)
             matches.append({
                 "pattern": "DYNAMIC_EXECUTION",
                 "severity": "high",
                 "evidence": f"{func_name}() call (could hide exploit code)",
+            })
+        elif func_name == "importlib.import_module" and func_name not in seen:
+            seen.add(func_name)
+            matches.append({
+                "pattern": "DYNAMIC_EXECUTION",
+                "severity": "high",
+                "evidence": "importlib.import_module() (dynamic module loading)",
             })
         elif func_name == "importlib.reload" and func_name not in seen:
             seen.add(func_name)
@@ -1689,6 +1973,229 @@ def detect_score_anomaly(metadata: Optional[dict]) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Rule policies and detector registry
+# ---------------------------------------------------------------------------
+
+AUTO_FILTER = "auto_filter"
+SUSPICIOUS_ONLY = "suspicious"
+TELEMETRY_ONLY = "low_confidence"
+
+
+@dataclass(frozen=True)
+class RulePolicy:
+    rule_name: str
+    technique_family: str
+    evidence_tier: str
+    max_outcome: str
+    requires_companion_patterns: tuple[str, ...]
+    mapped_positive_fixtures: tuple[str, ...]
+    default_verdict: str
+
+
+AMD_CODE_REPLACEMENT_FIXTURES = ("amd:514036",)
+AMD_MODULE_MUTATION_FIXTURES = (
+    "amd:514274", "amd:514288", "amd:514336", "amd:514350", "amd:514361",
+    "amd:514378", "amd:514394", "amd:515019", "amd:515037", "amd:515048",
+    "amd:515064", "amd:515082", "amd:515102", "amd:515123", "amd:519613",
+    "amd:519659", "amd:519693", "amd:521294", "amd:521414",
+)
+AMD_CONFIG_CACHE_FIXTURES = ("amd:520921", "amd:521087", "amd:521134", "amd:521160")
+AMD_MANUAL_HARNESS_FIXTURES = ("manual_review:515117",)
+AMD_MANUAL_PRECOMPUTE_FIXTURES = ("manual_review:514553",)
+AMD_MANUAL_POINTER_REPLAY_FIXTURES = ("manual_review:515367",)
+NVIDIA_ARCHIVE_TIMER_FIXTURES = (
+    "nvidia_archive:108465", "nvidia_archive:108477", "nvidia_archive:108609", "nvidia_archive:108878",
+    "nvidia_archive:121398", "nvidia_archive:121401",
+)
+NVIDIA_ARCHIVE_PRINT_FIXTURES = (
+    "nvidia_archive:116696", "nvidia_archive:116697", "nvidia_archive:116709",
+    "nvidia_archive:121398", "nvidia_archive:121401",
+)
+NVIDIA_ARCHIVE_EVALUATOR_FIXTURES = (
+    "nvidia_archive:108465", "nvidia_archive:108477", "nvidia_archive:108609", "nvidia_archive:108878",
+)
+
+
+RULE_REGISTRY: dict[str, RulePolicy] = {
+    "TIMER_MONKEYPATCH": RulePolicy(
+        "TIMER_MONKEYPATCH", "timing_monkeypatch", "hard", AUTO_FILTER, (),
+        NVIDIA_ARCHIVE_TIMER_FIXTURES, "keep",
+    ),
+    "PRINT_INJECTION": RulePolicy(
+        "PRINT_INJECTION", "benchmark_output_injection", "hard", AUTO_FILTER, (),
+        NVIDIA_ARCHIVE_PRINT_FIXTURES, "keep",
+    ),
+    "EVALUATOR_EXPLOIT": RulePolicy(
+        "EVALUATOR_EXPLOIT", "evaluator_state_mutation", "hard", AUTO_FILTER, (),
+        NVIDIA_ARCHIVE_EVALUATOR_FIXTURES, "keep",
+    ),
+    "HARNESS_RUNTIME_PATCHING": RulePolicy(
+        "HARNESS_RUNTIME_PATCHING", "evaluator_state_mutation", "hard", AUTO_FILTER, (),
+        AMD_MANUAL_HARNESS_FIXTURES, "keep",
+    ),
+    "SCALED_MM_REF": RulePolicy(
+        "SCALED_MM_REF", "reference_path_heuristic", "telemetry", TELEMETRY_ONLY, (),
+        (), "split",
+    ),
+    "DECODE_MM_REF": RulePolicy(
+        "DECODE_MM_REF", "reference_path_heuristic", "telemetry", SUSPICIOUS_ONLY, (),
+        (), "rewrite",
+    ),
+    "RESULT_CACHING": RulePolicy(
+        "RESULT_CACHING", "result_reuse", "support", SUSPICIOUS_ONLY, (),
+        AMD_CONFIG_CACHE_FIXTURES, "rewrite",
+    ),
+    "CUDA_GRAPH_REPLAY": RulePolicy(
+        "CUDA_GRAPH_REPLAY", "timing_manipulation", "telemetry", TELEMETRY_ONLY, (),
+        (), "downgrade",
+    ),
+    "SILENT_FALLBACK": RulePolicy(
+        "SILENT_FALLBACK", "reference_path_heuristic", "telemetry", TELEMETRY_ONLY, (),
+        (), "downgrade",
+    ),
+    "TRIVIAL_PROBE": RulePolicy(
+        "TRIVIAL_PROBE", "low_signal", "telemetry", TELEMETRY_ONLY, (),
+        (), "downgrade",
+    ),
+    "TORCH_COMPILE_CACHE": RulePolicy(
+        "TORCH_COMPILE_CACHE", "performance_heuristic", "telemetry", TELEMETRY_ONLY, (),
+        (), "downgrade",
+    ),
+    "CUDA_GRAPH_PYTHON": RulePolicy(
+        "CUDA_GRAPH_PYTHON", "timing_manipulation", "telemetry", TELEMETRY_ONLY, (),
+        (), "downgrade",
+    ),
+    "HARDCODED_SHAPES": RulePolicy(
+        "HARDCODED_SHAPES", "performance_heuristic", "telemetry", TELEMETRY_ONLY, (),
+        (), "downgrade",
+    ),
+    "UNSYNC_MULTISTREAM": RulePolicy(
+        "UNSYNC_MULTISTREAM", "timing_manipulation", "telemetry", TELEMETRY_ONLY, (),
+        (), "downgrade",
+    ),
+    "CUDA_EVENT_DISABLE_TIMING": RulePolicy(
+        "CUDA_EVENT_DISABLE_TIMING", "timing_manipulation", "telemetry", TELEMETRY_ONLY, (),
+        (), "downgrade",
+    ),
+    "TRUSTED_MODULE_IMPORT": RulePolicy(
+        "TRUSTED_MODULE_IMPORT", "evaluator_state_support", "support", SUSPICIOUS_ONLY,
+        ("MODULE_MUTATION", "GLOBALS_MUTATION", "CODE_REPLACEMENT", "EVALUATOR_EXPLOIT"),
+        AMD_MODULE_MUTATION_FIXTURES + AMD_CODE_REPLACEMENT_FIXTURES, "downgrade",
+    ),
+    "MODULE_MUTATION": RulePolicy(
+        "MODULE_MUTATION", "evaluator_state_mutation", "hard", AUTO_FILTER, (),
+        AMD_MODULE_MUTATION_FIXTURES + AMD_CODE_REPLACEMENT_FIXTURES, "keep",
+    ),
+    "GLOBALS_MUTATION": RulePolicy(
+        "GLOBALS_MUTATION", "evaluator_state_mutation", "hard", AUTO_FILTER, (),
+        AMD_MODULE_MUTATION_FIXTURES, "keep",
+    ),
+    "GLOBALS_ACCESS": RulePolicy(
+        "GLOBALS_ACCESS", "evaluator_state_support", "support", SUSPICIOUS_ONLY,
+        ("GLOBALS_MUTATION", "MODULE_MUTATION", "EVALUATOR_EXPLOIT"),
+        AMD_MODULE_MUTATION_FIXTURES, "downgrade",
+    ),
+    "FRAME_INTROSPECTION": RulePolicy(
+        "FRAME_INTROSPECTION", "evaluator_state_mutation", "support", SUSPICIOUS_ONLY,
+        ("MODULE_MUTATION", "GLOBALS_MUTATION", "EVALUATOR_EXPLOIT"),
+        (), "downgrade",
+    ),
+    "SYS_MODULES_ACCESS": RulePolicy(
+        "SYS_MODULES_ACCESS", "evaluator_state_support", "support", SUSPICIOUS_ONLY,
+        ("MODULE_MUTATION", "GLOBALS_MUTATION", "EVALUATOR_EXPLOIT"),
+        AMD_MODULE_MUTATION_FIXTURES, "downgrade",
+    ),
+    "CODE_REPLACEMENT": RulePolicy(
+        "CODE_REPLACEMENT", "evaluator_state_mutation", "hard", AUTO_FILTER, (),
+        AMD_CODE_REPLACEMENT_FIXTURES, "keep",
+    ),
+    "CODE_ACCESS": RulePolicy(
+        "CODE_ACCESS", "evaluator_state_support", "support", SUSPICIOUS_ONLY,
+        ("CODE_REPLACEMENT",), AMD_CODE_REPLACEMENT_FIXTURES, "downgrade",
+    ),
+    "CONFIG_CACHE_EXPLOIT": RulePolicy(
+        "CONFIG_CACHE_EXPLOIT", "result_reuse", "hard", AUTO_FILTER, (),
+        AMD_CONFIG_CACHE_FIXTURES, "rewrite",
+    ),
+    "REFERENCE_PRECOMPUTE_REPLAY": RulePolicy(
+        "REFERENCE_PRECOMPUTE_REPLAY", "reference_replay", "hard", AUTO_FILTER, (),
+        AMD_MANUAL_PRECOMPUTE_FIXTURES, "keep",
+    ),
+    "POINTER_REPLAY": RulePolicy(
+        "POINTER_REPLAY", "result_reuse", "hard", AUTO_FILTER, (),
+        AMD_MANUAL_POINTER_REPLAY_FIXTURES, "keep",
+    ),
+    "DYNAMIC_EXECUTION": RulePolicy(
+        "DYNAMIC_EXECUTION", "dynamic_execution", "telemetry", TELEMETRY_ONLY, (),
+        (), "split",
+    ),
+    "MODULE_RELOAD": RulePolicy(
+        "MODULE_RELOAD", "dynamic_execution", "telemetry", TELEMETRY_ONLY, (),
+        (), "downgrade",
+    ),
+    "THREAD_INJECTION": RulePolicy(
+        "THREAD_INJECTION", "timing_manipulation", "telemetry", TELEMETRY_ONLY, (),
+        (), "downgrade",
+    ),
+    "LAZY_TENSOR": RulePolicy(
+        "LAZY_TENSOR", "timing_manipulation", "telemetry", TELEMETRY_ONLY, (),
+        (), "downgrade",
+    ),
+    "PRECISION_DOWNGRADE": RulePolicy(
+        "PRECISION_DOWNGRADE", "approximation", "telemetry", TELEMETRY_ONLY, (),
+        (), "downgrade",
+    ),
+    "SCORE_IMPOSSIBLE": RulePolicy(
+        "SCORE_IMPOSSIBLE", "score_anomaly", "hard", AUTO_FILTER, (),
+        (), "keep",
+    ),
+    "SCORE_SUSPECT_FLOOR": RulePolicy(
+        "SCORE_SUSPECT_FLOOR", "score_anomaly", "hard", AUTO_FILTER, (),
+        (), "keep",
+    ),
+    "SCORE_BROKEN": RulePolicy(
+        "SCORE_BROKEN", "score_anomaly", "hard", AUTO_FILTER, (),
+        (), "keep",
+    ),
+    "SCORE_EXTREME_SPEEDUP": RulePolicy(
+        "SCORE_EXTREME_SPEEDUP", "score_anomaly", "support", SUSPICIOUS_ONLY, (),
+        (), "downgrade",
+    ),
+    "DUPLICATE_SPAM": RulePolicy(
+        "DUPLICATE_SPAM", "administrative", "support", SUSPICIOUS_ONLY, (),
+        (), "downgrade",
+    ),
+    "NEAR_CLONE_SPAM": RulePolicy(
+        "NEAR_CLONE_SPAM", "administrative", "support", SUSPICIOUS_ONLY, (),
+        (), "downgrade",
+    ),
+}
+
+
+OUTCOME_ORDER = {
+    TELEMETRY_ONLY: 1,
+    SUSPICIOUS_ONLY: 2,
+    AUTO_FILTER: 3,
+}
+
+
+def get_rule_policy(pattern: str) -> RulePolicy:
+    return RULE_REGISTRY.get(
+        pattern,
+        RulePolicy(pattern, "unclassified", "telemetry", TELEMETRY_ONLY, (), (), "keep"),
+    )
+
+
+def strongest_rule_outcome(matched_patterns: list[dict]) -> str:
+    if not matched_patterns:
+        return TELEMETRY_ONLY
+    return max(
+        (get_rule_policy(p["pattern"]).max_outcome for p in matched_patterns),
+        key=lambda outcome: OUTCOME_ORDER[outcome],
+    )
+
+
+# ---------------------------------------------------------------------------
 # All detectors list
 # ---------------------------------------------------------------------------
 
@@ -1714,7 +2221,10 @@ CODE_DETECTORS = [
     detect_globals_mutation,
     detect_introspection_exploit,
     detect_code_replacement,
+    detect_harness_runtime_patching,
     detect_config_cache_exploit,
+    detect_reference_precompute_replay,
+    detect_pointer_replay,
     detect_dynamic_execution,
     detect_thread_injection,
     detect_lazy_tensor,
@@ -1729,7 +2239,6 @@ CODE_DETECTORS = [
 SEVERITY_ORDER = {"critical": 4, "high": 3, "medium": 2, "low": 1}
 
 
-FILTER_SOLO_MEDIUM = {"CUDA_GRAPH_REPLAY", "UNSYNC_MULTISTREAM"}
 DEFAULT_REFERENCE_CLASS = "default_reference"
 DEFAULT_REFERENCE_FILTER_REASON = "default_scaled_mm"
 DEFAULT_REFERENCE_ALLOWED_MEDIUM = {"DUPLICATE_SPAM"}
@@ -1738,18 +2247,18 @@ DEFAULT_REFERENCE_ALLOWED_MEDIUM = {"DUPLICATE_SPAM"}
 def is_default_reference(matched_patterns: list[dict]) -> bool:
     """Return True when the submission is effectively a default/reference path.
 
-    High-severity `_scaled_mm` hits are common in default/reference submissions.
-    Those rows should remain filterable, but they should not count as hacked
-    unless another independent strong signal is present.
+    `_scaled_mm` reference paths are common in correctness fallbacks and
+    default submissions. Keep a separate class for these rows, but only allow
+    them to filter when the rule policy explicitly permits auto-filtering.
     """
-    strong_patterns = [
-        p["pattern"] for p in matched_patterns if p["severity"] in ("critical", "high")
-    ]
-    if not strong_patterns:
+    relevant_patterns = {
+        p["pattern"] for p in matched_patterns
+        if p["pattern"] not in {"DUPLICATE_SPAM", "NEAR_CLONE_SPAM"}
+    }
+    if not relevant_patterns:
         return False
-    if any(pattern != "SCALED_MM_REF" for pattern in strong_patterns):
+    if relevant_patterns != {"SCALED_MM_REF"}:
         return False
-
     medium_families = {p["pattern"] for p in matched_patterns if p["severity"] == "medium"}
     disqualifying_medium = medium_families - DEFAULT_REFERENCE_ALLOWED_MEDIUM - {"SCALED_MM_REF"}
     return not disqualifying_medium
@@ -1757,83 +2266,42 @@ def is_default_reference(matched_patterns: list[dict]) -> bool:
 
 def filter_reason(matched_patterns: list[dict]) -> str:
     """Return a short label explaining what drove the filter decision."""
-    severities = [p["severity"] for p in matched_patterns]
-    if not severities:
+    if not matched_patterns:
         return "none"
-    if is_default_reference(matched_patterns):
+    if is_default_reference(matched_patterns) and get_rule_policy("SCALED_MM_REF").max_outcome == AUTO_FILTER:
         return DEFAULT_REFERENCE_FILTER_REASON
-    max_sev = max(severities, key=lambda s: SEVERITY_ORDER.get(s, 0))
-    if max_sev in ("critical", "high"):
-        return "high_critical"
-    medium_families = {p["pattern"] for p in matched_patterns if p["severity"] == "medium"}
-    if medium_families & FILTER_SOLO_MEDIUM:
-        non_dup = medium_families - {"DUPLICATE_SPAM"}
-        if non_dup & FILTER_SOLO_MEDIUM:
-            return "solo_medium_graph"
-    code_mediums = medium_families - {"DUPLICATE_SPAM"}
-    if "CUDA_GRAPH_PYTHON" in code_mediums and "RESULT_CACHING" in code_mediums:
-        code_mediums.discard("CUDA_GRAPH_PYTHON")
-    if len(code_mediums) >= 2:
-        return "medium_combo"
-    if len(code_mediums) == 1:
-        return "solo_medium"
-    if medium_families:
-        return "duplicate_only"
-    return "none"
+    auto_filter_patterns = [
+        p for p in matched_patterns if get_rule_policy(p["pattern"]).max_outcome == AUTO_FILTER
+    ]
+    if not auto_filter_patterns:
+        return "none"
+    if any(p["pattern"].startswith("SCORE_") for p in auto_filter_patterns):
+        return "score_anomaly"
+    return "high_critical"
 
 
 def classify(matched_patterns: list[dict]) -> tuple[str, bool]:
     """Return (classification, should_filter) from matched patterns.
 
-    Five levels:
-      hacked            — confirmed hack patterns (critical/high) OR medium-combo
-                          that clears the filter threshold; always filtered.
-      default_reference — default/reference behavior (primarily `_scaled_mm`)
-                          that should be filtered but not counted as hacked.
-      suspicious        — 1 medium-family signal, not strong enough to filter alone;
-                          flagged for manual review.
-      low_confidence    — low-severity signals only; probably legitimate.
+    Precision-first policy:
+      hacked            — at least one rule whose policy allows auto-filtering.
+      default_reference — `_scaled_mm` reference behavior; not filterable in this pass.
+      suspicious        — support signals or rewrite-before-trust rules.
+      low_confidence    — telemetry-only signals.
       valid             — no signals detected.
     """
     if not matched_patterns:
         return "valid", False
 
     if is_default_reference(matched_patterns):
-        return DEFAULT_REFERENCE_CLASS, True
+        should_filter = get_rule_policy("SCALED_MM_REF").max_outcome == AUTO_FILTER
+        return DEFAULT_REFERENCE_CLASS, should_filter
 
-    severities = [p["severity"] for p in matched_patterns]
-    max_sev = max(severities, key=lambda s: SEVERITY_ORDER.get(s, 0))
-
-    if max_sev in ("critical", "high"):
+    strongest = strongest_rule_outcome(matched_patterns)
+    if strongest == AUTO_FILTER:
         return "hacked", True
-
-    # Count distinct medium rule families (not raw hits).  Two copies of
-    # the same rule across improved/baseline should not self-confirm.
-    medium_families = {p["pattern"] for p in matched_patterns if p["severity"] == "medium"}
-
-    # CUDA graph replay/caching and unsync multi-stream as sole medium still
-    # strong enough to filter: these are almost always deliberate timing evasion.
-    if medium_families & FILTER_SOLO_MEDIUM:
-        return "hacked", True
-
-    # DUPLICATE_SPAM is an administrative signal (same code submitted multiple
-    # times), not a code-analysis signal.  Don't let it amplify other mediums.
-    # CUDA_GRAPH_PYTHON always co-occurs with RESULT_CACHING (the cache-return
-    # pattern is inherent to CUDA graph replay) — don't double-count.
-    code_mediums = medium_families - {"DUPLICATE_SPAM"}
-    if "CUDA_GRAPH_PYTHON" in code_mediums and "RESULT_CACHING" in code_mediums:
-        code_mediums.discard("CUDA_GRAPH_PYTHON")
-    if len(code_mediums) >= 2:
-        return "hacked", True
-
-    if len(code_mediums) == 1:
+    if strongest == SUSPICIOUS_ONLY:
         return "suspicious", False
-
-    # Only DUPLICATE_SPAM left (if any) — not strong enough to filter alone.
-    if medium_families:
-        return "suspicious", False
-
-    # No medium signals — only low-severity hits (e.g. HARDCODED_SHAPES, TORCH_COMPILE_CACHE).
     return "low_confidence", False
 
 
@@ -1951,22 +2419,26 @@ def _worker_jsonl(args: tuple) -> Optional[dict]:
         "baseline_score": entry.get("baseline_score"),
     }
 
-    r_imp = analyze_code(entry.get("improved_code", ""), metadata,
+    # In pair mode, code-side detectors should stay attached to their source side.
+    # Score anomalies are entry-level metadata signals and must be emitted once.
+    r_imp = analyze_code(entry.get("improved_code", ""), None,
                          field="improved_code", compute_structural_hash=False)
-    r_base = analyze_code(entry.get("baseline_code", ""), metadata,
+    r_base = analyze_code(entry.get("baseline_code", ""), None,
                           field="baseline_code", compute_structural_hash=False)
 
     all_patterns = []
     for p in r_imp["matched_patterns"]:
-        p["field"] = "improved_code"
-        all_patterns.append(p)
+        all_patterns.append(dict(p, field="improved_code"))
     for p in r_base["matched_patterns"]:
-        p["field"] = "baseline_code"
-        all_patterns.append(p)
+        all_patterns.append(dict(p, field="baseline_code"))
+    for p in detect_score_anomaly(metadata):
+        all_patterns.append(dict(p, field="metadata"))
 
-    improved_only = [p for p in all_patterns if p["field"] == "improved_code"]
-    classification, should_filter = classify(improved_only)
-    reason = filter_reason(improved_only) if should_filter else None
+    decision_patterns = [
+        p for p in all_patterns if p["field"] in ("improved_code", "metadata")
+    ]
+    classification, should_filter = classify(decision_patterns)
+    reason = filter_reason(decision_patterns) if should_filter else None
 
     return {
         "id": entry_id,
@@ -2003,6 +2475,338 @@ def _worker_parquet(args: tuple) -> dict:
         "matched_patterns": r["matched_patterns"],
         "code_hash": r["code_hash"],
     }
+
+
+# ---------------------------------------------------------------------------
+# Precision audit
+# ---------------------------------------------------------------------------
+
+AUDIT_RESULT_FILES = (
+    ("nvidia_archive", "detection_results_nvidia_archive.jsonl"),
+    ("amd", "detection_results_amd_submissions.jsonl"),
+    ("nvidia", "detection_results_nvidia_submissions.jsonl"),
+)
+
+AUDIT_RULE_ORDER = [
+    "EVALUATOR_EXPLOIT", "HARNESS_RUNTIME_PATCHING", "MODULE_MUTATION", "GLOBALS_MUTATION", "CODE_REPLACEMENT",
+    "FRAME_INTROSPECTION", "SYS_MODULES_ACCESS", "GLOBALS_ACCESS", "CODE_ACCESS",
+    "TRUSTED_MODULE_IMPORT",
+    "RESULT_CACHING", "CONFIG_CACHE_EXPLOIT", "POINTER_REPLAY", "CUDA_GRAPH_PYTHON", "CUDA_GRAPH_REPLAY",
+    "TIMER_MONKEYPATCH", "PRINT_INJECTION", "UNSYNC_MULTISTREAM", "CUDA_EVENT_DISABLE_TIMING",
+    "SCALED_MM_REF", "DECODE_MM_REF", "SILENT_FALLBACK", "REFERENCE_PRECOMPUTE_REPLAY", "TORCH_COMPILE_CACHE",
+    "HARDCODED_SHAPES", "TRIVIAL_PROBE",
+    "DYNAMIC_EXECUTION", "MODULE_RELOAD", "THREAD_INJECTION", "LAZY_TENSOR",
+    "PRECISION_DOWNGRADE", "SCORE_IMPOSSIBLE", "SCORE_SUSPECT_FLOOR",
+    "SCORE_BROKEN", "SCORE_EXTREME_SPEEDUP", "DUPLICATE_SPAM", "NEAR_CLONE_SPAM",
+]
+
+
+def _parse_nvidia_archive_submission_id(path: str) -> str:
+    basename = os.path.basename(path)
+    parts = basename.split("_", 3)
+    return parts[2] if len(parts) >= 3 else "unknown"
+
+
+def _find_nvidia_archive_submission_path(directory: str, submission_id: str) -> Optional[str]:
+    candidates = sorted(glob.glob(os.path.join(directory, f"nv_sub_{submission_id}_*.py")))
+    return candidates[0] if candidates else None
+
+
+def _find_amd_submission_path(directory: str, submission_id: str) -> Optional[str]:
+    candidates = sorted(glob.glob(os.path.join(directory, f"amd_mla_sub_{submission_id}_*.py")))
+    return candidates[0] if candidates else None
+
+
+def _safe_read_text(path: str) -> str:
+    with open(path, encoding="utf-8", errors="ignore") as f:
+        return f.read()
+
+
+def build_classifier_fixture_manifest(
+    nvidia_archive_dir: str = "NvidiaArchive",
+    amd_dir: str = "amd_fixture_archive",
+    filtered_nvidia_archive_path: str = "filtered_nvidia_archive.jsonl",
+    manual_judgments_path: str = "manual_review_archive/manual_judgments.json",
+) -> dict:
+    """Build the precision-audit fixture manifest.
+
+    Hard positives:
+      - amd_fixture_archive/ground_truth.json exploit=true
+      - source-backed entries in NvidiaArchive/nvidia_hacking_manifest.json
+    Hard negatives:
+      - amd_fixture_archive/ground_truth.json exploit=false
+    Soft review negatives:
+      - deduplicated NvidiaArchive sources not in the hard-positive manifest and not
+        already present in filtered_nvidia_archive.jsonl
+    """
+    manifest = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "hard_positives": [],
+        "hard_negatives": [],
+        "soft_review_negatives": [],
+    }
+    known_hard_positive_amd_ids: set[str] = set()
+
+    gt_path = os.path.join(amd_dir, "ground_truth.json")
+    if os.path.exists(gt_path):
+        with open(gt_path, encoding="utf-8") as f:
+            ground_truth = json.load(f)
+        for row in ground_truth:
+            sid = str(row["submission_id"])
+            path = _find_amd_submission_path(amd_dir, sid)
+            if not path:
+                continue
+            code = _safe_read_text(path)
+            entry = {
+                "fixture_id": f"amd:{sid}",
+                "submission_id": sid,
+                "label": "hard_positive" if row.get("is_exploit") else "hard_negative",
+                "source": "amd_fixture_archive",
+                "technique": row.get("technique", "unknown"),
+                "note": row.get("note"),
+                "file": path,
+                "code_hash": code_hash(code),
+            }
+            bucket = "hard_positives" if row.get("is_exploit") else "hard_negatives"
+            manifest[bucket].append(entry)
+            if row.get("is_exploit"):
+                known_hard_positive_amd_ids.add(sid)
+
+    hacking_manifest_path = os.path.join(nvidia_archive_dir, "nvidia_hacking_manifest.json")
+    hard_positive_ids: set[str] = set()
+    if os.path.exists(hacking_manifest_path):
+        with open(hacking_manifest_path, encoding="utf-8") as f:
+            hacking_manifest = json.load(f)
+        for row in hacking_manifest:
+            sid = str(row["submissionId"])
+            path = _find_nvidia_archive_submission_path(nvidia_archive_dir, sid)
+            if not path:
+                continue
+            code = _safe_read_text(path)
+            manifest["hard_positives"].append({
+                "fixture_id": f"nvidia_archive:{sid}",
+                "submission_id": sid,
+                "label": "hard_positive",
+                "source": "nvidia_archive_hacking_manifest",
+                "technique": "source_backed_hacking_manifest",
+                "leaderboard": row.get("leaderboard"),
+                "submitted_at": row.get("submittedAt"),
+                "file": path,
+                "code_hash": code_hash(code),
+            })
+            hard_positive_ids.add(sid)
+
+    if os.path.exists(manual_judgments_path):
+        with open(manual_judgments_path, encoding="utf-8") as f:
+            manual_rows = json.load(f)
+        for row in manual_rows:
+            if str(row.get("manual_filter", "")).lower() != "yes":
+                continue
+            sid = str(row["submission_id"])
+            if sid in known_hard_positive_amd_ids:
+                continue
+            path = row.get("code_path")
+            if not path or not os.path.exists(path):
+                continue
+            code = _safe_read_text(path)
+            manifest["hard_positives"].append({
+                "fixture_id": f"manual_review:{sid}",
+                "submission_id": sid,
+                "label": "hard_positive",
+                "source": "manual_archive_review",
+                "technique": row.get("primary_technique", "manual_review"),
+                "problem_name": row.get("problem_name"),
+                "manual_judgment": row.get("manual_judgment"),
+                "file": path,
+                "code_hash": code_hash(code),
+            })
+            known_hard_positive_amd_ids.add(sid)
+
+    filtered_ids: set[str] = set()
+    if os.path.exists(filtered_nvidia_archive_path):
+        with open(filtered_nvidia_archive_path, encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                row = json.loads(line)
+                filtered_ids.add(str(row.get("submission_id")))
+
+    seen_hashes: set[str] = set()
+    for path in sorted(glob.glob(os.path.join(nvidia_archive_dir, "nv_sub_*.py"))):
+        sid = _parse_nvidia_archive_submission_id(path)
+        if sid in hard_positive_ids or sid in filtered_ids:
+            continue
+        code = _safe_read_text(path)
+        ch = code_hash(code)
+        if ch in seen_hashes:
+            continue
+        seen_hashes.add(ch)
+        manifest["soft_review_negatives"].append({
+            "fixture_id": f"nvidia_archive_soft:{sid}",
+            "submission_id": sid,
+            "label": "soft_review_negative",
+            "source": "nvidia_archive",
+            "technique": "unknown",
+            "file": path,
+            "code_hash": ch,
+        })
+
+    return manifest
+
+
+def _fixture_pattern_hits(fixtures: list[dict]) -> dict[str, set[str]]:
+    hits_by_fixture: dict[str, set[str]] = {}
+    for fixture in fixtures:
+        code = _safe_read_text(fixture["file"])
+        result = analyze_code(code, metadata=None, field="code", compute_structural_hash=False)
+        hits_by_fixture[fixture["fixture_id"]] = {p["pattern"] for p in result["matched_patterns"]}
+    return hits_by_fixture
+
+
+def _load_rule_examples_from_results(result_path: str, source_name: str) -> tuple[Counter, dict[str, list[dict]]]:
+    sole_counts: Counter = Counter()
+    sole_examples: dict[str, list[dict]] = defaultdict(list)
+    if not os.path.exists(result_path):
+        return sole_counts, sole_examples
+
+    with open(result_path, encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            row = json.loads(line)
+            if not row.get("should_filter"):
+                continue
+            patterns = sorted({p["pattern"] for p in row.get("matched_patterns", [])})
+            if len(patterns) != 1:
+                continue
+            pattern = patterns[0]
+            sole_counts[pattern] += 1
+            if len(sole_examples[pattern]) < 20:
+                sole_examples[pattern].append({
+                    "source": source_name,
+                    "submission_id": row.get("submission_id"),
+                    "id": row.get("id"),
+                    "user": row.get("user"),
+                    "problem_name": row.get("problem_name"),
+                    "filename": row.get("filename"),
+                })
+    return sole_counts, sole_examples
+
+
+def generate_rule_audit_report(manifest: dict) -> dict:
+    """Generate a precision-audit report for every registered rule."""
+    hard_positive_hits = _fixture_pattern_hits(manifest["hard_positives"])
+    hard_negative_hits = _fixture_pattern_hits(manifest["hard_negatives"])
+    soft_negative_hits = _fixture_pattern_hits(manifest["soft_review_negatives"])
+
+    sole_counts_by_source: dict[str, Counter] = {}
+    sole_examples_by_source: dict[str, dict[str, list[dict]]] = {}
+    for source_name, result_path in AUDIT_RESULT_FILES:
+        counts, examples = _load_rule_examples_from_results(result_path, source_name)
+        sole_counts_by_source[source_name] = counts
+        sole_examples_by_source[source_name] = examples
+
+    rules = {}
+    hard_negative_total = len(manifest["hard_negatives"])
+    for rule_name in AUDIT_RULE_ORDER:
+        policy = get_rule_policy(rule_name)
+        expected_positive_fixtures = list(policy.mapped_positive_fixtures)
+        positive_hits = sorted(
+            fixture_id
+            for fixture_id in expected_positive_fixtures
+            if rule_name in hard_positive_hits.get(fixture_id, set())
+        )
+        positive_misses = sorted(
+            fixture_id
+            for fixture_id in expected_positive_fixtures
+            if rule_name not in hard_positive_hits.get(fixture_id, set())
+        )
+        negative_hits = sorted(
+            fixture_id for fixture_id, patterns in hard_negative_hits.items() if rule_name in patterns
+        )
+        soft_hits = sorted(
+            fixture_id for fixture_id, patterns in soft_negative_hits.items() if rule_name in patterns
+        )
+        rules[rule_name] = {
+            "rule_name": rule_name,
+            "technique_family": policy.technique_family,
+            "evidence_tier": policy.evidence_tier,
+            "max_outcome": policy.max_outcome,
+            "requires_companion_patterns": list(policy.requires_companion_patterns),
+            "mapped_positive_fixtures": list(policy.mapped_positive_fixtures),
+            "observed_hard_positive_hits": sorted(
+                fixture_id for fixture_id, patterns in hard_positive_hits.items() if rule_name in patterns
+            ),
+            "hard_positive_hits": positive_hits,
+            "hard_positive_misses": positive_misses,
+            "hard_negative_hits": negative_hits,
+            "confusion_matrix": {
+                "true_positive": len(positive_hits),
+                "false_negative": len(positive_misses),
+                "false_positive": len(negative_hits),
+                "true_negative": hard_negative_total - len(negative_hits),
+            },
+            "soft_negative_hit_count": len(soft_hits),
+            "soft_negative_hit_samples": soft_hits[:20],
+            "sole_hit_frequency": {
+                source_name: sole_counts_by_source[source_name].get(rule_name, 0)
+                for source_name, _ in AUDIT_RESULT_FILES
+            },
+            "sole_hit_examples": [
+                example
+                for source_name, _ in AUDIT_RESULT_FILES
+                for example in sole_examples_by_source[source_name].get(rule_name, [])
+            ][:20],
+            "final_verdict": policy.default_verdict,
+        }
+
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "manifest_counts": {
+            "hard_positives": len(manifest["hard_positives"]),
+            "hard_negatives": len(manifest["hard_negatives"]),
+            "soft_review_negatives": len(manifest["soft_review_negatives"]),
+        },
+        "rule_order": AUDIT_RULE_ORDER,
+        "rules": rules,
+    }
+
+
+def write_rule_audit_report(output_dir: str, manifest: dict, report: dict) -> tuple[str, str, str]:
+    os.makedirs(output_dir, exist_ok=True)
+    manifest_path = os.path.join(output_dir, "classifier_fixture_manifest.json")
+    report_json_path = os.path.join(output_dir, "rule_audit_report.json")
+    report_md_path = os.path.join(output_dir, "rule_audit_report.md")
+
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
+    with open(report_json_path, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2)
+
+    lines = [
+        "# Rule Audit Report",
+        "",
+        f"- Generated: {report['generated_at']}",
+        f"- Hard positives: {report['manifest_counts']['hard_positives']}",
+        f"- Hard negatives: {report['manifest_counts']['hard_negatives']}",
+        f"- Soft review negatives: {report['manifest_counts']['soft_review_negatives']}",
+        "",
+    ]
+    for rule_name in report["rule_order"]:
+        rule = report["rules"][rule_name]
+        lines.extend([
+            f"## {rule_name}",
+            f"- Technique family: `{rule['technique_family']}`",
+            f"- Evidence tier: `{rule['evidence_tier']}`",
+            f"- Max outcome: `{rule['max_outcome']}`",
+            f"- Final verdict: `{rule['final_verdict']}`",
+            f"- Hard positive hits: {len(rule['hard_positive_hits'])}",
+            f"- Hard negative hits: {len(rule['hard_negative_hits'])}",
+            f"- Confusion matrix: {json.dumps(rule['confusion_matrix'], sort_keys=True)}",
+            f"- Soft negative hits: {rule['soft_negative_hit_count']}",
+            f"- Sole-hit frequency: {json.dumps(rule['sole_hit_frequency'], sort_keys=True)}",
+            "",
+        ])
+    with open(report_md_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+    return manifest_path, report_json_path, report_md_path
 
 
 # ---------------------------------------------------------------------------
@@ -2150,6 +2954,7 @@ def scan_jsonl(jsonl_path: str, results_path: str, cleaned_path: str, summary_pa
     hash_groups_baseline: dict = defaultdict(list)
     patterns_improved: Counter = Counter()
     patterns_baseline: Counter = Counter()
+    patterns_metadata: Counter = Counter()
     per_user = defaultdict(lambda: {"total": 0, "filtered": 0})
     per_problem = defaultdict(lambda: {"total": 0, "filtered": 0})
 
@@ -2166,8 +2971,10 @@ def scan_jsonl(jsonl_path: str, results_path: str, cleaned_path: str, summary_pa
             for p in result["matched_patterns"]:
                 if p["field"] == "improved_code":
                     patterns_improved[p["pattern"]] += 1
-                else:
+                elif p["field"] == "baseline_code":
                     patterns_baseline[p["pattern"]] += 1
+                else:
+                    patterns_metadata[p["pattern"]] += 1
             per_user[result["user"]]["total"] += 1
             per_problem[result["problem_name"]]["total"] += 1
             done += 1
@@ -2204,9 +3011,14 @@ def scan_jsonl(jsonl_path: str, results_path: str, cleaned_path: str, summary_pa
             })
         if extra_patterns:
             r["matched_patterns"].extend(extra_patterns)
-            _imp_only = [p for p in r["matched_patterns"] if p.get("field") == "improved_code"]
-            r["classification"], r["should_filter"] = classify(_imp_only)
-            r["filter_reason"] = filter_reason(_imp_only) if r["should_filter"] else None
+            decision_patterns = [
+                p for p in r["matched_patterns"]
+                if p.get("field") in ("improved_code", "metadata")
+            ]
+            r["classification"], r["should_filter"] = classify(decision_patterns)
+            r["filter_reason"] = (
+                filter_reason(decision_patterns) if r["should_filter"] else None
+            )
 
     # Second pass: write results and cleaned JSONL
     print(f"  Writing results...")
@@ -2244,6 +3056,7 @@ def scan_jsonl(jsonl_path: str, results_path: str, cleaned_path: str, summary_pa
         "filter_reason_breakdown": dict(sorted(filter_reason_counts.items(), key=lambda x: -x[1])),
         "pattern_hits_improved_code": dict(sorted(patterns_improved.items(), key=lambda x: -x[1])),
         "pattern_hits_baseline_code": dict(sorted(patterns_baseline.items(), key=lambda x: -x[1])),
+        "pattern_hits_metadata": dict(sorted(patterns_metadata.items(), key=lambda x: -x[1])),
         "per_problem": {
             k: v for k, v in sorted(per_problem.items())
         },
@@ -2275,6 +3088,10 @@ def scan_jsonl(jsonl_path: str, results_path: str, cleaned_path: str, summary_pa
     print(f"\nPattern hits (baseline_code):")
     for pat, count in sorted(patterns_baseline.items(), key=lambda x: -x[1]):
         print(f"  {pat}: {count}")
+    if patterns_metadata:
+        print(f"\nPattern hits (metadata):")
+        for pat, count in sorted(patterns_metadata.items(), key=lambda x: -x[1]):
+            print(f"  {pat}: {count}")
     print(f"\nFiltered: {filtered}, Kept: {kept}")
     print(f"\nFilter reason breakdown:")
     for reason, count in sorted(filter_reason_counts.items(), key=lambda x: -x[1]):
@@ -2452,15 +3269,32 @@ def main():
     parser.add_argument("--nvidia_archive", type=str, help="Path to NvidiaArchive directory")
     parser.add_argument("--jsonl", type=str, help="Path to JSONL dataset")
     parser.add_argument("--parquet", type=str, help="Path to submission parquet file")
+    parser.add_argument(
+        "--audit-rules",
+        action="store_true",
+        help="Build the precision-audit fixture manifest and rule audit report",
+    )
     parser.add_argument("--output-dir", type=str, default=".", help="Output directory")
     parser.add_argument("--workers", type=int, default=0,
                         help="Parallel worker processes (default: os.cpu_count())")
     args = parser.parse_args()
 
-    if not args.nvidia_archive and not args.jsonl and not args.parquet:
-        parser.error("Must specify at least one of --nvidia_archive, --jsonl, --parquet")
+    if not args.nvidia_archive and not args.jsonl and not args.parquet and not args.audit_rules:
+        parser.error("Must specify at least one of --nvidia_archive, --jsonl, --parquet, --audit-rules")
 
     os.makedirs(args.output_dir, exist_ok=True)
+
+    if args.audit_rules:
+        nvidia_archive_dir = args.nvidia_archive or "NvidiaArchive"
+        manifest = build_classifier_fixture_manifest(nvidia_archive_dir=nvidia_archive_dir)
+        report = generate_rule_audit_report(manifest)
+        manifest_path, report_json_path, report_md_path = write_rule_audit_report(
+            args.output_dir, manifest, report,
+        )
+        print("Precision audit complete")
+        print(f"  Manifest: {manifest_path}")
+        print(f"  Report:   {report_json_path}")
+        print(f"  Summary:  {report_md_path}")
 
     if args.nvidia_archive:
         output_path = os.path.join(args.output_dir, "detection_results_nvidia_archive.jsonl")
