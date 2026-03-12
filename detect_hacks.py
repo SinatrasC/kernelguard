@@ -13,16 +13,17 @@ Usage:
 
 import argparse
 import ast
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass, field
 import glob
 import hashlib
+import io
 import json
 import multiprocessing as mp
 import os
 import re
 import sys
+import tokenize
 from collections import Counter, defaultdict
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -200,6 +201,19 @@ def strip_cpp_cuda_blocks(code: str) -> str:
     return RE_TRIPLE_QUOTED.sub(replacer, code)
 
 
+def strip_python_comments(code: str) -> str:
+    """Remove Python comments without touching string literals."""
+    try:
+        tokens = [
+            tok
+            for tok in tokenize.generate_tokens(io.StringIO(code).readline)
+            if tok.type != tokenize.COMMENT
+        ]
+    except tokenize.TokenError:
+        return code
+    return tokenize.untokenize(tokens)
+
+
 def extract_function_block(code: str, func_name: str) -> str:
     """Best-effort extraction of a Python function block from source text."""
     lines = code.splitlines()
@@ -253,12 +267,87 @@ def function_uses_scaled_mm(func_body: str, alias_names: set[str]) -> bool:
     return False
 
 
+@dataclass
+class SubmissionFacts:
+    """Shared normalized views and AST summaries for one submission."""
+
+    raw_code: str
+    python_only: str
+    python_active: str
+    ast_tree: Optional[ast.AST]
+    main_aliases: set[str]
+    scaled_mm_aliases: set[str]
+    trusted_aliases: dict[str, str]
+    custom_kernel_pos: Optional[int]
+    code_before_custom_kernel: str
+    code_from_custom_kernel: str
+    custom_kernel_code: str
+    custom_kernel_active: str
+    _function_blocks: dict[str, str] = field(default_factory=dict)
+    _active_function_blocks: dict[str, str] = field(default_factory=dict)
+
+    def get_function_block(self, func_name: str) -> str:
+        block = self._function_blocks.get(func_name)
+        if block is None:
+            block = extract_function_block(self.raw_code, func_name)
+            self._function_blocks[func_name] = block
+        return block
+
+    def get_active_function_block(self, func_name: str) -> str:
+        block = self._active_function_blocks.get(func_name)
+        if block is None:
+            block = strip_python_comments(self.get_function_block(func_name))
+            self._active_function_blocks[func_name] = block
+        return block
+
+
+def build_submission_facts(code: str) -> SubmissionFacts:
+    """Parse and normalize a submission once for reuse across all detectors."""
+    python_only = strip_cpp_cuda_blocks(code)
+    python_active = strip_python_comments(python_only)
+    tree = _safe_ast_parse(code)
+    custom_kernel_match = re.search(r'^def\s+custom_kernel\s*\(', code, re.MULTILINE)
+    custom_kernel_pos = custom_kernel_match.start() if custom_kernel_match else None
+    code_before_custom_kernel = code[:custom_kernel_pos] if custom_kernel_pos is not None else code
+    code_from_custom_kernel = code[custom_kernel_pos:] if custom_kernel_pos is not None else code
+    custom_kernel_code = extract_function_block(code, "custom_kernel")
+    custom_kernel_active = strip_python_comments(custom_kernel_code)
+    trusted_aliases = _collect_trusted_aliases(tree) if tree is not None else {}
+
+    facts = SubmissionFacts(
+        raw_code=code,
+        python_only=python_only,
+        python_active=python_active,
+        ast_tree=tree,
+        main_aliases=find_main_aliases(python_only),
+        scaled_mm_aliases=find_scaled_mm_aliases(code_before_custom_kernel),
+        trusted_aliases=trusted_aliases,
+        custom_kernel_pos=custom_kernel_pos,
+        code_before_custom_kernel=code_before_custom_kernel,
+        code_from_custom_kernel=code_from_custom_kernel,
+        custom_kernel_code=custom_kernel_code,
+        custom_kernel_active=custom_kernel_active,
+    )
+    facts._function_blocks["custom_kernel"] = custom_kernel_code
+    facts._active_function_blocks["custom_kernel"] = custom_kernel_active
+    return facts
+
+
+def ensure_submission_facts(code_or_facts: str | SubmissionFacts) -> SubmissionFacts:
+    """Accept a raw code string or a pre-built SubmissionFacts object."""
+    if isinstance(code_or_facts, SubmissionFacts):
+        return code_or_facts
+    return build_submission_facts(code_or_facts)
+
+
 # ---------------------------------------------------------------------------
 # Detectors
 # ---------------------------------------------------------------------------
 
-def detect_timer_monkeypatch(code: str) -> list[dict]:
+def detect_timer_monkeypatch(code: str | SubmissionFacts) -> list[dict]:
     """Pattern 1: torch.cuda.Event replaced with fake class."""
+    facts = ensure_submission_facts(code)
+    code = facts.raw_code
     matches = []
     if RE_CUDA_EVENT_ASSIGN.search(code):
         matches.append({
@@ -293,53 +382,59 @@ def detect_timer_monkeypatch(code: str) -> list[dict]:
     return matches
 
 
-def detect_print_injection(code: str) -> list[dict]:
-    """Pattern 2: Fake benchmark output or builtins.print patching."""
+def detect_print_injection(code: str | SubmissionFacts) -> list[dict]:
+    """Pattern 2: separate real benchmark spoofing from benign stdio handling."""
+    facts = ensure_submission_facts(code)
+    python_active = facts.python_active
     matches = []
-    if RE_EMIT_FAKE_BENCH.search(code):
+    seen: set[tuple[str, str]] = set()
+
+    def add(pattern: str, severity: str, evidence: str):
+        key = (pattern, evidence)
+        if key in seen:
+            return
+        seen.add(key)
         matches.append({
-            "pattern": "PRINT_INJECTION",
-            "severity": "critical",
-            "evidence": "_emit_fake_benchmark function defined",
+            "pattern": pattern,
+            "severity": severity,
+            "evidence": evidence,
         })
-    if RE_BUILTINS_PRINT_ASSIGN.search(code):
-        matches.append({
-            "pattern": "PRINT_INJECTION",
-            "severity": "critical",
-            "evidence": "builtins.print reassigned",
-        })
-    if RE_PATCHED_PRINT.search(code):
-        matches.append({
-            "pattern": "PRINT_INJECTION",
-            "severity": "critical",
-            "evidence": "Print patching variable (_patched_print/_real_print)",
-        })
-    # sys.stdout/stderr replacement
-    if RE_SYS_STDOUT_REPLACE.search(code):
-        matches.append({
-            "pattern": "PRINT_INJECTION",
-            "severity": "critical",
-            "evidence": "sys.stdout reassigned",
-        })
-    if RE_SYS_STDERR_REPLACE.search(code):
-        matches.append({
-            "pattern": "PRINT_INJECTION",
-            "severity": "high",
-            "evidence": "sys.stderr reassigned",
-        })
-    # Check for "Ranked Benchmark" in print calls (not in C++ code)
-    python_only = strip_cpp_cuda_blocks(code)
-    if RE_RANKED_BENCHMARK_PRINT.search(python_only):
-        matches.append({
-            "pattern": "PRINT_INJECTION",
-            "severity": "critical",
-            "evidence": "Ranked Benchmark string in print() call",
-        })
+
+    fake_emit = False
+    if RE_EMIT_FAKE_BENCH.search(python_active):
+        fake_emit = True
+        add("FAKE_BENCHMARK_EMIT", "critical", "_emit_fake_benchmark function defined")
+    if RE_BUILTINS_PRINT_ASSIGN.search(python_active):
+        fake_emit = True
+        add("FAKE_BENCHMARK_EMIT", "critical", "builtins.print reassigned")
+    if RE_RANKED_BENCHMARK_PRINT.search(python_active):
+        fake_emit = True
+        add("FAKE_BENCHMARK_EMIT", "critical", "Ranked Benchmark string printed directly")
+    elif RE_PATCHED_PRINT.search(python_active) and RE_RANKED_BENCHMARK_STR.search(python_active):
+        fake_emit = True
+        add("FAKE_BENCHMARK_EMIT", "critical", "print patching plus Ranked Benchmark payload")
+
+    # Stdio redirection is common as a compatibility shim around compilation and
+    # should not be treated as benchmark spoofing on its own.
+    if RE_SYS_STDOUT_REPLACE.search(python_active):
+        if re.search(r'if\s+sys\.stdout\s+is\s+None\s*:', python_active):
+            add("STDIO_REDIRECT", "low", "guarded sys.stdout compatibility redirect")
+        else:
+            add("STDIO_REDIRECT", "medium", "sys.stdout reassigned")
+    if RE_SYS_STDERR_REPLACE.search(python_active):
+        if re.search(r'if\s+sys\.stderr\s+is\s+None\s*:', python_active):
+            add("STDIO_REDIRECT", "low", "guarded sys.stderr compatibility redirect")
+        else:
+            add("STDIO_REDIRECT", "medium", "sys.stderr reassigned")
+
+    # Do not keep the old broad PRINT_INJECTION marker; the split rules carry
+    # the action semantics now.
     return matches
 
 
-def detect_evaluator_exploit(code: str) -> list[dict]:
+def detect_evaluator_exploit(code: str | SubmissionFacts) -> list[dict]:
     """Pattern 3: Patching evaluator internals (main.time_kernel, etc.)."""
+    facts = ensure_submission_facts(code)
     matches = []
     seen = set()
 
@@ -356,7 +451,7 @@ def detect_evaluator_exploit(code: str) -> list[dict]:
     # Strip large data blobs (base64, lookup tables) before pattern matching.
     # Blobs cause O(n²) backtracking in patterns like (\w+)\s*=\s*literal when
     # they form very long single-line word runs (e.g. 129KB base64 strings).
-    code = strip_cpp_cuda_blocks(code)
+    code = facts.python_only
 
     if RE_MAIN_TIME_KERNEL.search(code):
         add_match("main.time_kernel patched")
@@ -365,7 +460,7 @@ def detect_evaluator_exploit(code: str) -> list[dict]:
     if RE_MAIN_CLEAR_L2.search(code):
         add_match("main.clear_l2_cache patched")
 
-    aliases = find_main_aliases(code)
+    aliases = facts.main_aliases
     # Check for alias-based patching regardless of how __main__ was obtained
     for m in RE_MAIN_ATTR_PATCH.finditer(code):
         obj, attr = m.group(1), m.group(2)
@@ -381,7 +476,7 @@ def detect_evaluator_exploit(code: str) -> list[dict]:
     return matches
 
 
-def detect_scaled_mm_ref(code: str) -> list[dict]:
+def detect_scaled_mm_ref(code: str | SubmissionFacts) -> list[dict]:
     """Pattern 4: Using torch._scaled_mm as primary compute.
 
     Scope-aware: if the file has a `def custom_kernel` function and
@@ -389,24 +484,23 @@ def detect_scaled_mm_ref(code: str) -> list[dict]:
     reference implementation (not the submission's compute path) and
     should not be flagged.
     """
+    facts = ensure_submission_facts(code)
     matches = []
-
-    # Find position of custom_kernel definition
-    custom_kernel_match = re.search(r'^def\s+custom_kernel\s*\(', code, re.MULTILINE)
-    custom_kernel_pos = custom_kernel_match.start() if custom_kernel_match else 0
+    code = facts.raw_code
+    custom_kernel_pos = facts.custom_kernel_pos or 0
 
     # For scope-aware check: code from custom_kernel onward
     # If no custom_kernel found, check entire file (conservative)
-    if custom_kernel_match:
+    if facts.custom_kernel_pos is not None:
         # Check if _scaled_mm is used at or after custom_kernel definition,
         # or if _scaled_mm is aliased to a variable that custom_kernel could
         # call indirectly.
-        code_from_ck = code[custom_kernel_pos:]
-        code_before_ck = code[:custom_kernel_pos]
+        code_from_ck = facts.code_from_custom_kernel
+        code_before_ck = facts.code_before_custom_kernel
 
         has_python_after = bool(RE_SCALED_MM_PYTHON.search(code_from_ck))
         has_alias_after = bool(RE_SCALED_MM_ALIAS.search(code_from_ck))
-        alias_names_before = find_scaled_mm_aliases(code_before_ck)
+        alias_names_before = facts.scaled_mm_aliases
         has_alias_before = bool(alias_names_before)
         has_cpp = bool(RE_SCALED_MM_CPP.search(code))
         has_schema = bool(RE_SCALED_MM_SCHEMA.search(code))
@@ -421,13 +515,12 @@ def detect_scaled_mm_ref(code: str) -> list[dict]:
             helper_funcs_with_mm = set()
             for func_m in re.finditer(r'^def\s+(\w+)\s*\(', code_before_ck, re.MULTILINE):
                 func_name = func_m.group(1)
-                func_body = extract_function_block(code_before_ck, func_name)
+                func_body = facts.get_function_block(func_name)
                 if function_uses_scaled_mm(func_body, alias_names_before):
                     helper_funcs_with_mm.add(func_name)
             # Strip Python comments from custom_kernel body before call-site analysis
             # so that commented-out calls (e.g. # result = ref_kernel(data)) are ignored.
-            ck_body = extract_function_block(code, "custom_kernel")
-            ck_active = re.sub(r'#.*$', '', ck_body, flags=re.MULTILINE)
+            ck_active = facts.custom_kernel_active
             # Check if custom_kernel's OUTPUT comes from a helper that uses _scaled_mm.
             # Validation-only calls (result not returned) are NOT the submission's compute.
             compute_helpers = set()
@@ -561,15 +654,16 @@ def detect_scaled_mm_ref(code: str) -> list[dict]:
     return matches
 
 
-def detect_decode_mm_ref(code: str) -> list[dict]:
+def detect_decode_mm_ref(code: str | SubmissionFacts) -> list[dict]:
     """Pattern 5: FP4 decode + torch.mm/bmm as main compute path.
 
     Only flags when mm/bmm/matmul appears to feed the output (near return
     or assigned to a result-like variable), not when used for small
     pre/post processing steps.
     """
-    python_only = strip_cpp_cuda_blocks(code)
-    custom_kernel_code = extract_function_block(python_only, "custom_kernel")
+    facts = ensure_submission_facts(code)
+    python_only = facts.python_only
+    custom_kernel_code = facts.custom_kernel_code
     matches = []
 
     # Tighten scope: only count mm/bmm/matmul used in submission entrypoint.
@@ -623,64 +717,72 @@ def detect_decode_mm_ref(code: str) -> list[dict]:
     return matches
 
 
-def detect_result_caching(code: str) -> list[dict]:
-    """Pattern 6: Result/output caching by tensor pointer or id.
-
-    Checks Python code for dict/WeakValueDictionary caches. Also checks
-    C++ inline code for thread_local Cache structs keyed by data_ptr().
-    """
-    python_only = strip_cpp_cuda_blocks(code)
-    # Strip Python comments to avoid matching commented-out cache code
-    python_active = re.sub(r'#.*$', '', python_only, flags=re.MULTILINE)
+def detect_result_caching(code: str | SubmissionFacts) -> list[dict]:
+    """Pattern 6: split output replay from benign workspace/preprocess caches."""
+    facts = ensure_submission_facts(code)
+    code = facts.raw_code
+    python_only = facts.python_only
+    python_active = facts.python_active
     matches = []
 
-    weak_signals = []
-    strong_signals = []
+    output_replay_signals = []
+    preprocess_signals = []
+    workspace_signals = []
+    runner_plan_signals = []
 
     if RE_WEAK_VALUE_DICT.search(python_only):
-        weak_signals.append("WeakValueDictionary")
+        workspace_signals.append("WeakValueDictionary")
     if RE_DECODED_CACHE.search(python_only):
-        weak_signals.append("_decoded_cache")
+        preprocess_signals.append("_decoded_cache")
     if RE_PREPROCESS_CACHE.search(python_only):
-        weak_signals.append("_PREPROCESS_CACHE")
+        preprocess_signals.append("_PREPROCESS_CACHE")
     if RE_SCALE_CACHE.search(python_only):
-        weak_signals.append("_scale_cache")
+        preprocess_signals.append("_scale_cache")
     if RE_RESULT_CACHE_GENERAL.search(python_only):
-        weak_signals.append("_RESULT/_GROUPED_RESULT/_COMPUTE/_GEMM_CACHE")
+        workspace_signals.append("_RESULT/_GROUPED_RESULT/_COMPUTE/_GEMM_CACHE")
     if RE_VERSION_CACHE.search(python_only):
-        weak_signals.append("tensor._version cache check")
+        workspace_signals.append("tensor._version cache check")
 
     # Scope all strong-signal checks to custom_kernel body.
     # Helper functions that cache compilation artifacts (TensorMap, compiled kernels,
     # plan descriptors, etc.) return those objects from caches, but that is legitimate —
     # only a cache inside custom_kernel itself indicates result caching.
-    ck_body_active = extract_function_block(python_active, "custom_kernel")
-    cache_scope = ck_body_active if ck_body_active else python_active
+    cache_scope = facts.custom_kernel_active if facts.custom_kernel_active else python_active
 
+    stores_output = bool(RE_CACHE_STORE_OUTPUT.search(cache_scope))
     if RE_RESULT_REUSE.search(cache_scope):
-        strong_signals.append("_result_reuse")
+        output_replay_signals.append("_result_reuse")
     if RE_OUTPUT_CACHE.search(cache_scope):
-        strong_signals.append("_OUTPUT_CACHE")
+        workspace_signals.append("_OUTPUT_CACHE")
     if RE_ID_DATA_CACHE.search(cache_scope):
-        weak_signals.append("id(data) cache key")
+        workspace_signals.append("id(data) cache key")
     if RE_DATA_PTR_CACHE_KEY.search(cache_scope):
-        strong_signals.append("data_ptr() cache key")
+        workspace_signals.append("data_ptr() cache key")
     if RE_RETURN_CACHE_INDEX.search(cache_scope):
-        strong_signals.append("direct return from cache[...]")
-    if RE_CACHE_STORE_OUTPUT.search(cache_scope):
-        strong_signals.append("cache[...] stores output/result tensor")
+        output_replay_signals.append("direct return from cache[...]")
+    if stores_output and output_replay_signals:
+        output_replay_signals.append("cache[...] stores output/result tensor")
+    elif stores_output:
+        workspace_signals.append("cache[...] stores reusable output/result tensor")
 
     for var, cache_name in RE_CACHE_GET_ASSIGN.findall(cache_scope):
-        if re.search(
+        cache_lower = cache_name.lower()
+        if any(token in cache_lower for token in ("plan", "dispatch", "runner", "config")):
+            runner_plan_signals.append(f"{cache_name}.get(...) runner/plan cache")
+        elif any(token in cache_lower for token in ("decoded", "preprocess", "scale", "sort", "view", "shape", "quant", "meta", "pad")):
+            preprocess_signals.append(f"{cache_name}.get(...) preprocess cache")
+        elif re.search(
             rf'if\s+{re.escape(var)}\s+is\s+not\s+None\s*:[\s\S]{{0,300}}?\breturn\s+{re.escape(var)}\b',
             cache_scope,
         ):
-            strong_signals.append(f"{cache_name}.get(...) then return cached value")
+            output_replay_signals.append(f"{cache_name}.get(...) then return cached value")
         elif re.search(
             rf'if\s+{re.escape(var)}\s*:[\s\S]{{0,300}}?\breturn\s+{re.escape(var)}\b',
             cache_scope,
         ):
-            strong_signals.append(f"{cache_name}.get(...) guarded return")
+            output_replay_signals.append(f"{cache_name}.get(...) guarded return")
+        else:
+            workspace_signals.append(f"{cache_name}.get(...) workspace cache")
 
     # C++ thread_local cache keyed by data_ptr (e.g., lastA = A.data_ptr())
     cpp_thread_local_cache = re.findall(
@@ -700,9 +802,9 @@ def detect_result_caching(code: str) -> list[dict]:
     )
     if cpp_thread_local_cache and (cpp_last_ptr_store or cpp_data_ptr_compare):
         if RE_CPP_CACHE_FAST_RETURN.search(code):
-            strong_signals.append("C++ pointer cache fast-return path")
+            output_replay_signals.append("C++ pointer cache fast-return path")
         else:
-            weak_signals.append("C++ thread_local cache keyed by data_ptr()")
+            workspace_signals.append("C++ thread_local cache keyed by data_ptr()")
 
     # CUDA graph replay (CUDAGraph + .replay()) explains the cache-and-return
     # pattern — the graph replays actual GPU computation, not cached results.
@@ -711,41 +813,51 @@ def detect_result_caching(code: str) -> list[dict]:
         RE_CUDA_GRAPH_PYTHON.search(python_only) and RE_CUDA_GRAPH_REPLAY.search(python_only)
     )
     if has_cuda_graph_replay:
-        cuda_graph_explained = {
-            "direct return from cache[...]",
-            "cache[...] stores output/result tensor",
-            "data_ptr() cache key",
-        }
-        demoted = [s for s in strong_signals if s in cuda_graph_explained]
-        strong_signals = [s for s in strong_signals if s not in cuda_graph_explained]
-        weak_signals.extend(f"{s} (CUDA graph replay)" for s in demoted)
-        # Also demote .get() guarded returns when they follow .replay()
-        strong_signals = [
-            s for s in strong_signals
-            if not (s.endswith("then return cached value") or s.endswith("guarded return"))
-            or not has_cuda_graph_replay
+        workspace_signals.append("CUDA graph replay cache")
+        output_replay_signals = [
+            s for s in output_replay_signals
+            if s not in {
+                "direct return from cache[...]",
+                "cache[...] stores output/result tensor",
+            }
         ]
 
-    strong_signals = list(dict.fromkeys(strong_signals))
-    weak_signals = list(dict.fromkeys(weak_signals))
+    output_replay_signals = list(dict.fromkeys(output_replay_signals))
+    preprocess_signals = list(dict.fromkeys(preprocess_signals))
+    workspace_signals = list(dict.fromkeys(workspace_signals))
+    runner_plan_signals = list(dict.fromkeys(runner_plan_signals))
 
-    if strong_signals or weak_signals:
-        evidence_parts = []
-        severity = "high" if strong_signals else "medium"
-        if strong_signals:
-            evidence_parts.append("Strong cache signals: " + ", ".join(strong_signals))
-        if weak_signals:
-            evidence_parts.append("Weak cache signals: " + ", ".join(weak_signals))
+    if output_replay_signals:
         matches.append({
-            "pattern": "RESULT_CACHING",
-            "severity": severity,
-            "evidence": "; ".join(evidence_parts),
+            "pattern": "OUTPUT_REPLAY_CACHE",
+            "severity": "high",
+            "evidence": "Output replay signals: " + ", ".join(output_replay_signals),
+        })
+    if preprocess_signals:
+        matches.append({
+            "pattern": "PREPROCESS_CACHE",
+            "severity": "low",
+            "evidence": "Preprocess cache signals: " + ", ".join(preprocess_signals),
+        })
+    if workspace_signals:
+        matches.append({
+            "pattern": "WORKSPACE_CACHE",
+            "severity": "low",
+            "evidence": "Workspace cache signals: " + ", ".join(workspace_signals),
+        })
+    if runner_plan_signals:
+        matches.append({
+            "pattern": "RUNNER_PLAN_CACHE",
+            "severity": "low",
+            "evidence": "Runner/plan cache signals: " + ", ".join(runner_plan_signals),
         })
     return matches
 
 
-def detect_cuda_graph_replay(code: str) -> list[dict]:
+def detect_cuda_graph_replay(code: str | SubmissionFacts) -> list[dict]:
     """Pattern 7: CUDA graph replay via ctypes libcudart."""
+    facts = ensure_submission_facts(code)
+    code = facts.raw_code
     matches = []
     signals = []
     has_ctypes = bool(RE_CTYPES_LIBCUDART.search(code))
@@ -785,8 +897,10 @@ def detect_cuda_graph_replay(code: str) -> list[dict]:
     return matches
 
 
-def detect_silent_fallback(code: str) -> list[dict]:
+def detect_silent_fallback(code: str | SubmissionFacts) -> list[dict]:
     """Pattern 8: try/except falling back to reference matmul."""
+    facts = ensure_submission_facts(code)
+    code = facts.python_active
     matches = []
     if RE_TORCH_MATMUL_FALLBACK.search(code):
         matches.append({
@@ -797,8 +911,10 @@ def detect_silent_fallback(code: str) -> list[dict]:
     return matches
 
 
-def detect_trivial_probe(code: str) -> list[dict]:
+def detect_trivial_probe(code: str | SubmissionFacts) -> list[dict]:
     """Pattern 9: Trivial/probe submission (empty return, debug only)."""
+    facts = ensure_submission_facts(code)
+    code = facts.raw_code
     matches = []
     lines = [l.strip() for l in code.strip().splitlines() if l.strip() and not l.strip().startswith('#')]
     if len(lines) < 35:
@@ -820,8 +936,10 @@ def detect_trivial_probe(code: str) -> list[dict]:
     return matches
 
 
-def detect_torch_compile_cache(code: str) -> list[dict]:
+def detect_torch_compile_cache(code: str | SubmissionFacts) -> list[dict]:
     """Pattern 11: torch.compile for pipeline graph caching."""
+    facts = ensure_submission_facts(code)
+    code = facts.python_only
     matches = []
     if RE_TORCH_COMPILE.search(code):
         matches.append({
@@ -832,9 +950,10 @@ def detect_torch_compile_cache(code: str) -> list[dict]:
     return matches
 
 
-def detect_cuda_graph_python(code: str) -> list[dict]:
+def detect_cuda_graph_python(code: str | SubmissionFacts) -> list[dict]:
     """Pattern 12: Python CUDAGraph caching with data_ptr keys + .replay()."""
-    python_only = strip_cpp_cuda_blocks(code)
+    facts = ensure_submission_facts(code)
+    python_only = facts.python_only
     matches = []
     signals = []
 
@@ -865,12 +984,14 @@ def detect_cuda_graph_python(code: str) -> list[dict]:
     return matches
 
 
-def detect_hardcoded_shapes(code: str) -> list[dict]:
+def detect_hardcoded_shapes(code: str | SubmissionFacts) -> list[dict]:
     """Pattern 13: Hardcoded benchmark shapes in KERNEL_CONFIGS or shape-gated branches.
 
     Checks both Python and C++ inline code, including macro-based dispatch.
     """
-    python_only = strip_cpp_cuda_blocks(code)
+    facts = ensure_submission_facts(code)
+    code = facts.raw_code
+    python_only = facts.python_only
     matches = []
     signals = []
 
@@ -930,14 +1051,16 @@ def detect_hardcoded_shapes(code: str) -> list[dict]:
     return matches
 
 
-def detect_unsync_multistream(code: str) -> list[dict]:
+def detect_unsync_multistream(code: str | SubmissionFacts) -> list[dict]:
     """Pattern 14: Unsynchronized multi-stream dispatch to exploit timing.
 
     Checks both Python code AND C++ inline code, since getStreamFromPool
     is often called from C++/CUDA inline sources.
     """
     # Check Python code
-    python_only = strip_cpp_cuda_blocks(code)
+    facts = ensure_submission_facts(code)
+    code = facts.raw_code
+    python_only = facts.python_only
     py_stream_creates = len(RE_GET_STREAM_FROM_POOL.findall(python_only))
     py_sync_calls = (
         len(RE_NO_SYNC_STREAM.findall(python_only)) +
@@ -990,8 +1113,10 @@ def detect_unsync_multistream(code: str) -> list[dict]:
     }]
 
 
-def detect_cuda_event_disable_timing(code: str) -> list[dict]:
+def detect_cuda_event_disable_timing(code: str | SubmissionFacts) -> list[dict]:
     """Pattern 15: cudaEventDisableTiming to mess with benchmark timing."""
+    facts = ensure_submission_facts(code)
+    code = facts.raw_code
     matches = []
     if RE_CUDA_EVENT_DISABLE_TIMING.search(code):
         matches.append({
@@ -1055,13 +1180,14 @@ def _collect_trusted_aliases(tree: ast.AST) -> dict[str, str]:
     return aliases
 
 
-def detect_trusted_module_import(code: str) -> list[dict]:
+def detect_trusted_module_import(code: str | SubmissionFacts) -> list[dict]:
     """AST pattern 1: import of evaluator-trusted modules.
 
     Catches: import reference, from reference import generate_input, etc.
     Severity medium — the import alone is suspicious but not conclusive.
     """
-    tree = _safe_ast_parse(code)
+    facts = ensure_submission_facts(code)
+    tree = facts.ast_tree
     if tree is None:
         return []
 
@@ -1087,7 +1213,7 @@ def detect_trusted_module_import(code: str) -> list[dict]:
     return matches
 
 
-def detect_module_mutation(code: str) -> list[dict]:
+def detect_module_mutation(code: str | SubmissionFacts) -> list[dict]:
     """AST pattern 2: attribute assignment to trusted modules.
 
     Catches:
@@ -1095,11 +1221,12 @@ def detect_module_mutation(code: str) -> list[dict]:
       _ref.ref_kernel.__code__ = fake.__code__
       _ref_module.clear_l2_cache = noop
     """
-    tree = _safe_ast_parse(code)
+    facts = ensure_submission_facts(code)
+    tree = facts.ast_tree
     if tree is None:
         return []
 
-    aliases = _collect_trusted_aliases(tree)
+    aliases = facts.trusted_aliases
     if not aliases:
         return []
 
@@ -1137,14 +1264,15 @@ def detect_module_mutation(code: str) -> list[dict]:
     return matches
 
 
-def detect_globals_mutation(code: str) -> list[dict]:
+def detect_globals_mutation(code: str | SubmissionFacts) -> list[dict]:
     """AST pattern 3: __globals__ dict mutation.
 
     Catches:
       fn.__globals__['generate_input'] = hooked_fn
       getattr(obj, '__globals__')[key] = value
     """
-    tree = _safe_ast_parse(code)
+    facts = ensure_submission_facts(code)
+    tree = facts.ast_tree
     if tree is None:
         return []
 
@@ -1188,22 +1316,35 @@ def detect_globals_mutation(code: str) -> list[dict]:
     return matches
 
 
-def detect_introspection_exploit(code: str) -> list[dict]:
-    """AST pattern 4: frame introspection and sys.modules access.
-
-    Catches:
-      inspect.currentframe(), inspect.stack()
-      frame.f_back, frame.f_globals, frame.f_locals
-      sys.modules access
-    """
-    tree = _safe_ast_parse(code)
+def detect_introspection_exploit(code: str | SubmissionFacts) -> list[dict]:
+    """AST pattern 4: split frame-walk access from frame-based mutation."""
+    facts = ensure_submission_facts(code)
+    tree = facts.ast_tree
     if tree is None:
         return []
 
     matches = []
     seen_patterns: set[str] = set()
+    frame_namespace_aliases: set[str] = set()
+    saw_frame_access = False
+    saw_frame_mutation = False
 
     for node in ast.walk(tree):
+        # Track aliases of frame globals/locals dicts.
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if not isinstance(target, ast.Name):
+                    continue
+                value = node.value
+                if (isinstance(value, ast.Attribute) and value.attr in ("f_globals", "f_locals")) or (
+                    isinstance(value, ast.Subscript)
+                    and any(
+                        isinstance(sub, ast.Attribute) and sub.attr in ("f_globals", "f_locals")
+                        for sub in ast.walk(value.value)
+                    )
+                ):
+                    frame_namespace_aliases.add(target.id)
+
         # inspect.currentframe() / inspect.stack()
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
             if (isinstance(node.func.value, ast.Name)
@@ -1212,22 +1353,30 @@ def detect_introspection_exploit(code: str) -> list[dict]:
                 key = f"inspect.{node.func.attr}"
                 if key not in seen_patterns:
                     seen_patterns.add(key)
-                    matches.append({
-                        "pattern": "FRAME_INTROSPECTION",
-                        "severity": "critical",
-                        "evidence": f"inspect.{node.func.attr}() (frame walking for evaluator access)",
-                    })
+                    saw_frame_access = True
 
         # f_back, f_globals, f_locals attribute access
         if isinstance(node, ast.Attribute) and node.attr in ("f_back", "f_globals", "f_locals"):
             key = f".{node.attr}"
             if key not in seen_patterns:
                 seen_patterns.add(key)
-                matches.append({
-                    "pattern": "FRAME_INTROSPECTION",
-                    "severity": "critical",
-                    "evidence": f".{node.attr} access (frame object exploitation)",
-                })
+                saw_frame_access = True
+
+        # Writes through frame globals/locals aliases are much stronger than
+        # plain access and should stand on their own.
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Subscript):
+                    direct_frame_write = any(
+                        isinstance(sub, ast.Attribute) and sub.attr in ("f_globals", "f_locals")
+                        for sub in ast.walk(target.value)
+                    )
+                    alias_frame_write = (
+                        isinstance(target.value, ast.Name)
+                        and target.value.id in frame_namespace_aliases
+                    )
+                    if direct_frame_write or alias_frame_write:
+                        saw_frame_mutation = True
 
         # sys.modules access
         if (isinstance(node, ast.Attribute)
@@ -1241,17 +1390,31 @@ def detect_introspection_exploit(code: str) -> list[dict]:
                     "evidence": "sys.modules accessed (potential module namespace manipulation)",
                 })
 
+    if saw_frame_mutation:
+        matches.append({
+            "pattern": "FRAME_WALK_MUTATION",
+            "severity": "critical",
+            "evidence": "frame globals/locals accessed and then mutated",
+        })
+    elif saw_frame_access:
+        matches.append({
+            "pattern": "FRAME_WALK_ACCESS",
+            "severity": "medium",
+            "evidence": "frame walking / frame globals access",
+        })
+
     return matches
 
 
-def detect_code_replacement(code: str) -> list[dict]:
+def detect_code_replacement(code: str | SubmissionFacts) -> list[dict]:
     """AST pattern 5: __code__ attribute assignment (bytecode replacement).
 
     Catches any func.__code__ = other.__code__ regardless of module context.
     The module-specific variant is handled by detect_module_mutation;
     this catches the general case.
     """
-    tree = _safe_ast_parse(code)
+    facts = ensure_submission_facts(code)
+    tree = facts.ast_tree
     if tree is None:
         return []
 
@@ -1290,14 +1453,15 @@ TRUSTED_HARNESS_NAMES = frozenset({
 })
 
 
-def detect_harness_runtime_patching(code: str) -> list[dict]:
+def detect_harness_runtime_patching(code: str | SubmissionFacts) -> list[dict]:
     """AST pattern: dynamic runtime patching of trusted evaluator functions.
 
     Targets the ooousay-style exploit family that scans `sys.modules` / `gc`
     for live evaluator objects, then rewrites module attrs or function globals
     through helper functions instead of direct `reference.foo = ...` syntax.
     """
-    tree = _safe_ast_parse(code)
+    facts = ensure_submission_facts(code)
+    tree = facts.ast_tree
     if tree is None:
         return []
 
@@ -1357,13 +1521,15 @@ RE_PRECOMPUTE_APPEND = re.compile(r'outputs\.append\s*\(\s*_compute_output\s*\('
 RE_PRECOMPUTE_REPLAY = re.compile(r'state\.outputs\s*\[\s*state\.cursor\s*\]')
 
 
-def detect_reference_precompute_replay(code: str) -> list[dict]:
+def detect_reference_precompute_replay(code: str | SubmissionFacts) -> list[dict]:
     """Pattern: import trusted reference generator, precompute public cases, replay outputs.
 
     This targets files that do not mutate evaluator state but still leverage
     trusted `reference.generate_input` to synthesize benchmark cases ahead of
     timing and then return precomputed outputs.
     """
+    facts = ensure_submission_facts(code)
+    code = facts.python_active
     if not RE_REFERENCE_GENERATE_INPUT.search(code):
         return []
     if not RE_PRECOMPUTE_STATE.search(code):
@@ -1382,9 +1548,10 @@ def detect_reference_precompute_replay(code: str) -> list[dict]:
     }]
 
 
-def detect_pointer_replay(code: str) -> list[dict]:
+def detect_pointer_replay(code: str | SubmissionFacts) -> list[dict]:
     """Pattern: single-slot output replay keyed by input pointer equality."""
-    tree = _safe_ast_parse(code)
+    facts = ensure_submission_facts(code)
+    tree = facts.ast_tree
     if tree is None:
         return []
 
@@ -1464,7 +1631,7 @@ def detect_pointer_replay(code: str) -> list[dict]:
     return []
 
 
-def detect_config_cache_exploit(code: str) -> list[dict]:
+def detect_config_cache_exploit(code: str | SubmissionFacts) -> list[dict]:
     """AST pattern 7: config-keyed result caching inside custom_kernel.
 
     Detects: custom_kernel that looks up a cache on entry, returns the cached
@@ -1475,7 +1642,8 @@ def detect_config_cache_exploit(code: str) -> list[dict]:
     early-return path does NOT contain any function calls (a real exploit
     returns the cached tensor directly without computation).
     """
-    tree = _safe_ast_parse(code)
+    facts = ensure_submission_facts(code)
+    tree = facts.ast_tree
     if tree is None:
         return []
 
@@ -1609,12 +1777,13 @@ def detect_config_cache_exploit(code: str) -> list[dict]:
     return matches
 
 
-def detect_dynamic_execution(code: str) -> list[dict]:
+def detect_dynamic_execution(code: str | SubmissionFacts) -> list[dict]:
     """AST pattern 6: exec/eval/compile and dynamic import.
 
     These can hide exploit code that static analysis cannot see.
     """
-    tree = _safe_ast_parse(code)
+    facts = ensure_submission_facts(code)
+    tree = facts.ast_tree
     if tree is None:
         return []
 
@@ -1656,7 +1825,7 @@ def detect_dynamic_execution(code: str) -> list[dict]:
     return matches
 
 
-def detect_thread_injection(code: str) -> list[dict]:
+def detect_thread_injection(code: str | SubmissionFacts) -> list[dict]:
     """AST pattern 8: background thread/process to offload computation.
 
     The kernel spawns a background thread that performs the real work while
@@ -1665,7 +1834,8 @@ def detect_thread_injection(code: str) -> list[dict]:
 
     Ref: reference exploit note: thread injection
     """
-    tree = _safe_ast_parse(code)
+    facts = ensure_submission_facts(code)
+    tree = facts.ast_tree
     if tree is None:
         return []
 
@@ -1754,7 +1924,7 @@ def detect_thread_injection(code: str) -> list[dict]:
     return deduped
 
 
-def detect_lazy_tensor(code: str) -> list[dict]:
+def detect_lazy_tensor(code: str | SubmissionFacts) -> list[dict]:
     """AST pattern 9: lazy tensor subclass that defers computation.
 
     The kernel returns a torch.Tensor subclass whose data is not materialized.
@@ -1763,7 +1933,8 @@ def detect_lazy_tensor(code: str) -> list[dict]:
 
     Ref: reference exploit note: lazy evaluation
     """
-    tree = _safe_ast_parse(code)
+    facts = ensure_submission_facts(code)
+    tree = facts.ast_tree
     if tree is None:
         return []
 
@@ -1820,7 +1991,7 @@ def detect_lazy_tensor(code: str) -> list[dict]:
     return matches
 
 
-def detect_precision_downgrade(code: str) -> list[dict]:
+def detect_precision_downgrade(code: str | SubmissionFacts) -> list[dict]:
     """AST pattern 10: silent precision downgrade for speed.
 
     The kernel casts inputs to lower precision (fp16/bf16), computes faster,
@@ -1829,21 +2000,19 @@ def detect_precision_downgrade(code: str) -> list[dict]:
 
     Ref: reference exploit note: precision downgrading
     """
-    tree = _safe_ast_parse(code)
+    facts = ensure_submission_facts(code)
+    tree = facts.ast_tree
     if tree is None:
         return []
 
     matches = []
 
     # Look inside custom_kernel (or the whole file if no custom_kernel found)
-    target_funcs = []
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            if node.name == "custom_kernel":
-                target_funcs.append(node)
-
+    target_funcs = [
+        node for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "custom_kernel"
+    ]
     if not target_funcs:
-        # No custom_kernel — scan top-level
         target_funcs = [tree]
 
     for func_node in target_funcs:
@@ -2003,12 +2172,12 @@ AMD_CONFIG_CACHE_FIXTURES = ("amd:520921", "amd:521087", "amd:521134", "amd:5211
 AMD_MANUAL_HARNESS_FIXTURES = ("manual_review:515117",)
 AMD_MANUAL_PRECOMPUTE_FIXTURES = ("manual_review:514553",)
 AMD_MANUAL_POINTER_REPLAY_FIXTURES = ("manual_review:515367",)
+AMD_MANUAL_FRAME_MUTATION_FIXTURES = ("manual_review:516235",)
 NVIDIA_ARCHIVE_TIMER_FIXTURES = (
     "nvidia_archive:108465", "nvidia_archive:108477", "nvidia_archive:108609", "nvidia_archive:108878",
     "nvidia_archive:121398", "nvidia_archive:121401",
 )
 NVIDIA_ARCHIVE_PRINT_FIXTURES = (
-    "nvidia_archive:116696", "nvidia_archive:116697", "nvidia_archive:116709",
     "nvidia_archive:121398", "nvidia_archive:121401",
 )
 NVIDIA_ARCHIVE_EVALUATOR_FIXTURES = (
@@ -2021,9 +2190,13 @@ RULE_REGISTRY: dict[str, RulePolicy] = {
         "TIMER_MONKEYPATCH", "timing_monkeypatch", "hard", AUTO_FILTER, (),
         NVIDIA_ARCHIVE_TIMER_FIXTURES, "keep",
     ),
-    "PRINT_INJECTION": RulePolicy(
-        "PRINT_INJECTION", "benchmark_output_injection", "hard", AUTO_FILTER, (),
+    "FAKE_BENCHMARK_EMIT": RulePolicy(
+        "FAKE_BENCHMARK_EMIT", "benchmark_output_injection", "hard", AUTO_FILTER, (),
         NVIDIA_ARCHIVE_PRINT_FIXTURES, "keep",
+    ),
+    "STDIO_REDIRECT": RulePolicy(
+        "STDIO_REDIRECT", "stdio_compat", "telemetry", TELEMETRY_ONLY, (),
+        (), "split",
     ),
     "EVALUATOR_EXPLOIT": RulePolicy(
         "EVALUATOR_EXPLOIT", "evaluator_state_mutation", "hard", AUTO_FILTER, (),
@@ -2038,12 +2211,24 @@ RULE_REGISTRY: dict[str, RulePolicy] = {
         (), "split",
     ),
     "DECODE_MM_REF": RulePolicy(
-        "DECODE_MM_REF", "reference_path_heuristic", "telemetry", SUSPICIOUS_ONLY, (),
-        (), "rewrite",
+        "DECODE_MM_REF", "reference_path_heuristic", "telemetry", TELEMETRY_ONLY, (),
+        (), "remove",
     ),
-    "RESULT_CACHING": RulePolicy(
-        "RESULT_CACHING", "result_reuse", "support", SUSPICIOUS_ONLY, (),
+    "OUTPUT_REPLAY_CACHE": RulePolicy(
+        "OUTPUT_REPLAY_CACHE", "result_reuse", "support", SUSPICIOUS_ONLY, (),
         AMD_CONFIG_CACHE_FIXTURES, "rewrite",
+    ),
+    "PREPROCESS_CACHE": RulePolicy(
+        "PREPROCESS_CACHE", "preprocess_cache", "telemetry", TELEMETRY_ONLY, (),
+        (), "keep",
+    ),
+    "WORKSPACE_CACHE": RulePolicy(
+        "WORKSPACE_CACHE", "workspace_cache", "telemetry", TELEMETRY_ONLY, (),
+        (), "keep",
+    ),
+    "RUNNER_PLAN_CACHE": RulePolicy(
+        "RUNNER_PLAN_CACHE", "runner_plan_cache", "telemetry", TELEMETRY_ONLY, (),
+        (), "keep",
     ),
     "CUDA_GRAPH_REPLAY": RulePolicy(
         "CUDA_GRAPH_REPLAY", "timing_manipulation", "telemetry", TELEMETRY_ONLY, (),
@@ -2051,7 +2236,7 @@ RULE_REGISTRY: dict[str, RulePolicy] = {
     ),
     "SILENT_FALLBACK": RulePolicy(
         "SILENT_FALLBACK", "reference_path_heuristic", "telemetry", TELEMETRY_ONLY, (),
-        (), "downgrade",
+        (), "remove",
     ),
     "TRIVIAL_PROBE": RulePolicy(
         "TRIVIAL_PROBE", "low_signal", "telemetry", TELEMETRY_ONLY, (),
@@ -2095,23 +2280,25 @@ RULE_REGISTRY: dict[str, RulePolicy] = {
         ("GLOBALS_MUTATION", "MODULE_MUTATION", "EVALUATOR_EXPLOIT"),
         AMD_MODULE_MUTATION_FIXTURES, "downgrade",
     ),
-    "FRAME_INTROSPECTION": RulePolicy(
-        "FRAME_INTROSPECTION", "evaluator_state_mutation", "support", SUSPICIOUS_ONLY,
-        ("MODULE_MUTATION", "GLOBALS_MUTATION", "EVALUATOR_EXPLOIT"),
-        (), "downgrade",
+    "FRAME_WALK_ACCESS": RulePolicy(
+        "FRAME_WALK_ACCESS", "evaluator_state_support", "telemetry", TELEMETRY_ONLY,
+        (), (), "split",
+    ),
+    "FRAME_WALK_MUTATION": RulePolicy(
+        "FRAME_WALK_MUTATION", "evaluator_state_mutation", "hard", AUTO_FILTER,
+        (), AMD_MANUAL_FRAME_MUTATION_FIXTURES, "keep",
     ),
     "SYS_MODULES_ACCESS": RulePolicy(
-        "SYS_MODULES_ACCESS", "evaluator_state_support", "support", SUSPICIOUS_ONLY,
-        ("MODULE_MUTATION", "GLOBALS_MUTATION", "EVALUATOR_EXPLOIT"),
-        AMD_MODULE_MUTATION_FIXTURES, "downgrade",
+        "SYS_MODULES_ACCESS", "evaluator_state_support", "telemetry", TELEMETRY_ONLY,
+        (), AMD_MODULE_MUTATION_FIXTURES, "downgrade",
     ),
     "CODE_REPLACEMENT": RulePolicy(
         "CODE_REPLACEMENT", "evaluator_state_mutation", "hard", AUTO_FILTER, (),
         AMD_CODE_REPLACEMENT_FIXTURES, "keep",
     ),
     "CODE_ACCESS": RulePolicy(
-        "CODE_ACCESS", "evaluator_state_support", "support", SUSPICIOUS_ONLY,
-        ("CODE_REPLACEMENT",), AMD_CODE_REPLACEMENT_FIXTURES, "downgrade",
+        "CODE_ACCESS", "evaluator_state_support", "telemetry", TELEMETRY_ONLY,
+        (), AMD_CODE_REPLACEMENT_FIXTURES, "downgrade",
     ),
     "CONFIG_CACHE_EXPLOIT": RulePolicy(
         "CONFIG_CACHE_EXPLOIT", "result_reuse", "hard", AUTO_FILTER, (),
@@ -2150,11 +2337,11 @@ RULE_REGISTRY: dict[str, RulePolicy] = {
         (), "keep",
     ),
     "SCORE_SUSPECT_FLOOR": RulePolicy(
-        "SCORE_SUSPECT_FLOOR", "score_anomaly", "hard", AUTO_FILTER, (),
+        "SCORE_SUSPECT_FLOOR", "score_anomaly", "support", SUSPICIOUS_ONLY, (),
         (), "keep",
     ),
     "SCORE_BROKEN": RulePolicy(
-        "SCORE_BROKEN", "score_anomaly", "hard", AUTO_FILTER, (),
+        "SCORE_BROKEN", "score_anomaly", "support", SUSPICIOUS_ONLY, (),
         (), "keep",
     ),
     "SCORE_EXTREME_SPEEDUP": RulePolicy(
@@ -2193,6 +2380,32 @@ def strongest_rule_outcome(matched_patterns: list[dict]) -> str:
         (get_rule_policy(p["pattern"]).max_outcome for p in matched_patterns),
         key=lambda outcome: OUTCOME_ORDER[outcome],
     )
+
+
+ADMIN_PATTERNS = {"DUPLICATE_SPAM", "NEAR_CLONE_SPAM"}
+
+
+def split_match_domains(matched_patterns: list[dict]) -> tuple[list[dict], list[dict], list[dict]]:
+    """Split matches into code, metadata, and administrative domains."""
+    code_patterns = []
+    metadata_patterns = []
+    admin_patterns = []
+    for pattern in matched_patterns:
+        name = pattern["pattern"]
+        if name in ADMIN_PATTERNS:
+            admin_patterns.append(pattern)
+        elif name.startswith("SCORE_") or pattern.get("field") == "metadata":
+            metadata_patterns.append(pattern)
+        else:
+            code_patterns.append(pattern)
+    return code_patterns, metadata_patterns, admin_patterns
+
+
+def support_only_patterns(matched_patterns: list[dict]) -> bool:
+    """Return True when every pattern is only support/telemetry evidence."""
+    if not matched_patterns:
+        return False
+    return all(get_rule_policy(p["pattern"]).evidence_tier != "hard" for p in matched_patterns)
 
 
 # ---------------------------------------------------------------------------
@@ -2268,16 +2481,23 @@ def filter_reason(matched_patterns: list[dict]) -> str:
     """Return a short label explaining what drove the filter decision."""
     if not matched_patterns:
         return "none"
-    if is_default_reference(matched_patterns) and get_rule_policy("SCALED_MM_REF").max_outcome == AUTO_FILTER:
+    code_patterns, metadata_patterns, admin_patterns = split_match_domains(matched_patterns)
+    if is_default_reference(code_patterns) and get_rule_policy("SCALED_MM_REF").max_outcome == AUTO_FILTER:
         return DEFAULT_REFERENCE_FILTER_REASON
-    auto_filter_patterns = [
-        p for p in matched_patterns if get_rule_policy(p["pattern"]).max_outcome == AUTO_FILTER
+
+    code_auto_filter = [
+        p for p in code_patterns if get_rule_policy(p["pattern"]).max_outcome == AUTO_FILTER
     ]
-    if not auto_filter_patterns:
-        return "none"
-    if any(p["pattern"].startswith("SCORE_") for p in auto_filter_patterns):
+    metadata_auto_filter = [
+        p for p in metadata_patterns if get_rule_policy(p["pattern"]).max_outcome == AUTO_FILTER
+    ]
+    if code_auto_filter:
+        return "high_critical"
+    if metadata_auto_filter:
         return "score_anomaly"
-    return "high_critical"
+    if admin_patterns:
+        return "admin_review"
+    return "none"
 
 
 def classify(matched_patterns: list[dict]) -> tuple[str, bool]:
@@ -2293,16 +2513,33 @@ def classify(matched_patterns: list[dict]) -> tuple[str, bool]:
     if not matched_patterns:
         return "valid", False
 
-    if is_default_reference(matched_patterns):
+    code_patterns, metadata_patterns, admin_patterns = split_match_domains(matched_patterns)
+
+    if is_default_reference(code_patterns):
         should_filter = get_rule_policy("SCALED_MM_REF").max_outcome == AUTO_FILTER
         return DEFAULT_REFERENCE_CLASS, should_filter
 
-    strongest = strongest_rule_outcome(matched_patterns)
-    if strongest == AUTO_FILTER:
+    code_strongest = strongest_rule_outcome(code_patterns) if code_patterns else TELEMETRY_ONLY
+    metadata_strongest = strongest_rule_outcome(metadata_patterns) if metadata_patterns else TELEMETRY_ONLY
+    admin_strongest = strongest_rule_outcome(admin_patterns) if admin_patterns else TELEMETRY_ONLY
+
+    if code_strongest == AUTO_FILTER:
         return "hacked", True
-    if strongest == SUSPICIOUS_ONLY:
+    if metadata_strongest == AUTO_FILTER:
+        return "hacked", True
+
+    if code_patterns:
+        if code_strongest == SUSPICIOUS_ONLY:
+            if support_only_patterns(code_patterns):
+                return "low_confidence", False
+            return "suspicious", False
+        return "low_confidence", False
+
+    if metadata_strongest == SUSPICIOUS_ONLY:
         return "suspicious", False
-    return "low_confidence", False
+    if admin_strongest == SUSPICIOUS_ONLY:
+        return "low_confidence", False
+    return "valid", False
 
 
 # ---------------------------------------------------------------------------
@@ -2369,9 +2606,10 @@ def analyze_code(code: str, metadata: Optional[dict] = None, field: str = "code"
     compute_structural_hash: set False for JSONL bulk mode (expensive identifier
     normalization is impractical at 44K × 2 entries; exact dedup suffices there).
     """
+    facts = build_submission_facts(code)
     all_matches = []
     for detector in CODE_DETECTORS:
-        hits = detector(code)
+        hits = detector(facts)
         for h in hits:
             h["field"] = field
         all_matches.extend(hits)
@@ -2489,10 +2727,11 @@ AUDIT_RESULT_FILES = (
 
 AUDIT_RULE_ORDER = [
     "EVALUATOR_EXPLOIT", "HARNESS_RUNTIME_PATCHING", "MODULE_MUTATION", "GLOBALS_MUTATION", "CODE_REPLACEMENT",
-    "FRAME_INTROSPECTION", "SYS_MODULES_ACCESS", "GLOBALS_ACCESS", "CODE_ACCESS",
+    "FRAME_WALK_ACCESS", "FRAME_WALK_MUTATION", "SYS_MODULES_ACCESS", "GLOBALS_ACCESS", "CODE_ACCESS",
     "TRUSTED_MODULE_IMPORT",
-    "RESULT_CACHING", "CONFIG_CACHE_EXPLOIT", "POINTER_REPLAY", "CUDA_GRAPH_PYTHON", "CUDA_GRAPH_REPLAY",
-    "TIMER_MONKEYPATCH", "PRINT_INJECTION", "UNSYNC_MULTISTREAM", "CUDA_EVENT_DISABLE_TIMING",
+    "OUTPUT_REPLAY_CACHE", "CONFIG_CACHE_EXPLOIT", "POINTER_REPLAY", "PREPROCESS_CACHE", "WORKSPACE_CACHE",
+    "RUNNER_PLAN_CACHE", "CUDA_GRAPH_PYTHON", "CUDA_GRAPH_REPLAY",
+    "TIMER_MONKEYPATCH", "FAKE_BENCHMARK_EMIT", "STDIO_REDIRECT", "UNSYNC_MULTISTREAM", "CUDA_EVENT_DISABLE_TIMING",
     "SCALED_MM_REF", "DECODE_MM_REF", "SILENT_FALLBACK", "REFERENCE_PRECOMPUTE_REPLAY", "TORCH_COMPILE_CACHE",
     "HARDCODED_SHAPES", "TRIVIAL_PROBE",
     "DYNAMIC_EXECUTION", "MODULE_RELOAD", "THREAD_INJECTION", "LAZY_TENSOR",
