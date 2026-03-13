@@ -1425,6 +1425,12 @@ def detect_code_replacement(code: str | SubmissionFacts) -> list[dict]:
         if isinstance(node, ast.Assign):
             for target in node.targets:
                 if isinstance(target, ast.Attribute) and target.attr == "__code__":
+                    # Module-scoped __code__ replacement is already explained by
+                    # detect_module_mutation with better source attribution.
+                    if (isinstance(target.value, ast.Attribute)
+                            and isinstance(target.value.value, ast.Name)
+                            and target.value.value.id in facts.trusted_aliases):
+                        continue
                     lineno = getattr(node, "lineno", -1)
                     assigned_lines.add(lineno)
                     matches.append({
@@ -1546,6 +1552,114 @@ def detect_reference_precompute_replay(code: str | SubmissionFacts) -> list[dict
         "severity": "critical",
         "evidence": "trusted reference.generate_input imported, public cases precomputed, outputs replayed from precompute state",
     }]
+
+
+def detect_shape_output_replay(code: str | SubmissionFacts) -> list[dict]:
+    """Pattern: output replay keyed only by config / shape state."""
+    facts = ensure_submission_facts(code)
+    tree = facts.ast_tree
+    if tree is None:
+        return []
+
+    active = facts.python_active
+    if re.search(r'torch\.zeros', active) and re.search(r'return\s+_Z\s*\[\s*key\s*\]', active):
+        return [{
+            "pattern": "SHAPE_OUTPUT_REPLAY",
+            "severity": "critical",
+            "evidence": "shape-keyed zero/output cache returned directly from custom_kernel",
+        }]
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) or node.name != "custom_kernel":
+            continue
+
+        state_slots: dict[str, tuple[object, ...]] = {}
+        for arg, default in zip(node.args.args[-len(node.args.defaults):], node.args.defaults):
+            if isinstance(default, (ast.List, ast.Tuple)) and len(default.elts) >= 2:
+                state_slots[arg.arg] = tuple(range(len(default.elts)))
+
+        shape_state_match = False
+        replay_state = None
+        for child in ast.walk(node):
+            if not isinstance(child, ast.If):
+                continue
+            test = child.test
+            if not (isinstance(test, ast.Compare) and len(test.ops) == 1 and isinstance(test.ops[0], ast.Eq)):
+                continue
+            left, right = test.left, test.comparators[0]
+            for state_name in state_slots:
+                if (isinstance(left, ast.Subscript) and isinstance(left.value, ast.Name) and left.value.id == state_name
+                        and isinstance(right, ast.Name)) or (
+                    isinstance(right, ast.Subscript) and isinstance(right.value, ast.Name) and right.value.id == state_name
+                    and isinstance(left, ast.Name)
+                ):
+                    returns = [stmt for stmt in child.body if isinstance(stmt, ast.Return)]
+                    if returns:
+                        replay_state = state_name
+                        shape_state_match = True
+                        break
+            if shape_state_match:
+                break
+
+        if shape_state_match and replay_state:
+            helper_called = any(
+                isinstance(stmt, ast.Return) and isinstance(stmt.value, ast.Call)
+                for stmt in node.body
+            )
+            for sub in ast.walk(tree):
+                if not isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                if replay_state not in {arg.arg for arg in sub.args.args}:
+                    continue
+                assigns_first = any(
+                    isinstance(stmt, ast.Assign)
+                    and any(
+                        isinstance(t, ast.Subscript)
+                        and isinstance(t.value, ast.Name)
+                        and t.value.id == replay_state
+                        for t in stmt.targets
+                    )
+                    for stmt in ast.walk(sub)
+                )
+                if assigns_first:
+                    return [{
+                        "pattern": "SHAPE_OUTPUT_REPLAY",
+                        "severity": "critical",
+                        "evidence": "custom_kernel replays saved output based only on config/shape state",
+                    }]
+    return []
+
+
+def detect_timed_input_replay(code: str | SubmissionFacts) -> list[dict]:
+    """Pattern: timed-input preprocess/quant replay keyed by shape or pointer."""
+    facts = ensure_submission_facts(code)
+    active = facts.python_active
+    indicators = []
+
+    if re.search(r'_q_fp8_cache', active) and re.search(r'q\.data_ptr\s*\(', active):
+        indicators.append("q_fp8 cached by q.data_ptr()")
+    if re.search(r"c\['_q_ptr'\]\s*!=\s*q_ptr", active) and re.search(r"c\['_q_fp8'\]", active):
+        indicators.append("stateful _q_ptr/_q_fp8 reuse")
+    if re.search(r'_q_scale', active) and re.search(r'q_scale\s*=\s*_q_scale', active):
+        indicators.append("reused q_scale buffer")
+    if re.search(r'_FP8_BUF_CACHE', active) and re.search(r'dynamic_per_tensor_quant', active):
+        indicators.append("shape-keyed fp8 quant buffer cache")
+    if re.search(r'_s\s*=\s*\[\s*-?1\s*,\s*None\s*\]', active) and re.search(r'return\s+_s\s*\[\s*1\s*\]', active):
+        indicators.append("saved output reused from mutable default state")
+
+    # Only promote when the cached object is tied to live input quantization or
+    # transformed q tensors, not just generic workspace reuse.
+    if indicators and (
+        re.search(r'q_fp8', active)
+        or re.search(r'dynamic_per_tensor_quant', active)
+        or "saved output reused from mutable default state" in indicators
+    ):
+        return [{
+            "pattern": "TIMED_INPUT_REPLAY",
+            "severity": "critical",
+            "evidence": "timed-input quantization / transformed-Q replay: " + ", ".join(sorted(set(indicators))),
+        }]
+    return []
 
 
 def detect_pointer_replay(code: str | SubmissionFacts) -> list[dict]:
@@ -2173,6 +2287,8 @@ AMD_MANUAL_HARNESS_FIXTURES = ("manual_review:515117",)
 AMD_MANUAL_PRECOMPUTE_FIXTURES = ("manual_review:514553",)
 AMD_MANUAL_POINTER_REPLAY_FIXTURES = ("manual_review:515367",)
 AMD_MANUAL_FRAME_MUTATION_FIXTURES = ("manual_review:516235",)
+AMD_PACKAGE_TIMED_INPUT_REPLAY_FIXTURES = ()
+AMD_PACKAGE_SHAPE_REPLAY_FIXTURES = ()
 NVIDIA_ARCHIVE_TIMER_FIXTURES = (
     "nvidia_archive:108465", "nvidia_archive:108477", "nvidia_archive:108609", "nvidia_archive:108878",
     "nvidia_archive:121398", "nvidia_archive:121401",
@@ -2199,7 +2315,7 @@ RULE_REGISTRY: dict[str, RulePolicy] = {
         (), "split",
     ),
     "EVALUATOR_EXPLOIT": RulePolicy(
-        "EVALUATOR_EXPLOIT", "evaluator_state_mutation", "hard", AUTO_FILTER, (),
+        "EVALUATOR_EXPLOIT", "evaluator_state_mutation", "support", SUSPICIOUS_ONLY, (),
         NVIDIA_ARCHIVE_EVALUATOR_FIXTURES, "keep",
     ),
     "HARNESS_RUNTIME_PATCHING": RulePolicy(
@@ -2217,6 +2333,14 @@ RULE_REGISTRY: dict[str, RulePolicy] = {
     "OUTPUT_REPLAY_CACHE": RulePolicy(
         "OUTPUT_REPLAY_CACHE", "result_reuse", "support", SUSPICIOUS_ONLY, (),
         AMD_CONFIG_CACHE_FIXTURES, "rewrite",
+    ),
+    "SHAPE_OUTPUT_REPLAY": RulePolicy(
+        "SHAPE_OUTPUT_REPLAY", "result_reuse", "hard", AUTO_FILTER, (),
+        AMD_PACKAGE_SHAPE_REPLAY_FIXTURES, "keep",
+    ),
+    "TIMED_INPUT_REPLAY": RulePolicy(
+        "TIMED_INPUT_REPLAY", "result_reuse", "hard", AUTO_FILTER, (),
+        AMD_PACKAGE_TIMED_INPUT_REPLAY_FIXTURES, "keep",
     ),
     "PREPROCESS_CACHE": RulePolicy(
         "PREPROCESS_CACHE", "preprocess_cache", "telemetry", TELEMETRY_ONLY, (),
@@ -2420,6 +2544,8 @@ CODE_DETECTORS = [
     detect_scaled_mm_ref,
     detect_decode_mm_ref,
     detect_result_caching,
+    detect_shape_output_replay,
+    detect_timed_input_replay,
     detect_cuda_graph_replay,
     detect_silent_fallback,
     detect_trivial_probe,
@@ -2482,8 +2608,6 @@ def filter_reason(matched_patterns: list[dict]) -> str:
     if not matched_patterns:
         return "none"
     code_patterns, metadata_patterns, admin_patterns = split_match_domains(matched_patterns)
-    if is_default_reference(code_patterns) and get_rule_policy("SCALED_MM_REF").max_outcome == AUTO_FILTER:
-        return DEFAULT_REFERENCE_FILTER_REASON
 
     code_auto_filter = [
         p for p in code_patterns if get_rule_policy(p["pattern"]).max_outcome == AUTO_FILTER
@@ -2516,8 +2640,7 @@ def classify(matched_patterns: list[dict]) -> tuple[str, bool]:
     code_patterns, metadata_patterns, admin_patterns = split_match_domains(matched_patterns)
 
     if is_default_reference(code_patterns):
-        should_filter = get_rule_policy("SCALED_MM_REF").max_outcome == AUTO_FILTER
-        return DEFAULT_REFERENCE_CLASS, should_filter
+        return "low_confidence", False
 
     code_strongest = strongest_rule_outcome(code_patterns) if code_patterns else TELEMETRY_ONLY
     metadata_strongest = strongest_rule_outcome(metadata_patterns) if metadata_patterns else TELEMETRY_ONLY
@@ -2729,7 +2852,7 @@ AUDIT_RULE_ORDER = [
     "EVALUATOR_EXPLOIT", "HARNESS_RUNTIME_PATCHING", "MODULE_MUTATION", "GLOBALS_MUTATION", "CODE_REPLACEMENT",
     "FRAME_WALK_ACCESS", "FRAME_WALK_MUTATION", "SYS_MODULES_ACCESS", "GLOBALS_ACCESS", "CODE_ACCESS",
     "TRUSTED_MODULE_IMPORT",
-    "OUTPUT_REPLAY_CACHE", "CONFIG_CACHE_EXPLOIT", "POINTER_REPLAY", "PREPROCESS_CACHE", "WORKSPACE_CACHE",
+    "OUTPUT_REPLAY_CACHE", "SHAPE_OUTPUT_REPLAY", "TIMED_INPUT_REPLAY", "CONFIG_CACHE_EXPLOIT", "POINTER_REPLAY", "PREPROCESS_CACHE", "WORKSPACE_CACHE",
     "RUNNER_PLAN_CACHE", "CUDA_GRAPH_PYTHON", "CUDA_GRAPH_REPLAY",
     "TIMER_MONKEYPATCH", "FAKE_BENCHMARK_EMIT", "STDIO_REDIRECT", "UNSYNC_MULTISTREAM", "CUDA_EVENT_DISABLE_TIMING",
     "SCALED_MM_REF", "DECODE_MM_REF", "SILENT_FALLBACK", "REFERENCE_PRECOMPUTE_REPLAY", "TORCH_COMPILE_CACHE",
@@ -3516,7 +3639,19 @@ def main():
     parser.add_argument("--output-dir", type=str, default=".", help="Output directory")
     parser.add_argument("--workers", type=int, default=0,
                         help="Parallel worker processes (default: os.cpu_count())")
+    parser.add_argument(
+        "--api-mode",
+        action="store_true",
+        help="Read submission code from stdin, output JSON result to stdout (for sidecar integration)",
+    )
     args = parser.parse_args()
+
+    if args.api_mode:
+        import sys as _sys
+        code = _sys.stdin.read()
+        result = analyze_code(code, compute_structural_hash=False)
+        print(json.dumps(result))
+        return
 
     if not args.nvidia_archive and not args.jsonl and not args.parquet and not args.audit_rules:
         parser.error("Must specify at least one of --nvidia_archive, --jsonl, --parquet, --audit-rules")
