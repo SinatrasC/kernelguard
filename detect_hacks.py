@@ -1745,6 +1745,54 @@ def detect_pointer_replay(code: str | SubmissionFacts) -> list[dict]:
     return []
 
 
+RE_OBJECT_ID_DATA = re.compile(r"\bdata_id\s*=\s*id\s*\(\s*data\s*\)")
+RE_RESULT_BANK_SET = re.compile(r"_superbatch_results\s*\[\s*(?:did|data_id)\s*\]\s*=")
+RE_RESULT_BANK_RETURN = re.compile(r"return\s+_superbatch_results\s*\[\s*data_id\s*\]")
+RE_FAST_RESULT_CACHE_GET = re.compile(r"_fast_cache\.get\s*\(\s*data_id\s*\)")
+RE_FAST_RESULT_CACHE_SET = re.compile(r"_fast_cache\s*\[\s*data_id\s*\]\s*=")
+RE_RETURN_RESULT = re.compile(r"return\s+result\b")
+RE_RESULT_LIST = re.compile(r"\bresult_list\b")
+RE_LEARNING_DATA = re.compile(r"\b_learning_data\b")
+
+
+def detect_result_bank_replay(code: str | SubmissionFacts) -> list[dict]:
+    """Pattern: object-identity replay through learned result banks / super-batches.
+
+    Targets kernels that key caches by `id(data)`, accumulate per-object result
+    lists, and later return stored results or launch handles for those same
+    objects instead of recomputing normally.
+    """
+    facts = ensure_submission_facts(code)
+    active = facts.python_active
+    if not RE_OBJECT_ID_DATA.search(active):
+        return []
+
+    superbatch_replay = (
+        RE_RESULT_BANK_SET.search(active)
+        and RE_RESULT_BANK_RETURN.search(active)
+        and RE_RESULT_LIST.search(active)
+    )
+    fast_cache_replay = (
+        RE_FAST_RESULT_CACHE_GET.search(active)
+        and RE_FAST_RESULT_CACHE_SET.search(active)
+        and RE_RETURN_RESULT.search(active)
+        and RE_LEARNING_DATA.search(active)
+    )
+
+    if superbatch_replay or fast_cache_replay:
+        evidence_parts = ["custom_kernel keys replay state by id(data)"]
+        if superbatch_replay:
+            evidence_parts.append("returns _superbatch_results[data_id]")
+        if fast_cache_replay:
+            evidence_parts.append("returns cached result from _fast_cache[data_id]")
+        return [{
+            "pattern": "RESULT_BANK_REPLAY",
+            "severity": "critical",
+            "evidence": "; ".join(evidence_parts),
+        }]
+    return []
+
+
 def detect_config_cache_exploit(code: str | SubmissionFacts) -> list[dict]:
     """AST pattern 7: config-keyed result caching inside custom_kernel.
 
@@ -2287,6 +2335,7 @@ AMD_MANUAL_HARNESS_FIXTURES = ("manual_review:515117",)
 AMD_MANUAL_PRECOMPUTE_FIXTURES = ("manual_review:514553",)
 AMD_MANUAL_POINTER_REPLAY_FIXTURES = ("manual_review:515367",)
 AMD_MANUAL_FRAME_MUTATION_FIXTURES = ("manual_review:516235",)
+TOP5_LOWCONF_RESULT_BANK_FIXTURES = ("top5low:506336",)
 AMD_PACKAGE_TIMED_INPUT_REPLAY_FIXTURES = ()
 AMD_PACKAGE_SHAPE_REPLAY_FIXTURES = ()
 NVIDIA_ARCHIVE_TIMER_FIXTURES = (
@@ -2436,6 +2485,10 @@ RULE_REGISTRY: dict[str, RulePolicy] = {
         "POINTER_REPLAY", "result_reuse", "hard", AUTO_FILTER, (),
         AMD_MANUAL_POINTER_REPLAY_FIXTURES, "keep",
     ),
+    "RESULT_BANK_REPLAY": RulePolicy(
+        "RESULT_BANK_REPLAY", "result_reuse", "hard", AUTO_FILTER, (),
+        TOP5_LOWCONF_RESULT_BANK_FIXTURES, "keep",
+    ),
     "DYNAMIC_EXECUTION": RulePolicy(
         "DYNAMIC_EXECUTION", "dynamic_execution", "telemetry", TELEMETRY_ONLY, (),
         (), "split",
@@ -2564,6 +2617,7 @@ CODE_DETECTORS = [
     detect_config_cache_exploit,
     detect_reference_precompute_replay,
     detect_pointer_replay,
+    detect_result_bank_replay,
     detect_dynamic_execution,
     detect_thread_injection,
     detect_lazy_tensor,
@@ -2852,7 +2906,7 @@ AUDIT_RULE_ORDER = [
     "EVALUATOR_EXPLOIT", "HARNESS_RUNTIME_PATCHING", "MODULE_MUTATION", "GLOBALS_MUTATION", "CODE_REPLACEMENT",
     "FRAME_WALK_ACCESS", "FRAME_WALK_MUTATION", "SYS_MODULES_ACCESS", "GLOBALS_ACCESS", "CODE_ACCESS",
     "TRUSTED_MODULE_IMPORT",
-    "OUTPUT_REPLAY_CACHE", "SHAPE_OUTPUT_REPLAY", "TIMED_INPUT_REPLAY", "CONFIG_CACHE_EXPLOIT", "POINTER_REPLAY", "PREPROCESS_CACHE", "WORKSPACE_CACHE",
+    "OUTPUT_REPLAY_CACHE", "SHAPE_OUTPUT_REPLAY", "TIMED_INPUT_REPLAY", "CONFIG_CACHE_EXPLOIT", "POINTER_REPLAY", "RESULT_BANK_REPLAY", "PREPROCESS_CACHE", "WORKSPACE_CACHE",
     "RUNNER_PLAN_CACHE", "CUDA_GRAPH_PYTHON", "CUDA_GRAPH_REPLAY",
     "TIMER_MONKEYPATCH", "FAKE_BENCHMARK_EMIT", "STDIO_REDIRECT", "UNSYNC_MULTISTREAM", "CUDA_EVENT_DISABLE_TIMING",
     "SCALED_MM_REF", "DECODE_MM_REF", "SILENT_FALLBACK", "REFERENCE_PRECOMPUTE_REPLAY", "TORCH_COMPILE_CACHE",
@@ -2889,6 +2943,9 @@ def build_classifier_fixture_manifest(
     amd_dir: str = "amd_fixture_archive",
     filtered_nvidia_archive_path: str = "filtered_nvidia_archive.jsonl",
     manual_judgments_path: str = "manual_review_archive/manual_judgments.json",
+    extra_manual_review_paths: tuple[str, ...] = (
+        "top_competitions_review/low_confidence_review/manual_judgments.json",
+    ),
 ) -> dict:
     """Build the precision-audit fixture manifest.
 
@@ -2958,31 +3015,38 @@ def build_classifier_fixture_manifest(
             })
             hard_positive_ids.add(sid)
 
-    if os.path.exists(manual_judgments_path):
-        with open(manual_judgments_path, encoding="utf-8") as f:
+    manual_review_sources = [
+        (manual_judgments_path, "manual_review", "manual_archive_review"),
+        *[(path, "top5low", "top5_lowconfidence_manual_review") for path in extra_manual_review_paths],
+    ]
+    for review_path, fixture_prefix, source_name in manual_review_sources:
+        if not os.path.exists(review_path):
+            continue
+        with open(review_path, encoding="utf-8") as f:
             manual_rows = json.load(f)
         for row in manual_rows:
             if str(row.get("manual_filter", "")).lower() != "yes":
                 continue
             sid = str(row["submission_id"])
-            if sid in known_hard_positive_amd_ids:
+            if fixture_prefix == "manual_review" and sid in known_hard_positive_amd_ids:
                 continue
-            path = row.get("code_path")
-            if not path or not os.path.exists(path):
+            code_path = row.get("code_path") or row.get("path")
+            if not code_path or not os.path.exists(code_path):
                 continue
-            code = _safe_read_text(path)
+            code = _safe_read_text(code_path)
             manifest["hard_positives"].append({
-                "fixture_id": f"manual_review:{sid}",
+                "fixture_id": f"{fixture_prefix}:{sid}",
                 "submission_id": sid,
                 "label": "hard_positive",
-                "source": "manual_archive_review",
+                "source": source_name,
                 "technique": row.get("primary_technique", "manual_review"),
                 "problem_name": row.get("problem_name"),
                 "manual_judgment": row.get("manual_judgment"),
-                "file": path,
+                "file": code_path,
                 "code_hash": code_hash(code),
             })
-            known_hard_positive_amd_ids.add(sid)
+            if fixture_prefix == "manual_review":
+                known_hard_positive_amd_ids.add(sid)
 
     filtered_ids: set[str] = set()
     if os.path.exists(filtered_nvidia_archive_path):
