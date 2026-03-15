@@ -13,6 +13,7 @@ Usage:
 
 import argparse
 import ast
+import copy
 from dataclasses import dataclass, field
 import glob
 import hashlib
@@ -22,10 +23,15 @@ import multiprocessing as mp
 import os
 import re
 import sys
+import tomllib
 import tokenize
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from typing import Any, Optional
+
+
+CONFIG_VERSION = 1
+DEFAULT_PROFILE_NAME = "default"
 
 # ---------------------------------------------------------------------------
 # Compiled regex patterns (module-level for performance)
@@ -267,6 +273,22 @@ def function_uses_scaled_mm(func_body: str, alias_names: set[str]) -> bool:
     return False
 
 
+BASE_ENTRYPOINT_NAMES = ("custom_kernel",)
+ENTRYPOINT_NAMES = BASE_ENTRYPOINT_NAMES
+
+
+def _entrypoint_candidates() -> tuple[str, ...]:
+    return ENTRYPOINT_NAMES
+
+
+def is_entrypoint_name(name: str) -> bool:
+    return name in ENTRYPOINT_NAMES
+
+
+def entrypoint_label(name: Optional[str] = None) -> str:
+    return name or (ENTRYPOINT_NAMES[0] if ENTRYPOINT_NAMES else "entrypoint")
+
+
 @dataclass
 class SubmissionFacts:
     """Shared normalized views and AST summaries for one submission."""
@@ -278,6 +300,7 @@ class SubmissionFacts:
     main_aliases: set[str]
     scaled_mm_aliases: set[str]
     trusted_aliases: dict[str, str]
+    entrypoint_name: Optional[str]
     custom_kernel_pos: Optional[int]
     code_before_custom_kernel: str
     code_from_custom_kernel: str
@@ -306,11 +329,18 @@ def build_submission_facts(code: str) -> SubmissionFacts:
     python_only = strip_cpp_cuda_blocks(code)
     python_active = strip_python_comments(python_only)
     tree = _safe_ast_parse(code)
-    custom_kernel_match = re.search(r'^def\s+custom_kernel\s*\(', code, re.MULTILINE)
+    entrypoint_name = None
+    custom_kernel_match = None
+    for candidate_name in _entrypoint_candidates():
+        match = re.search(rf'^\s*def\s+{re.escape(candidate_name)}\s*\(', code, re.MULTILINE)
+        if match is not None:
+            entrypoint_name = candidate_name
+            custom_kernel_match = match
+            break
     custom_kernel_pos = custom_kernel_match.start() if custom_kernel_match else None
     code_before_custom_kernel = code[:custom_kernel_pos] if custom_kernel_pos is not None else code
     code_from_custom_kernel = code[custom_kernel_pos:] if custom_kernel_pos is not None else code
-    custom_kernel_code = extract_function_block(code, "custom_kernel")
+    custom_kernel_code = extract_function_block(code, entrypoint_name or entrypoint_label())
     custom_kernel_active = strip_python_comments(custom_kernel_code)
     trusted_aliases = _collect_trusted_aliases(tree) if tree is not None else {}
 
@@ -322,12 +352,16 @@ def build_submission_facts(code: str) -> SubmissionFacts:
         main_aliases=find_main_aliases(python_only),
         scaled_mm_aliases=find_scaled_mm_aliases(code_before_custom_kernel),
         trusted_aliases=trusted_aliases,
+        entrypoint_name=entrypoint_name,
         custom_kernel_pos=custom_kernel_pos,
         code_before_custom_kernel=code_before_custom_kernel,
         code_from_custom_kernel=code_from_custom_kernel,
         custom_kernel_code=custom_kernel_code,
         custom_kernel_active=custom_kernel_active,
     )
+    if entrypoint_name:
+        facts._function_blocks[entrypoint_name] = custom_kernel_code
+        facts._active_function_blocks[entrypoint_name] = custom_kernel_active
     facts._function_blocks["custom_kernel"] = custom_kernel_code
     facts._active_function_blocks["custom_kernel"] = custom_kernel_active
     return facts
@@ -452,24 +486,27 @@ def detect_evaluator_exploit(code: str | SubmissionFacts) -> list[dict]:
     # Blobs cause O(n²) backtracking in patterns like (\w+)\s*=\s*literal when
     # they form very long single-line word runs (e.g. 129KB base64 strings).
     code = facts.python_only
+    main_patch_targets = sorted(TRUSTED_FUNCTIONS)
 
-    if RE_MAIN_TIME_KERNEL.search(code):
-        add_match("main.time_kernel patched")
-    if RE_MAIN_CLONE_DATA.search(code):
-        add_match("main._clone_data patched")
-    if RE_MAIN_CLEAR_L2.search(code):
-        add_match("main.clear_l2_cache patched")
+    for attr in main_patch_targets:
+        if re.search(rf'\bmain\.{re.escape(attr)}\s*=', code):
+            add_match(f"main.{attr} patched")
 
     aliases = facts.main_aliases
     # Check for alias-based patching regardless of how __main__ was obtained
-    for m in RE_MAIN_ATTR_PATCH.finditer(code):
-        obj, attr = m.group(1), m.group(2)
-        if obj in aliases and obj != "main":
-            add_match(f"{obj}.{attr} patched via __main__ alias")
-    for m in RE_MAIN_SETATTR_PATCH.finditer(code):
-        obj, attr = m.group(1), m.group(2)
-        if obj in aliases:
-            add_match(f"setattr({obj}, '{attr}', ...) on __main__ alias")
+    for obj in sorted(aliases):
+        if obj == "main":
+            continue
+        for attr in main_patch_targets:
+            if re.search(rf'\b{re.escape(obj)}\.{re.escape(attr)}\s*=', code):
+                add_match(f"{obj}.{attr} patched via __main__ alias")
+    for obj in sorted(aliases):
+        for attr in main_patch_targets:
+            if re.search(
+                rf'setattr\s*\(\s*{re.escape(obj)}\s*,\s*[\'"]{re.escape(attr)}[\'"]\s*,',
+                code,
+            ):
+                add_match(f"setattr({obj}, '{attr}', ...) on __main__ alias")
     # Also flag if __main__ is imported directly (unusual in a kernel submission)
     if RE_FROM_IMPORT_MAIN.search(code):
         add_match("from __main__ import ... (direct harness access)")
@@ -479,7 +516,7 @@ def detect_evaluator_exploit(code: str | SubmissionFacts) -> list[dict]:
 def detect_scaled_mm_ref(code: str | SubmissionFacts) -> list[dict]:
     """Pattern 4: Using torch._scaled_mm as primary compute.
 
-    Scope-aware: if the file has a `def custom_kernel` function and
+    Scope-aware: if the file has a configured entrypoint function and
     `_scaled_mm` only appears BEFORE that function, it's likely a
     reference implementation (not the submission's compute path) and
     should not be flagged.
@@ -487,13 +524,14 @@ def detect_scaled_mm_ref(code: str | SubmissionFacts) -> list[dict]:
     facts = ensure_submission_facts(code)
     matches = []
     code = facts.raw_code
+    entrypoint_name = entrypoint_label(facts.entrypoint_name)
     custom_kernel_pos = facts.custom_kernel_pos or 0
 
-    # For scope-aware check: code from custom_kernel onward
-    # If no custom_kernel found, check entire file (conservative)
+    # For scope-aware check: code from the configured entrypoint onward.
+    # If no entrypoint is found, check the entire file (conservative).
     if facts.custom_kernel_pos is not None:
-        # Check if _scaled_mm is used at or after custom_kernel definition,
-        # or if _scaled_mm is aliased to a variable that custom_kernel could
+        # Check if _scaled_mm is used at or after the configured entrypoint,
+        # or if _scaled_mm is aliased to a variable that the entrypoint could
         # call indirectly.
         code_from_ck = facts.code_from_custom_kernel
         code_before_ck = facts.code_before_custom_kernel
@@ -505,23 +543,23 @@ def detect_scaled_mm_ref(code: str | SubmissionFacts) -> list[dict]:
         has_cpp = bool(RE_SCALED_MM_CPP.search(code))
         has_schema = bool(RE_SCALED_MM_SCHEMA.search(code))
 
-        # _scaled_mm only before custom_kernel — check if custom_kernel actually
+        # _scaled_mm only before the configured entrypoint — check if it actually
         # reaches that code path through a helper or a direct alias call.
         has_python_before = bool(RE_SCALED_MM_PYTHON.search(code_before_ck))
         if ((has_python_before or has_alias_before) and not has_python_after and
                 not has_alias_after and
                 not has_cpp and not has_schema):
-            # Find function names defined before custom_kernel that use _scaled_mm
+            # Find function names defined before the entrypoint that use _scaled_mm
             helper_funcs_with_mm = set()
             for func_m in re.finditer(r'^def\s+(\w+)\s*\(', code_before_ck, re.MULTILINE):
                 func_name = func_m.group(1)
                 func_body = facts.get_function_block(func_name)
                 if function_uses_scaled_mm(func_body, alias_names_before):
                     helper_funcs_with_mm.add(func_name)
-            # Strip Python comments from custom_kernel body before call-site analysis
+            # Strip Python comments from the entrypoint body before call-site analysis
             # so that commented-out calls (e.g. # result = ref_kernel(data)) are ignored.
             ck_active = facts.custom_kernel_active
-            # Check if custom_kernel's OUTPUT comes from a helper that uses _scaled_mm.
+            # Check if the entrypoint output comes from a helper that uses _scaled_mm.
             # Validation-only calls (result not returned) are NOT the submission's compute.
             compute_helpers = set()
             for fn in helper_funcs_with_mm:
@@ -580,13 +618,16 @@ def detect_scaled_mm_ref(code: str | SubmissionFacts) -> list[dict]:
                             f"_scaled_mm helper(s) used as shape-gated fallback in custom_kernel: "
                             f"{', '.join(sorted(compute_helpers))} "
                             f"(primary path is custom, ref only in conditional branch)"
-                        ),
+                        ).replace("custom_kernel", entrypoint_name),
                     })
                 else:
                     matches.append({
                         "pattern": "SCALED_MM_REF",
                         "severity": "high",
-                        "evidence": f"custom_kernel returns output of _scaled_mm helper(s): {', '.join(sorted(compute_helpers))}",
+                        "evidence": (
+                            f"{entrypoint_name} returns output of _scaled_mm helper(s): "
+                            f"{', '.join(sorted(compute_helpers))} "
+                        ),
                     })
                 return matches
             # Helper called for validation only (result not returned).
@@ -607,7 +648,10 @@ def detect_scaled_mm_ref(code: str | SubmissionFacts) -> list[dict]:
                     matches.append({
                         "pattern": "SCALED_MM_REF",
                         "severity": "medium",
-                        "evidence": f"_scaled_mm helper(s) called in custom_kernel but result not returned: {', '.join(sorted(non_inplace))}",
+                        "evidence": (
+                            f"_scaled_mm helper(s) called in {entrypoint_name} but result not returned: "
+                            f"{', '.join(sorted(non_inplace))}"
+                        ),
                     })
                 if inplace:
                     matches.append({
@@ -616,15 +660,18 @@ def detect_scaled_mm_ref(code: str | SubmissionFacts) -> list[dict]:
                         "evidence": f"_scaled_mm helper(s) called as in-place mutation (result discarded): {', '.join(sorted(inplace))}",
                     })
                 return matches
-            # Helper defined but not called from custom_kernel (e.g. commented-out) → medium
+            # Helper defined but not called from the entrypoint (e.g. commented-out) → medium
             if helper_funcs_with_mm:
                 matches.append({
                     "pattern": "SCALED_MM_REF",
                     "severity": "medium",
-                    "evidence": f"_scaled_mm in helper(s) before custom_kernel: {', '.join(sorted(helper_funcs_with_mm))} (not called in active code)",
+                    "evidence": (
+                        f"_scaled_mm in helper(s) before {entrypoint_name}: "
+                        f"{', '.join(sorted(helper_funcs_with_mm))} (not called in active code)"
+                    ),
                 })
                 return matches
-            # _scaled_mm or an alias only appears before custom_kernel and is never
+            # _scaled_mm or an alias only appears before the entrypoint and is never
             # reached from it → likely reference/dead code, not the submission path.
             return []
 
@@ -664,9 +711,10 @@ def detect_decode_mm_ref(code: str | SubmissionFacts) -> list[dict]:
     facts = ensure_submission_facts(code)
     python_only = facts.python_only
     custom_kernel_code = facts.custom_kernel_code
+    entrypoint_name = entrypoint_label(facts.entrypoint_name)
     matches = []
 
-    # Tighten scope: only count mm/bmm/matmul used in submission entrypoint.
+    # Tighten scope: only count mm/bmm/matmul used in the submission entrypoint.
     if not custom_kernel_code:
         return matches
 
@@ -704,7 +752,7 @@ def detect_decode_mm_ref(code: str | SubmissionFacts) -> list[dict]:
             re.search(r'\b(?:fp4|decode|sfa|sfb|scale_a|scale_b|to_blocked)\b', python_only, re.IGNORECASE),
         )
         severity = "high" if has_decode_context else "medium"
-        evidence = f"{', '.join(ops)} used inside custom_kernel"
+        evidence = f"{', '.join(ops)} used inside {entrypoint_name}"
         if not has_decode_context:
             evidence += " (no explicit FP4 decode context)"
         if feeds_output:
@@ -743,10 +791,10 @@ def detect_result_caching(code: str | SubmissionFacts) -> list[dict]:
     if RE_VERSION_CACHE.search(python_only):
         workspace_signals.append("tensor._version cache check")
 
-    # Scope all strong-signal checks to custom_kernel body.
+    # Scope all strong-signal checks to the configured entrypoint body.
     # Helper functions that cache compilation artifacts (TensorMap, compiled kernels,
     # plan descriptors, etc.) return those objects from caches, but that is legitimate —
-    # only a cache inside custom_kernel itself indicates result caching.
+    # only a cache inside the entrypoint itself indicates result caching.
     cache_scope = facts.custom_kernel_active if facts.custom_kernel_active else python_active
 
     stores_output = bool(RE_CACHE_STORE_OUTPUT.search(cache_scope))
@@ -1132,16 +1180,18 @@ def detect_cuda_event_disable_timing(code: str | SubmissionFacts) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 # Modules that are trusted by the evaluator and must not be mutated by submissions.
-TRUSTED_MODULES = frozenset({
+BASE_TRUSTED_MODULES = frozenset({
     "reference", "utils", "eval", "__main__",
 })
+TRUSTED_MODULES = BASE_TRUSTED_MODULES
 
 # Evaluator-critical functions that should never be replaced.
-TRUSTED_FUNCTIONS = frozenset({
+BASE_TRUSTED_FUNCTIONS = frozenset({
     "generate_input", "ref_kernel", "check_implementation",
     "clear_l2_cache", "clear_l2_cache_large", "time_kernel",
     "_clone_data", "_run_single_benchmark", "_run_single_test",
 })
+TRUSTED_FUNCTIONS = BASE_TRUSTED_FUNCTIONS
 
 
 def _safe_ast_parse(code: str):
@@ -1453,10 +1503,11 @@ def detect_code_replacement(code: str | SubmissionFacts) -> list[dict]:
     return matches
 
 
-TRUSTED_HARNESS_NAMES = frozenset({
+BASE_TRUSTED_HARNESS_NAMES = frozenset({
     "generate_input", "check_implementation", "clear_l2_cache",
     "clear_l2_cache_large", "_clone_data", "ref_kernel",
 })
+TRUSTED_HARNESS_NAMES = BASE_TRUSTED_HARNESS_NAMES
 
 
 def detect_harness_runtime_patching(code: str | SubmissionFacts) -> list[dict]:
@@ -1536,11 +1587,25 @@ def detect_reference_precompute_replay(code: str | SubmissionFacts) -> list[dict
     """
     facts = ensure_submission_facts(code)
     code = facts.python_active
-    if not RE_REFERENCE_GENERATE_INPUT.search(code):
+    import_hits = []
+    imported_functions = set()
+    for module_name in sorted(TRUSTED_MODULES):
+        for function_name in sorted(TRUSTED_FUNCTIONS):
+            if re.search(
+                rf'from\s+{re.escape(module_name)}\s+import\s+{re.escape(function_name)}\b',
+                code,
+            ):
+                import_hits.append(f"{module_name}.{function_name}")
+                imported_functions.add(function_name)
+    if not import_hits:
         return []
     if not RE_PRECOMPUTE_STATE.search(code):
         return []
-    if len(re.findall(r'\bgenerate_input\s*\(', code)) < 2:
+    call_count = sum(
+        len(re.findall(rf'\b{re.escape(function_name)}\s*\(', code))
+        for function_name in imported_functions
+    )
+    if call_count < 2:
         return []
     if not RE_PRECOMPUTE_APPEND.search(code):
         return []
@@ -1550,7 +1615,10 @@ def detect_reference_precompute_replay(code: str | SubmissionFacts) -> list[dict
     return [{
         "pattern": "REFERENCE_PRECOMPUTE_REPLAY",
         "severity": "critical",
-        "evidence": "trusted reference.generate_input imported, public cases precomputed, outputs replayed from precompute state",
+        "evidence": (
+            f"trusted import(s) {', '.join(sorted(import_hits))} used to precompute public cases "
+            "and replay outputs from precompute state"
+        ),
     }]
 
 
@@ -1560,17 +1628,18 @@ def detect_shape_output_replay(code: str | SubmissionFacts) -> list[dict]:
     tree = facts.ast_tree
     if tree is None:
         return []
+    entrypoint_name = entrypoint_label(facts.entrypoint_name)
 
     active = facts.python_active
     if re.search(r'torch\.zeros', active) and re.search(r'return\s+_Z\s*\[\s*key\s*\]', active):
         return [{
             "pattern": "SHAPE_OUTPUT_REPLAY",
             "severity": "critical",
-            "evidence": "shape-keyed zero/output cache returned directly from custom_kernel",
+            "evidence": f"shape-keyed zero/output cache returned directly from {entrypoint_name}",
         }]
 
     for node in ast.walk(tree):
-        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) or node.name != "custom_kernel":
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) or not is_entrypoint_name(node.name):
             continue
 
         state_slots: dict[str, tuple[object, ...]] = {}
@@ -1625,7 +1694,7 @@ def detect_shape_output_replay(code: str | SubmissionFacts) -> list[dict]:
                     return [{
                         "pattern": "SHAPE_OUTPUT_REPLAY",
                         "severity": "critical",
-                        "evidence": "custom_kernel replays saved output based only on config/shape state",
+                        "evidence": f"{entrypoint_name} replays saved output based only on config/shape state",
                     }]
     return []
 
@@ -1668,6 +1737,7 @@ def detect_pointer_replay(code: str | SubmissionFacts) -> list[dict]:
     tree = facts.ast_tree
     if tree is None:
         return []
+    entrypoint_name = entrypoint_label(facts.entrypoint_name)
 
     def _is_data_ptr_call(expr: ast.AST | None) -> bool:
         return (
@@ -1679,7 +1749,7 @@ def detect_pointer_replay(code: str | SubmissionFacts) -> list[dict]:
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
-        if node.name != "custom_kernel":
+        if not is_entrypoint_name(node.name):
             continue
 
         pointer_aliases: set[str] = set()
@@ -1739,7 +1809,7 @@ def detect_pointer_replay(code: str | SubmissionFacts) -> list[dict]:
             return [{
                 "pattern": "POINTER_REPLAY",
                 "severity": "critical",
-                "evidence": "custom_kernel returns saved output when input data_ptr matches previous pointer",
+                "evidence": f"{entrypoint_name} returns saved output when input data_ptr matches previous pointer",
             }]
 
     return []
@@ -1764,6 +1834,7 @@ def detect_result_bank_replay(code: str | SubmissionFacts) -> list[dict]:
     """
     facts = ensure_submission_facts(code)
     active = facts.python_active
+    entrypoint_name = entrypoint_label(facts.entrypoint_name)
     if not RE_OBJECT_ID_DATA.search(active):
         return []
 
@@ -1780,7 +1851,7 @@ def detect_result_bank_replay(code: str | SubmissionFacts) -> list[dict]:
     )
 
     if superbatch_replay or fast_cache_replay:
-        evidence_parts = ["custom_kernel keys replay state by id(data)"]
+        evidence_parts = [f"{entrypoint_name} keys replay state by id(data)"]
         if superbatch_replay:
             evidence_parts.append("returns _superbatch_results[data_id]")
         if fast_cache_replay:
@@ -1794,9 +1865,9 @@ def detect_result_bank_replay(code: str | SubmissionFacts) -> list[dict]:
 
 
 def detect_config_cache_exploit(code: str | SubmissionFacts) -> list[dict]:
-    """AST pattern 7: config-keyed result caching inside custom_kernel.
+    """AST pattern 7: config-keyed result caching inside the configured entrypoint.
 
-    Detects: custom_kernel that looks up a cache on entry, returns the cached
+    Detects: an entrypoint that looks up a cache on entry, returns the cached
     value WITHOUT calling any GPU kernel, and stores output into the cache
     before the final return.
 
@@ -1808,13 +1879,14 @@ def detect_config_cache_exploit(code: str | SubmissionFacts) -> list[dict]:
     tree = facts.ast_tree
     if tree is None:
         return []
+    entrypoint_name = entrypoint_label(facts.entrypoint_name)
 
     matches = []
 
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
-        if node.name != "custom_kernel":
+        if not is_entrypoint_name(node.name):
             continue
 
         def _root_name(expr: ast.AST | None) -> Optional[str]:
@@ -1930,11 +2002,14 @@ def detect_config_cache_exploit(code: str | SubmissionFacts) -> list[dict]:
                             store_containers.add(target_root)
 
         if shortcircuit_containers & store_containers:
-            matches.append({
-                "pattern": "CONFIG_CACHE_EXPLOIT",
-                "severity": "high",
-                "evidence": "custom_kernel short-circuits on cache hit + stores output (config-keyed result caching)",
-            })
+                matches.append({
+                    "pattern": "CONFIG_CACHE_EXPLOIT",
+                    "severity": "high",
+                    "evidence": (
+                        f"{entrypoint_name} short-circuits on cache hit + stores output "
+                        "(config-keyed result caching)"
+                    ),
+                })
 
     return matches
 
@@ -2169,10 +2244,10 @@ def detect_precision_downgrade(code: str | SubmissionFacts) -> list[dict]:
 
     matches = []
 
-    # Look inside custom_kernel (or the whole file if no custom_kernel found)
+    # Look inside the configured entrypoint (or the whole file if none is found)
     target_funcs = [
         node for node in ast.walk(tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "custom_kernel"
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and is_entrypoint_name(node.name)
     ]
     if not target_funcs:
         target_funcs = [tree]
@@ -2238,7 +2313,7 @@ def detect_score_anomaly(metadata: Optional[dict]) -> list[dict]:
     - nvidia_archive: metadata has "scores" (list of floats)
     - jsonl: metadata has "improved_score" / "baseline_score"
     """
-    if not metadata:
+    if not metadata or not SCORE_CONFIG.get("enabled", True):
         return []
     matches = []
 
@@ -2262,28 +2337,31 @@ def detect_score_anomaly(metadata: Optional[dict]) -> list[dict]:
         all_scores.append(improved_score)
 
     # Check score anomalies
+    impossible_below = float(SCORE_CONFIG["impossible_below"])
+    suspect_floor_below = float(SCORE_CONFIG["suspect_floor_below"])
+    broken_above = float(SCORE_CONFIG["broken_above"])
     for s in all_scores:
         if not isinstance(s, (int, float)) or s <= 0:
             continue
-        if s < 1e-8:
+        if s < impossible_below:
             matches.append({
                 "pattern": "SCORE_IMPOSSIBLE",
                 "severity": "critical",
-                "evidence": f"Score {s:.2e} is physically impossible (<10ns)",
+                "evidence": f"Score {s:.2e} is physically impossible (<{impossible_below:.2e}s)",
             })
             break
-        if s < 5e-6:
+        if s < suspect_floor_below:
             matches.append({
                 "pattern": "SCORE_SUSPECT_FLOOR",
                 "severity": "high",
-                "evidence": f"Score {s:.2e}s is at/near HIP/CUDA event timing floor (~4µs)",
+                "evidence": f"Score {s:.2e}s is at/near timing floor (<{suspect_floor_below:.2e}s)",
             })
             break
-        if s > 0.5:
+        if s > broken_above:
             matches.append({
                 "pattern": "SCORE_BROKEN",
                 "severity": "critical",
-                "evidence": f"Score {s:.2e} suggests broken/inverted metric",
+                "evidence": f"Score {s:.2e} exceeds configured upper bound ({broken_above:.2e}s)",
             })
             break
 
@@ -2293,11 +2371,14 @@ def detect_score_anomaly(metadata: Optional[dict]) -> list[dict]:
             and isinstance(baseline_score, (int, float))
             and improved_score > 0):
         speedup = baseline_score / improved_score
-        if speedup > 100:
+        if speedup > float(SCORE_CONFIG["extreme_speedup_above"]):
             matches.append({
                 "pattern": "SCORE_EXTREME_SPEEDUP",
                 "severity": "high",
-                "evidence": f"Speedup {speedup:.1f}x over baseline is extreme",
+                "evidence": (
+                    f"Speedup {speedup:.1f}x over baseline exceeds configured bound "
+                    f"({float(SCORE_CONFIG['extreme_speedup_above']):.1f}x)"
+                ),
             })
 
     return matches
@@ -2350,7 +2431,7 @@ NVIDIA_ARCHIVE_EVALUATOR_FIXTURES = (
 )
 
 
-RULE_REGISTRY: dict[str, RulePolicy] = {
+BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
     "TIMER_MONKEYPATCH": RulePolicy(
         "TIMER_MONKEYPATCH", "timing_monkeypatch", "hard", AUTO_FILTER, (),
         NVIDIA_ARCHIVE_TIMER_FIXTURES, "keep",
@@ -2535,6 +2616,39 @@ RULE_REGISTRY: dict[str, RulePolicy] = {
     ),
 }
 
+BASE_SCORE_CONFIG = {
+    "enabled": True,
+    "impossible_below": 1e-8,
+    "suspect_floor_below": 5e-6,
+    "broken_above": 0.5,
+    "extreme_speedup_above": 100.0,
+}
+
+BASE_DUPLICATE_CONFIG = {
+    "exact": True,
+    "near_clone": True,
+}
+
+BASE_CLASSIFICATION_CONFIG = {
+    "default_reference_classification": "low_confidence",
+    "default_reference_allowed_medium": ["DUPLICATE_SPAM"],
+    "support_only_code_classification": "low_confidence",
+    "support_code_classification": "suspicious",
+    "telemetry_code_classification": "low_confidence",
+    "metadata_support_classification": "suspicious",
+    "admin_support_classification": "low_confidence",
+    "code_auto_filter_reason": "high_critical",
+    "metadata_auto_filter_reason": "score_anomaly",
+    "admin_reason": "admin_review",
+    "none_reason": "none",
+}
+
+RULE_REGISTRY: dict[str, RulePolicy] = dict(BASE_RULE_REGISTRY)
+SCORE_CONFIG: dict[str, Any] = copy.deepcopy(BASE_SCORE_CONFIG)
+DUPLICATE_CONFIG: dict[str, Any] = copy.deepcopy(BASE_DUPLICATE_CONFIG)
+CLASSIFICATION_CONFIG: dict[str, Any] = copy.deepcopy(BASE_CLASSIFICATION_CONFIG)
+ACTIVE_RUNTIME_CONFIG: dict[str, Any] = {}
+
 
 OUTCOME_ORDER = {
     TELEMETRY_ONLY: 1,
@@ -2624,17 +2738,50 @@ CODE_DETECTORS = [
     detect_precision_downgrade,
 ]
 
+BASE_DETECTOR_SPECS = [
+    ("timer_monkeypatch", detect_timer_monkeypatch),
+    ("print_injection", detect_print_injection),
+    ("evaluator_exploit", detect_evaluator_exploit),
+    ("scaled_mm_ref", detect_scaled_mm_ref),
+    ("decode_mm_ref", detect_decode_mm_ref),
+    ("result_caching", detect_result_caching),
+    ("shape_output_replay", detect_shape_output_replay),
+    ("timed_input_replay", detect_timed_input_replay),
+    ("cuda_graph_replay", detect_cuda_graph_replay),
+    ("silent_fallback", detect_silent_fallback),
+    ("trivial_probe", detect_trivial_probe),
+    ("torch_compile_cache", detect_torch_compile_cache),
+    ("cuda_graph_python", detect_cuda_graph_python),
+    ("hardcoded_shapes", detect_hardcoded_shapes),
+    ("unsync_multistream", detect_unsync_multistream),
+    ("cuda_event_disable_timing", detect_cuda_event_disable_timing),
+    ("trusted_module_import", detect_trusted_module_import),
+    ("module_mutation", detect_module_mutation),
+    ("globals_mutation", detect_globals_mutation),
+    ("introspection_exploit", detect_introspection_exploit),
+    ("code_replacement", detect_code_replacement),
+    ("harness_runtime_patching", detect_harness_runtime_patching),
+    ("config_cache_exploit", detect_config_cache_exploit),
+    ("reference_precompute_replay", detect_reference_precompute_replay),
+    ("pointer_replay", detect_pointer_replay),
+    ("result_bank_replay", detect_result_bank_replay),
+    ("dynamic_execution", detect_dynamic_execution),
+    ("thread_injection", detect_thread_injection),
+    ("lazy_tensor", detect_lazy_tensor),
+    ("precision_downgrade", detect_precision_downgrade),
+]
+
+VALID_RULE_OUTCOMES = {AUTO_FILTER, SUSPICIOUS_ONLY, TELEMETRY_ONLY}
+VALID_RULE_TIERS = {"hard", "support", "telemetry"}
+VALID_NONFILTER_CLASSES = {"valid", "low_confidence", "suspicious"}
+BUILTIN_PROFILES = ("default", "strict", "generic")
+
 
 # ---------------------------------------------------------------------------
 # Classification
 # ---------------------------------------------------------------------------
 
 SEVERITY_ORDER = {"critical": 4, "high": 3, "medium": 2, "low": 1}
-
-
-DEFAULT_REFERENCE_CLASS = "default_reference"
-DEFAULT_REFERENCE_FILTER_REASON = "default_scaled_mm"
-DEFAULT_REFERENCE_ALLOWED_MEDIUM = {"DUPLICATE_SPAM"}
 
 
 def is_default_reference(matched_patterns: list[dict]) -> bool:
@@ -2653,14 +2800,15 @@ def is_default_reference(matched_patterns: list[dict]) -> bool:
     if relevant_patterns != {"SCALED_MM_REF"}:
         return False
     medium_families = {p["pattern"] for p in matched_patterns if p["severity"] == "medium"}
-    disqualifying_medium = medium_families - DEFAULT_REFERENCE_ALLOWED_MEDIUM - {"SCALED_MM_REF"}
+    allowed_medium = set(CLASSIFICATION_CONFIG["default_reference_allowed_medium"])
+    disqualifying_medium = medium_families - allowed_medium - {"SCALED_MM_REF"}
     return not disqualifying_medium
 
 
 def filter_reason(matched_patterns: list[dict]) -> str:
     """Return a short label explaining what drove the filter decision."""
     if not matched_patterns:
-        return "none"
+        return str(CLASSIFICATION_CONFIG["none_reason"])
     code_patterns, metadata_patterns, admin_patterns = split_match_domains(matched_patterns)
 
     code_auto_filter = [
@@ -2670,12 +2818,12 @@ def filter_reason(matched_patterns: list[dict]) -> str:
         p for p in metadata_patterns if get_rule_policy(p["pattern"]).max_outcome == AUTO_FILTER
     ]
     if code_auto_filter:
-        return "high_critical"
+        return str(CLASSIFICATION_CONFIG["code_auto_filter_reason"])
     if metadata_auto_filter:
-        return "score_anomaly"
+        return str(CLASSIFICATION_CONFIG["metadata_auto_filter_reason"])
     if admin_patterns:
-        return "admin_review"
-    return "none"
+        return str(CLASSIFICATION_CONFIG["admin_reason"])
+    return str(CLASSIFICATION_CONFIG["none_reason"])
 
 
 def classify(matched_patterns: list[dict]) -> tuple[str, bool]:
@@ -2694,7 +2842,7 @@ def classify(matched_patterns: list[dict]) -> tuple[str, bool]:
     code_patterns, metadata_patterns, admin_patterns = split_match_domains(matched_patterns)
 
     if is_default_reference(code_patterns):
-        return "low_confidence", False
+        return str(CLASSIFICATION_CONFIG["default_reference_classification"]), False
 
     code_strongest = strongest_rule_outcome(code_patterns) if code_patterns else TELEMETRY_ONLY
     metadata_strongest = strongest_rule_outcome(metadata_patterns) if metadata_patterns else TELEMETRY_ONLY
@@ -2708,15 +2856,403 @@ def classify(matched_patterns: list[dict]) -> tuple[str, bool]:
     if code_patterns:
         if code_strongest == SUSPICIOUS_ONLY:
             if support_only_patterns(code_patterns):
-                return "low_confidence", False
-            return "suspicious", False
-        return "low_confidence", False
+                return str(CLASSIFICATION_CONFIG["support_only_code_classification"]), False
+            return str(CLASSIFICATION_CONFIG["support_code_classification"]), False
+        return str(CLASSIFICATION_CONFIG["telemetry_code_classification"]), False
 
     if metadata_strongest == SUSPICIOUS_ONLY:
-        return "suspicious", False
+        return str(CLASSIFICATION_CONFIG["metadata_support_classification"]), False
     if admin_strongest == SUSPICIOUS_ONLY:
-        return "low_confidence", False
+        return str(CLASSIFICATION_CONFIG["admin_support_classification"]), False
     return "valid", False
+
+
+def build_default_runtime_config() -> dict[str, Any]:
+    """Return the default detector configuration as a plain dict."""
+    return {
+        "version": CONFIG_VERSION,
+        "profile": DEFAULT_PROFILE_NAME,
+        "entrypoints": {
+            "names": list(BASE_ENTRYPOINT_NAMES),
+        },
+        "trusted": {
+            "modules": sorted(BASE_TRUSTED_MODULES),
+            "functions": sorted(BASE_TRUSTED_FUNCTIONS),
+        },
+        "thresholds": {
+            "score": copy.deepcopy(BASE_SCORE_CONFIG),
+        },
+        "duplicates": copy.deepcopy(BASE_DUPLICATE_CONFIG),
+        "classification": copy.deepcopy(BASE_CLASSIFICATION_CONFIG),
+        "detectors": {
+            "enabled": [name for name, _ in BASE_DETECTOR_SPECS],
+            "disabled": [],
+        },
+        "rules": {
+            rule_name: {
+                "technique_family": policy.technique_family,
+                "evidence_tier": policy.evidence_tier,
+                "max_outcome": policy.max_outcome,
+                "requires_companion_patterns": list(policy.requires_companion_patterns),
+                "default_verdict": policy.default_verdict,
+            }
+            for rule_name, policy in BASE_RULE_REGISTRY.items()
+        },
+    }
+
+
+def _builtin_profile_overrides(profile_name: str) -> dict[str, Any]:
+    if profile_name == "default":
+        return {}
+    if profile_name == "strict":
+        return {
+            "classification": {
+                "support_only_code_classification": "suspicious",
+            },
+            "thresholds": {
+                "score": {
+                    "suspect_floor_below": 1e-5,
+                    "extreme_speedup_above": 50.0,
+                },
+            },
+            "rules": {
+                "CUDA_GRAPH_REPLAY": {"max_outcome": SUSPICIOUS_ONLY},
+                "CUDA_GRAPH_PYTHON": {"max_outcome": SUSPICIOUS_ONLY},
+                "UNSYNC_MULTISTREAM": {"max_outcome": SUSPICIOUS_ONLY},
+                "CUDA_EVENT_DISABLE_TIMING": {"max_outcome": SUSPICIOUS_ONLY},
+                "THREAD_INJECTION": {"max_outcome": SUSPICIOUS_ONLY},
+                "LAZY_TENSOR": {"max_outcome": SUSPICIOUS_ONLY},
+                "DYNAMIC_EXECUTION": {"max_outcome": SUSPICIOUS_ONLY},
+                "MODULE_RELOAD": {"max_outcome": SUSPICIOUS_ONLY},
+            },
+        }
+    if profile_name == "generic":
+        return {
+            "entrypoints": {
+                "names": ["custom_kernel", "kernel", "forward", "run"],
+            },
+            "trusted": {
+                "modules": [],
+                "functions": [],
+            },
+            "thresholds": {
+                "score": {
+                    "enabled": False,
+                },
+            },
+            "duplicates": {
+                "exact": False,
+                "near_clone": False,
+            },
+            "detectors": {
+                "disabled": [
+                    "evaluator_exploit",
+                    "trusted_module_import",
+                    "module_mutation",
+                    "globals_mutation",
+                    "introspection_exploit",
+                    "code_replacement",
+                    "harness_runtime_patching",
+                    "reference_precompute_replay",
+                ],
+            },
+        }
+    raise ValueError(
+        f"Unknown profile {profile_name!r}. Available profiles: {', '.join(BUILTIN_PROFILES)}"
+    )
+
+
+def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    merged = copy.deepcopy(base)
+    for key, value in override.items():
+        if (
+            isinstance(value, dict)
+            and isinstance(merged.get(key), dict)
+        ):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = copy.deepcopy(value)
+    return merged
+
+
+def _parse_override_value(raw_value: str) -> Any:
+    try:
+        return tomllib.loads(f"value = {raw_value}")["value"]
+    except tomllib.TOMLDecodeError:
+        return raw_value
+
+
+def _apply_dotted_override(config: dict[str, Any], dotted_key: str, value: Any) -> None:
+    target = config
+    parts = dotted_key.split(".")
+    for part in parts[:-1]:
+        child = target.get(part)
+        if child is None or not isinstance(child, dict):
+            child = {}
+            target[part] = child
+        target = child
+    target[parts[-1]] = value
+
+
+def _parse_override_argument(raw_override: str) -> tuple[str, Any]:
+    if "=" not in raw_override:
+        raise ValueError(f"Override must use key=value syntax, got: {raw_override}")
+    key, raw_value = raw_override.split("=", 1)
+    return key.strip(), _parse_override_value(raw_value.strip())
+
+
+def _validate_runtime_config(config: dict[str, Any]) -> None:
+    if int(config.get("version", CONFIG_VERSION)) != CONFIG_VERSION:
+        raise ValueError(
+            f"Unsupported config version {config.get('version')!r}; expected {CONFIG_VERSION}"
+        )
+
+    entrypoints = config.get("entrypoints", {}).get("names", [])
+    if not entrypoints or not all(isinstance(name, str) and name for name in entrypoints):
+        raise ValueError("entrypoints.names must contain at least one non-empty function name")
+
+    trusted = config.get("trusted", {})
+    for key in ("modules", "functions"):
+        values = trusted.get(key, [])
+        if not isinstance(values, list) or not all(isinstance(item, str) for item in values):
+            raise ValueError(f"trusted.{key} must be a list of strings")
+
+    score_cfg = config.get("thresholds", {}).get("score", {})
+    required_score_keys = {
+        "enabled",
+        "impossible_below",
+        "suspect_floor_below",
+        "broken_above",
+        "extreme_speedup_above",
+    }
+    if set(score_cfg) < required_score_keys:
+        missing = sorted(required_score_keys - set(score_cfg))
+        raise ValueError(f"thresholds.score missing keys: {', '.join(missing)}")
+
+    duplicate_cfg = config.get("duplicates", {})
+    for key in ("exact", "near_clone"):
+        if not isinstance(duplicate_cfg.get(key), bool):
+            raise ValueError(f"duplicates.{key} must be a boolean")
+
+    classification_cfg = config.get("classification", {})
+    list_fields = {"default_reference_allowed_medium"}
+    required_classification_keys = set(BASE_CLASSIFICATION_CONFIG)
+    if set(classification_cfg) < required_classification_keys:
+        missing = sorted(required_classification_keys - set(classification_cfg))
+        raise ValueError(f"classification missing keys: {', '.join(missing)}")
+    for key, value in classification_cfg.items():
+        if key in list_fields:
+            if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+                raise ValueError(f"classification.{key} must be a list of strings")
+            continue
+        if key.endswith("_classification") and value not in VALID_NONFILTER_CLASSES:
+            raise ValueError(
+                f"classification.{key} must be one of {sorted(VALID_NONFILTER_CLASSES)}"
+            )
+        if key.endswith("_reason") and not isinstance(value, str):
+            raise ValueError(f"classification.{key} must be a string")
+
+    detector_cfg = config.get("detectors", {})
+    valid_detector_ids = {name for name, _ in BASE_DETECTOR_SPECS}
+    for key in ("enabled", "disabled"):
+        values = detector_cfg.get(key, [])
+        if not isinstance(values, list) or not all(isinstance(item, str) for item in values):
+            raise ValueError(f"detectors.{key} must be a list of detector ids")
+        unknown = sorted(set(values) - valid_detector_ids)
+        if unknown:
+            raise ValueError(f"Unknown detector ids in detectors.{key}: {', '.join(unknown)}")
+
+    rule_cfg = config.get("rules", {})
+    unknown_rules = sorted(set(rule_cfg) - set(BASE_RULE_REGISTRY))
+    if unknown_rules:
+        raise ValueError(f"Unknown rule overrides: {', '.join(unknown_rules)}")
+    for rule_name, overrides in rule_cfg.items():
+        if not isinstance(overrides, dict):
+            raise ValueError(f"rules.{rule_name} must be a table/object")
+        if "evidence_tier" in overrides and overrides["evidence_tier"] not in VALID_RULE_TIERS:
+            raise ValueError(
+                f"rules.{rule_name}.evidence_tier must be one of {sorted(VALID_RULE_TIERS)}"
+            )
+        if "max_outcome" in overrides and overrides["max_outcome"] not in VALID_RULE_OUTCOMES:
+            raise ValueError(
+                f"rules.{rule_name}.max_outcome must be one of {sorted(VALID_RULE_OUTCOMES)}"
+            )
+        if "requires_companion_patterns" in overrides:
+            values = overrides["requires_companion_patterns"]
+            if not isinstance(values, list) or not all(isinstance(item, str) for item in values):
+                raise ValueError(
+                    f"rules.{rule_name}.requires_companion_patterns must be a list of strings"
+                )
+
+
+def resolve_runtime_config(
+    *,
+    profile: str = DEFAULT_PROFILE_NAME,
+    config_path: Optional[str] = None,
+    overrides: Optional[list[str]] = None,
+    config_data: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """Resolve built-in profile, TOML file, and dotted overrides into one config."""
+    resolved = build_default_runtime_config()
+    resolved = _deep_merge(resolved, _builtin_profile_overrides(profile))
+
+    if config_path:
+        with open(config_path, "rb") as config_file:
+            file_config = tomllib.load(config_file)
+        resolved = _deep_merge(resolved, file_config)
+
+    if config_data:
+        resolved = _deep_merge(resolved, config_data)
+
+    for raw_override in overrides or []:
+        key, value = _parse_override_argument(raw_override)
+        _apply_dotted_override(resolved, key, value)
+
+    resolved["profile"] = str(resolved.get("profile") or profile)
+    resolved.setdefault("version", CONFIG_VERSION)
+    _validate_runtime_config(resolved)
+    return resolved
+
+
+def _resolve_enabled_detector_ids(config: dict[str, Any]) -> set[str]:
+    enabled = set(config["detectors"]["enabled"])
+    disabled = set(config["detectors"].get("disabled", []))
+    effective = enabled - disabled
+    if not effective:
+        raise ValueError("Configuration disables all detectors")
+    return effective
+
+
+def apply_runtime_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Apply a resolved configuration to the module-level runtime state."""
+    global ACTIVE_RUNTIME_CONFIG
+    global ENTRYPOINT_NAMES
+    global TRUSTED_MODULES
+    global TRUSTED_FUNCTIONS
+    global TRUSTED_HARNESS_NAMES
+    global SCORE_CONFIG
+    global DUPLICATE_CONFIG
+    global CLASSIFICATION_CONFIG
+    global RULE_REGISTRY
+    global CODE_DETECTORS
+    global STRUCTURAL_HASH_PRESERVE_NAMES
+
+    _validate_runtime_config(config)
+
+    ENTRYPOINT_NAMES = tuple(config["entrypoints"]["names"])
+    TRUSTED_MODULES = frozenset(config["trusted"]["modules"])
+    TRUSTED_FUNCTIONS = frozenset(config["trusted"]["functions"])
+    TRUSTED_HARNESS_NAMES = frozenset(TRUSTED_FUNCTIONS)
+    SCORE_CONFIG = copy.deepcopy(config["thresholds"]["score"])
+    DUPLICATE_CONFIG = copy.deepcopy(config["duplicates"])
+    CLASSIFICATION_CONFIG = copy.deepcopy(config["classification"])
+
+    RULE_REGISTRY = {}
+    for rule_name, base_policy in BASE_RULE_REGISTRY.items():
+        overrides = config["rules"].get(rule_name, {})
+        RULE_REGISTRY[rule_name] = RulePolicy(
+            rule_name=rule_name,
+            technique_family=str(overrides.get("technique_family", base_policy.technique_family)),
+            evidence_tier=str(overrides.get("evidence_tier", base_policy.evidence_tier)),
+            max_outcome=str(overrides.get("max_outcome", base_policy.max_outcome)),
+            requires_companion_patterns=tuple(
+                overrides.get("requires_companion_patterns", list(base_policy.requires_companion_patterns))
+            ),
+            mapped_positive_fixtures=base_policy.mapped_positive_fixtures,
+            default_verdict=str(overrides.get("default_verdict", base_policy.default_verdict)),
+        )
+
+    enabled_detector_ids = _resolve_enabled_detector_ids(config)
+    CODE_DETECTORS = [
+        detector
+        for detector_name, detector in BASE_DETECTOR_SPECS
+        if detector_name in enabled_detector_ids
+    ]
+
+    STRUCTURAL_HASH_PRESERVE_NAMES = frozenset(
+        _BASE_STRUCTURAL_HASH_PRESERVE_NAMES | set(ENTRYPOINT_NAMES)
+    )
+    ACTIVE_RUNTIME_CONFIG = copy.deepcopy(config)
+    return copy.deepcopy(ACTIVE_RUNTIME_CONFIG)
+
+
+def configure_runtime(
+    *,
+    profile: str = DEFAULT_PROFILE_NAME,
+    config_path: Optional[str] = None,
+    overrides: Optional[list[str]] = None,
+    config_data: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """Resolve and apply runtime configuration for CLI or library usage."""
+    resolved = resolve_runtime_config(
+        profile=profile,
+        config_path=config_path,
+        overrides=overrides,
+        config_data=config_data,
+    )
+    return apply_runtime_config(resolved)
+
+
+def _toml_quote(value: str) -> str:
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _toml_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return repr(value)
+    if isinstance(value, str):
+        return _toml_quote(value)
+    if isinstance(value, list):
+        return "[" + ", ".join(_toml_value(item) for item in value) + "]"
+    raise TypeError(f"Unsupported TOML value type: {type(value).__name__}")
+
+
+def _append_toml_table(lines: list[str], prefix: str, table: dict[str, Any]) -> None:
+    scalar_items = []
+    child_tables = []
+    for key, value in table.items():
+        if isinstance(value, dict):
+            child_tables.append((key, value))
+        else:
+            scalar_items.append((key, value))
+
+    if prefix:
+        lines.append(f"[{prefix}]")
+    for key, value in scalar_items:
+        lines.append(f"{key} = {_toml_value(value)}")
+    if scalar_items or prefix:
+        lines.append("")
+
+    for key, child in child_tables:
+        child_prefix = f"{prefix}.{key}" if prefix else key
+        _append_toml_table(lines, child_prefix, child)
+
+
+def runtime_config_to_toml(config: Optional[dict[str, Any]] = None) -> str:
+    """Serialize a runtime config dict to TOML."""
+    data = copy.deepcopy(config or ACTIVE_RUNTIME_CONFIG or build_default_runtime_config())
+    lines = [
+        "# detect_hacks.py runtime configuration",
+        "# Generated from the current built-in defaults/profile resolution.",
+        "",
+    ]
+    root_scalars = {k: v for k, v in data.items() if not isinstance(v, dict)}
+    root_tables = {k: v for k, v in data.items() if isinstance(v, dict)}
+    for key, value in root_scalars.items():
+        lines.append(f"{key} = {_toml_value(value)}")
+    if root_scalars:
+        lines.append("")
+    for key, value in root_tables.items():
+        _append_toml_table(lines, key, value)
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _worker_pool_init(config: dict[str, Any]) -> None:
+    apply_runtime_config(config)
 
 
 # ---------------------------------------------------------------------------
@@ -2731,7 +3267,7 @@ def normalize_code(code: str) -> str:
 
 
 _IDENT_RE = re.compile(r'\b([a-zA-Z_]\w*)\b')
-_PYTHON_KEYWORDS = frozenset({
+_BASE_STRUCTURAL_HASH_PRESERVE_NAMES = frozenset({
     "False", "None", "True", "and", "as", "assert", "async", "await",
     "break", "class", "continue", "def", "del", "elif", "else", "except",
     "finally", "for", "from", "global", "if", "import", "in", "is",
@@ -2740,8 +3276,11 @@ _PYTHON_KEYWORDS = frozenset({
     # common builtins / torch names to preserve structure
     "torch", "self", "data", "int", "float", "bool", "str", "list",
     "dict", "set", "tuple", "len", "range", "print", "type", "super",
-    "input_t", "output_t", "custom_kernel",
+    "input_t", "output_t",
 })
+STRUCTURAL_HASH_PRESERVE_NAMES = frozenset(_BASE_STRUCTURAL_HASH_PRESERVE_NAMES | set(ENTRYPOINT_NAMES))
+
+apply_runtime_config(build_default_runtime_config())
 
 
 def structural_hash(code: str) -> str:
@@ -2755,7 +3294,7 @@ def structural_hash(code: str) -> str:
     def replace_ident(m: re.Match) -> str:
         nonlocal counter
         name = m.group(1)
-        if name in _PYTHON_KEYWORDS or name.startswith('__'):
+        if name in STRUCTURAL_HASH_PRESERVE_NAMES or name.startswith('__'):
             return name
         if name not in ident_map:
             ident_map[name] = f"v{counter}"
@@ -3289,7 +3828,7 @@ def scan_nvidia_archive(directory: str, output_path: str):
         sh = r["structural_hash"]
         exact_group = hash_groups[ch]
         struct_group = struct_groups[sh]
-        if len(exact_group) > 1:
+        if DUPLICATE_CONFIG.get("exact", True) and len(exact_group) > 1:
             r["matched_patterns"].append({
                 "pattern": "DUPLICATE_SPAM",
                 "severity": "medium",
@@ -3297,7 +3836,7 @@ def scan_nvidia_archive(directory: str, output_path: str):
                 "field": "submission",
             })
             r["duplicate_count"] = len(exact_group)
-        elif len(struct_group) > 1:
+        elif DUPLICATE_CONFIG.get("near_clone", True) and len(struct_group) > 1:
             # Near-clone: same structure, different identifier names
             r["matched_patterns"].append({
                 "pattern": "NEAR_CLONE_SPAM",
@@ -3387,7 +3926,7 @@ def scan_jsonl(jsonl_path: str, results_path: str, cleaned_path: str, summary_pa
     chunksize = max(1, total_lines // (n_workers * 8))
     done = 0
 
-    with mp.Pool(n_workers) as pool:
+    with mp.Pool(n_workers, initializer=_worker_pool_init, initargs=(ACTIVE_RUNTIME_CONFIG,)) as pool:
         for result in pool.imap_unordered(_worker_jsonl, raw_lines, chunksize=chunksize):
             if result is None:
                 continue
@@ -3421,14 +3960,14 @@ def scan_jsonl(jsonl_path: str, results_path: str, cleaned_path: str, summary_pa
         extra_patterns = []
         ch_imp = r["code_hash_improved"]
         ch_base = r["code_hash_baseline"]
-        if len(hash_groups_improved.get(ch_imp, [])) > 1:
+        if DUPLICATE_CONFIG.get("exact", True) and len(hash_groups_improved.get(ch_imp, [])) > 1:
             extra_patterns.append({
                 "pattern": "DUPLICATE_SPAM",
                 "severity": "medium",
                 "evidence": f"improved_code hash {ch_imp} shared by {len(hash_groups_improved[ch_imp])} entries",
                 "field": "improved_code",
             })
-        if len(hash_groups_baseline.get(ch_base, [])) > 1:
+        if DUPLICATE_CONFIG.get("exact", True) and len(hash_groups_baseline.get(ch_base, [])) > 1:
             extra_patterns.append({
                 "pattern": "DUPLICATE_SPAM",
                 "severity": "medium",
@@ -3581,7 +4120,7 @@ def scan_parquet(parquet_path: str, results_path: str, best_path: str, summary_p
 
     # Single imap_unordered over a generator — workers stay saturated, no idle
     # gaps between batches.  chunksize=50 keeps IPC overhead low.
-    with mp.Pool(n_workers) as pool:
+    with mp.Pool(n_workers, initializer=_worker_pool_init, initargs=(ACTIVE_RUNTIME_CONFIG,)) as pool:
         for result in pool.imap_unordered(
             _worker_parquet,
             _iter_parquet_args(pf, cols, batch_size),
@@ -3598,7 +4137,7 @@ def scan_parquet(parquet_path: str, results_path: str, best_path: str, summary_p
     # Attach duplicate spam
     for r in all_results:
         ch = r["code_hash"]
-        if len(hash_groups.get(ch, [])) > 1:
+        if DUPLICATE_CONFIG.get("exact", True) and len(hash_groups.get(ch, [])) > 1:
             r["matched_patterns"].append({
                 "pattern": "DUPLICATE_SPAM",
                 "severity": "medium",
@@ -3696,6 +4235,31 @@ def main():
     parser.add_argument("--jsonl", type=str, help="Path to JSONL dataset")
     parser.add_argument("--parquet", type=str, help="Path to submission parquet file")
     parser.add_argument(
+        "--profile",
+        type=str,
+        default=DEFAULT_PROFILE_NAME,
+        choices=BUILTIN_PROFILES,
+        help="Built-in runtime profile to use before applying --config / --set overrides",
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        help="Path to a TOML runtime config file",
+    )
+    parser.add_argument(
+        "--set",
+        dest="overrides",
+        action="append",
+        default=[],
+        help='Override config values with dotted key=value syntax, e.g. entrypoints.names=["kernel"]',
+    )
+    parser.add_argument(
+        "--export-config",
+        nargs="?",
+        const="-",
+        help="Write the resolved runtime config as TOML and exit. Omit the path or use - for stdout.",
+    )
+    parser.add_argument(
         "--audit-rules",
         action="store_true",
         help="Build the precision-audit fixture manifest and rule audit report",
@@ -3709,6 +4273,25 @@ def main():
         help="Read submission code from stdin, output JSON result to stdout (for sidecar integration)",
     )
     args = parser.parse_args()
+
+    try:
+        resolved_config = configure_runtime(
+            profile=args.profile,
+            config_path=args.config,
+            overrides=args.overrides,
+        )
+    except Exception as exc:
+        parser.exit(2, f"Configuration error: {exc}\n")
+
+    if args.export_config is not None:
+        rendered = runtime_config_to_toml(resolved_config)
+        if args.export_config == "-":
+            sys.stdout.write(rendered)
+        else:
+            with open(args.export_config, "w", encoding="utf-8") as f:
+                f.write(rendered)
+            print(f"Exported runtime config to {args.export_config}")
+        return
 
     if args.api_mode:
         import sys as _sys
