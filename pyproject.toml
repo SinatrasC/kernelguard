@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kernelguard"
+version = "0.1.0"
+description = "Rule-based GPU kernel hack detector."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+  { name = "Sinatras" },
+]
+keywords = [
+  "gpu",
+  "kernel",
+  "security",
+  "benchmark",
+  "detection",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Security",
+  "Topic :: Software Development :: Testing",
+]
+dependencies = []
+
+[project.optional-dependencies]
+parquet = ["pyarrow>=15"]
+
+[project.scripts]
+kernelguard = "detect_hacks:main"
+
+[tool.setuptools]
+py-modules = ["detect_hacks"]
+license-files = ["LICENSE"]

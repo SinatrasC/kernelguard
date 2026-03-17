@@ -3436,9 +3436,9 @@ def _worker_parquet(args: tuple) -> dict:
 # ---------------------------------------------------------------------------
 
 AUDIT_RESULT_FILES = (
-    ("nvidia_archive", "detection_results_nvidia_archive.jsonl"),
-    ("amd", "detection_results_amd_submissions.jsonl"),
-    ("nvidia", "detection_results_nvidia_submissions.jsonl"),
+    ("nvidia_archive", ("detection_results_nvidia_archive.jsonl", "detection_results_allnvidia.jsonl")),
+    ("amd", ("detection_results_amd_submissions.jsonl", "detection_results_amd-latest-submissions-20260330.jsonl")),
+    ("nvidia", ("detection_results_nvidia_submissions.jsonl", "detection_results_nvidia_nvfp4_submissions.jsonl")),
 )
 
 AUDIT_RULE_ORDER = [
@@ -3477,6 +3477,58 @@ def _safe_read_text(path: str) -> str:
         return f.read()
 
 
+def _resolve_existing_dir(preferred: str, fallbacks: tuple[str, ...]) -> str:
+    for candidate in (preferred, *fallbacks):
+        if os.path.isdir(candidate):
+            return candidate
+    return preferred
+
+
+def _resolve_existing_file(preferred: str, fallbacks: tuple[str, ...]) -> str:
+    for candidate in (preferred, *fallbacks):
+        if os.path.exists(candidate):
+            return candidate
+    return preferred
+
+
+def _resolve_existing_file_candidates(candidates: tuple[str, ...]) -> Optional[str]:
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def _fixture_id_aliases(fixture_id: str) -> tuple[str, ...]:
+    aliases = {fixture_id}
+    if ":" not in fixture_id:
+        return tuple(sorted(aliases))
+
+    prefix, suffix = fixture_id.split(":", 1)
+    if prefix == "nvidia_archive":
+        aliases.add(f"allnvidia:{suffix}")
+    elif prefix == "allnvidia":
+        aliases.add(f"nvidia_archive:{suffix}")
+    elif prefix == "nvidia_archive_soft":
+        aliases.add(f"allnvidia_soft:{suffix}")
+    elif prefix == "allnvidia_soft":
+        aliases.add(f"nvidia_archive_soft:{suffix}")
+    elif prefix == "manual_review":
+        aliases.add(f"amd_top10:{suffix}")
+    elif prefix == "amd_top10":
+        aliases.add(f"manual_review:{suffix}")
+    return tuple(sorted(aliases))
+
+
+LEGACY_NVIDIA_ARCHIVE_DIRS = ("AllNvidia",)
+LEGACY_AMD_FIXTURE_DIRS = ("amd_hacked",)
+LEGACY_FILTERED_NVIDIA_ARCHIVE_PATHS = ("filtered_allnvidia.jsonl",)
+LEGACY_MANUAL_JUDGMENTS_PATHS = ("amd_top10_review/manual_judgments.json",)
+LEGACY_EXTRA_MANUAL_REVIEW_PATHS = (
+    "agentic_top5_competitions_eval_20260313/low_confidence_review/manual_judgments.json",
+)
+NVIDIA_HACKING_MANIFEST_FILENAMES = ("nvidia_hacking_manifest.json", "nvidia_hacking_submissions_all.json")
+
+
 def build_classifier_fixture_manifest(
     nvidia_archive_dir: str = "NvidiaArchive",
     amd_dir: str = "amd_fixture_archive",
@@ -3497,6 +3549,29 @@ def build_classifier_fixture_manifest(
       - deduplicated NvidiaArchive sources not in the hard-positive manifest and not
         already present in filtered_nvidia_archive.jsonl
     """
+    nvidia_archive_dir = _resolve_existing_dir(nvidia_archive_dir, LEGACY_NVIDIA_ARCHIVE_DIRS)
+    amd_dir = _resolve_existing_dir(amd_dir, LEGACY_AMD_FIXTURE_DIRS)
+    filtered_nvidia_archive_path = _resolve_existing_file(
+        filtered_nvidia_archive_path, LEGACY_FILTERED_NVIDIA_ARCHIVE_PATHS
+    )
+    manual_judgments_path = _resolve_existing_file(
+        manual_judgments_path, LEGACY_MANUAL_JUDGMENTS_PATHS
+    )
+    resolved_extra_manual_review_paths = []
+    for idx, review_path in enumerate(extra_manual_review_paths):
+        legacy_fallback = (
+            LEGACY_EXTRA_MANUAL_REVIEW_PATHS[idx]
+            if idx < len(LEGACY_EXTRA_MANUAL_REVIEW_PATHS)
+            else ()
+        )
+        if legacy_fallback:
+            resolved_extra_manual_review_paths.append(
+                _resolve_existing_file(review_path, (legacy_fallback,))
+            )
+        else:
+            resolved_extra_manual_review_paths.append(review_path)
+    extra_manual_review_paths = tuple(resolved_extra_manual_review_paths)
+
     manifest = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "hard_positives": [],
@@ -3530,7 +3605,9 @@ def build_classifier_fixture_manifest(
             if row.get("is_exploit"):
                 known_hard_positive_amd_ids.add(sid)
 
-    hacking_manifest_path = os.path.join(nvidia_archive_dir, "nvidia_hacking_manifest.json")
+    hacking_manifest_path = _resolve_existing_file_candidates(
+        tuple(os.path.join(nvidia_archive_dir, name) for name in NVIDIA_HACKING_MANIFEST_FILENAMES)
+    ) or os.path.join(nvidia_archive_dir, NVIDIA_HACKING_MANIFEST_FILENAMES[0])
     hard_positive_ids: set[str] = set()
     if os.path.exists(hacking_manifest_path):
         with open(hacking_manifest_path, encoding="utf-8") as f:
@@ -3617,18 +3694,33 @@ def build_classifier_fixture_manifest(
     return manifest
 
 
+def _manifest_fixture_counts(manifest: dict) -> dict[str, int]:
+    return {
+        "hard_positives": len(manifest.get("hard_positives", [])),
+        "hard_negatives": len(manifest.get("hard_negatives", [])),
+        "soft_review_negatives": len(manifest.get("soft_review_negatives", [])),
+    }
+
+
 def _fixture_pattern_hits(fixtures: list[dict]) -> dict[str, set[str]]:
     hits_by_fixture: dict[str, set[str]] = {}
     for fixture in fixtures:
         code = _safe_read_text(fixture["file"])
         result = analyze_code(code, metadata=None, field="code", compute_structural_hash=False)
-        hits_by_fixture[fixture["fixture_id"]] = {p["pattern"] for p in result["matched_patterns"]}
+        patterns = {p["pattern"] for p in result["matched_patterns"]}
+        for alias in _fixture_id_aliases(fixture["fixture_id"]):
+            hits_by_fixture[alias] = patterns
     return hits_by_fixture
 
 
-def _load_rule_examples_from_results(result_path: str, source_name: str) -> tuple[Counter, dict[str, list[dict]]]:
+def _load_rule_examples_from_results(
+    result_paths: tuple[str, ...], source_name: str
+) -> tuple[Counter, dict[str, list[dict]]]:
     sole_counts: Counter = Counter()
     sole_examples: dict[str, list[dict]] = defaultdict(list)
+    result_path = _resolve_existing_file_candidates(result_paths)
+    if result_path is None:
+        return sole_counts, sole_examples
     if not os.path.exists(result_path):
         return sole_counts, sole_examples
 
@@ -3662,8 +3754,8 @@ def generate_rule_audit_report(manifest: dict) -> dict:
 
     sole_counts_by_source: dict[str, Counter] = {}
     sole_examples_by_source: dict[str, dict[str, list[dict]]] = {}
-    for source_name, result_path in AUDIT_RESULT_FILES:
-        counts, examples = _load_rule_examples_from_results(result_path, source_name)
+    for source_name, result_paths in AUDIT_RESULT_FILES:
+        counts, examples = _load_rule_examples_from_results(result_paths, source_name)
         sole_counts_by_source[source_name] = counts
         sole_examples_by_source[source_name] = examples
 
@@ -4231,7 +4323,13 @@ def scan_parquet(parquet_path: str, results_path: str, best_path: str, summary_p
 
 def main():
     parser = argparse.ArgumentParser(description="Hacky Kernel Fingerprinting Pipeline")
-    parser.add_argument("--nvidia_archive", type=str, help="Path to NvidiaArchive directory")
+    parser.add_argument(
+        "--nvidia_archive",
+        "--allnvidia",
+        dest="nvidia_archive",
+        type=str,
+        help="Path to NvidiaArchive directory (legacy --allnvidia alias supported)",
+    )
     parser.add_argument("--jsonl", type=str, help="Path to JSONL dataset")
     parser.add_argument("--parquet", type=str, help="Path to submission parquet file")
     parser.add_argument(
@@ -4306,8 +4404,17 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     if args.audit_rules:
-        nvidia_archive_dir = args.nvidia_archive or "NvidiaArchive"
+        nvidia_archive_dir = args.nvidia_archive or _resolve_existing_dir(
+            "NvidiaArchive", LEGACY_NVIDIA_ARCHIVE_DIRS
+        )
         manifest = build_classifier_fixture_manifest(nvidia_archive_dir=nvidia_archive_dir)
+        manifest_counts = _manifest_fixture_counts(manifest)
+        if not any(manifest_counts.values()):
+            parser.exit(
+                2,
+                "No audit fixtures discovered. Run from a workspace containing the audit corpora "
+                "or pass explicit archive locations before using --audit-rules.\n",
+            )
         report = generate_rule_audit_report(manifest)
         manifest_path, report_json_path, report_md_path = write_rule_audit_report(
             args.output_dir, manifest, report,
