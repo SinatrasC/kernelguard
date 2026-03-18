@@ -2,7 +2,7 @@
 
 `KernelGuard` is a rule-based kernel hack detector for GPU-kernel competition submissions.
 
-The current repository centers on `detect_hacks.py`, which can:
+The core module is `kernelguard.py`, which can:
 
 - classify a single submission from stdin
 - scan JSONL pair datasets
@@ -12,28 +12,38 @@ The current repository centers on `detect_hacks.py`, which can:
 
 ## Current Layout
 
-- `detect_hacks.py`
+- `kernelguard.py`
   Main detector and audit tool.
 
 ## Install
 
-Basic install:
+From PyPI:
 
 ```bash
-python3 -m pip install -e .
+pip install kernelguard
 ```
 
 With parquet support:
 
 ```bash
-python3 -m pip install -e .[parquet]
+pip install kernelguard[parquet]
 ```
 
-Installed entry point:
+Via uv (no install needed):
 
 ```bash
-kernelguard --help
+uvx kernelguard --help
+uvx --with pyarrow kernelguard --parquet submissions.parquet
 ```
+
+Or install permanently with uv:
+
+```bash
+uv tool install kernelguard
+uv tool install kernelguard[parquet]
+```
+
+Both `kernelguard` and `kguard` are available as entry points after installation.
 
 ## Quick Start
 
@@ -55,15 +65,9 @@ Parquet scan:
 kernelguard --parquet /path/to/submissions.parquet --output-dir out/
 ```
 
-Rule audit:
-
-```bash
-kernelguard --audit-rules --output-dir audit_out/
-```
-
 ## Runtime Config
 
-The standalone repo already includes the later config-support additions from the newer `kguard/detect_hacks.py` line of development.
+The standalone repo already includes the later config-support additions from the newer line of development.
 
 Runtime behavior can be controlled with:
 
@@ -124,7 +128,42 @@ The detector also keeps some legacy compatibility for older internal audit/archi
 
 `--audit-rules` is meant to run in a workspace that contains the audit corpora and prior detector outputs.
 
+This is an internal evaluation mode, not a normal first-run path.
+
 If no audit fixtures are discovered, the command exits with a clear error instead of silently producing an empty audit report.
+
+Minimal audit run:
+
+```bash
+kernelguard --audit-rules --output-dir audit_out/
+```
+
+If you want to drive audit mode from explicit inputs, put them in your config file:
+
+```toml
+[audit]
+archive_dir = "/path/to/archive"
+ground_truth_dir = "/path/to/ground_truth_dir"
+manual_review_files = [
+  "/path/to/manual_review_1.json",
+  "/path/to/manual_review_2.json",
+]
+filtered_results_path = "/path/to/filtered_results.jsonl"
+```
+
+To compare old and new detector outputs explicitly during audit, put them in config too:
+
+```toml
+[audit.result_files]
+old = "/path/to/old_results.jsonl"
+new = "/path/to/new_results.jsonl"
+```
+
+Then run:
+
+```bash
+kernelguard --config kernelguard.toml --audit-rules --output-dir audit_out/
+```
 
 Generated audit artifacts include:
 

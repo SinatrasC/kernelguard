@@ -35,8 +35,9 @@ dependencies = []
 parquet = ["pyarrow>=15"]
 
 [project.scripts]
-kernelguard = "detect_hacks:main"
+kernelguard = "kernelguard:main"
+kguard = "kernelguard:main"
 
 [tool.setuptools]
-py-modules = ["detect_hacks"]
+py-modules = ["kernelguard"]
 license-files = ["LICENSE"]

@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """
-Hacky Kernel Fingerprinting & Detection Pipeline
+KernelGuard — Rule-based GPU kernel hack detector.
 
 Detects cheating/hacking patterns in GPU kernel competition submissions.
-Runs on NvidiaArchive directory files or streams through JSONL dataset.
 
 Usage:
-    python detect_hacks.py --nvidia_archive NvidiaArchive/
-    python detect_hacks.py --jsonl /path/to/pairs.jsonl
-    python detect_hacks.py --nvidia_archive NvidiaArchive/ --jsonl /path/to/pairs.jsonl
+    kernelguard --jsonl /path/to/pairs.jsonl
+    kernelguard --parquet /path/to/submissions.parquet
+    kernelguard --audit-rules
 """
 
 import argparse
@@ -372,6 +371,65 @@ def ensure_submission_facts(code_or_facts: str | SubmissionFacts) -> SubmissionF
     if isinstance(code_or_facts, SubmissionFacts):
         return code_or_facts
     return build_submission_facts(code_or_facts)
+
+
+def _ast_root_name(expr: ast.AST | None) -> Optional[str]:
+    """Return the left-most name that owns an expression, when present."""
+    cur = expr
+    while cur is not None:
+        if isinstance(cur, ast.Name):
+            return cur.id
+        if isinstance(cur, ast.Attribute):
+            cur = cur.value
+            continue
+        if isinstance(cur, ast.Subscript):
+            cur = cur.value
+            continue
+        break
+    return None
+
+
+def _expr_names(expr: ast.AST | None) -> set[str]:
+    if expr is None:
+        return set()
+    return {
+        node.id
+        for node in ast.walk(expr)
+        if isinstance(node, ast.Name)
+    }
+
+
+def _expr_has_data_ptr(expr: ast.AST | None) -> bool:
+    if expr is None:
+        return False
+    return any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "data_ptr"
+        for node in ast.walk(expr)
+    )
+
+
+def _expr_has_tensor_version(expr: ast.AST | None) -> bool:
+    if expr is None:
+        return False
+    return any(
+        isinstance(node, ast.Attribute) and node.attr == "_version"
+        for node in ast.walk(expr)
+    )
+
+
+def _body_has_calls(body: list[ast.stmt]) -> bool:
+    for stmt in body:
+        for nested in ast.walk(stmt):
+            if isinstance(nested, ast.Call):
+                return True
+    return False
+
+
+def _looks_stateful_name(name: str) -> bool:
+    lowered = name.lower()
+    return any(token in lowered for token in ("last", "prev", "cache", "saved", "memo"))
 
 
 # ---------------------------------------------------------------------------
@@ -1759,17 +1817,55 @@ def detect_pointer_replay(code: str | SubmissionFacts) -> list[dict]:
         for child in ast.walk(node):
             if isinstance(child, ast.Assign):
                 if len(child.targets) == 1 and isinstance(child.targets[0], ast.Name):
-                    if _is_data_ptr_call(child.value):
+                    # Catches bare data_ptr() AND tuples/containers that contain data_ptr()
+                    if _expr_has_data_ptr(child.value):
                         pointer_aliases.add(child.targets[0].id)
 
         for child in ast.walk(node):
             if not isinstance(child, ast.If):
                 continue
             compare = child.test
-            if not (isinstance(compare, ast.Compare) and len(compare.ops) == 1 and isinstance(compare.ops[0], ast.Eq)):
+            if not (isinstance(compare, ast.Compare) and len(compare.ops) == 1):
                 continue
+            op = compare.ops[0]
             left = compare.left
             right = compare.comparators[0]
+
+            if isinstance(op, ast.In):
+                # Pattern: if cache_key in cache_dict — dict-based pointer cache
+                if not (isinstance(left, ast.Name) and left.id in pointer_aliases):
+                    continue
+                dict_name = _ast_root_name(right)
+                if dict_name is None:
+                    continue
+                has_return = any(
+                    isinstance(n, ast.Return) and n.value is not None
+                    for n in ast.walk(child)
+                )
+                if not has_return:
+                    continue
+                dict_written = any(
+                    isinstance(n, ast.Assign) and any(
+                        _ast_root_name(t) == dict_name for t in n.targets
+                    )
+                    for n in ast.walk(node)
+                ) or any(
+                    isinstance(n, ast.Assign) and any(
+                        _ast_root_name(t) == dict_name for t in n.targets
+                    )
+                    for n in tree.body
+                    if isinstance(n, ast.Assign)
+                )
+                if dict_written:
+                    return [{
+                        "pattern": "POINTER_REPLAY",
+                        "severity": "critical",
+                        "evidence": f"{entrypoint_name} returns saved output from dict keyed by input data_ptr",
+                    }]
+                continue
+
+            if not isinstance(op, ast.Eq):
+                continue
             pair = None
             if isinstance(left, ast.Name) and left.id in pointer_aliases and isinstance(right, ast.Name):
                 pair = (right.id, left.id)
@@ -1810,6 +1906,264 @@ def detect_pointer_replay(code: str | SubmissionFacts) -> list[dict]:
                 "pattern": "POINTER_REPLAY",
                 "severity": "critical",
                 "evidence": f"{entrypoint_name} returns saved output when input data_ptr matches previous pointer",
+            }]
+
+    return []
+
+
+def detect_last_call_replay(code: str | SubmissionFacts) -> list[dict]:
+    """Pattern: saved-output replay when prior call signature matches current state."""
+    facts = ensure_submission_facts(code)
+    tree = facts.ast_tree
+    if tree is None:
+        return []
+    entrypoint_name = entrypoint_label(facts.entrypoint_name)
+
+    # Collect module-level vars initialized to None — these are common last-call
+    # storage slots that use abbreviated names (e.g. _cd = None; _co = None).
+    none_inited: set[str] = set()
+    for _stmt in tree.body:
+        if isinstance(_stmt, ast.Assign):
+            if isinstance(_stmt.value, ast.Constant) and _stmt.value.value is None:
+                for _t in _stmt.targets:
+                    _n = _ast_root_name(_t)
+                    if _n:
+                        none_inited.add(_n)
+
+    # Collect module-level helper functions that internally use data_ptr or ._version.
+    # This lets the detector see through one layer of indirection (e.g. _tensor_sig,
+    # _make_tensor_sig) without full interprocedural analysis.
+    data_ptr_helpers: set[str] = set()
+    version_helpers: set[str] = set()
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if is_entrypoint_name(fn.name):
+            continue
+        if any(_expr_has_data_ptr(n) for n in ast.walk(fn)):
+            data_ptr_helpers.add(fn.name)
+        if any(_expr_has_tensor_version(n) for n in ast.walk(fn)):
+            version_helpers.add(fn.name)
+
+    def _has_ptr(expr: ast.AST | None) -> bool:
+        if _expr_has_data_ptr(expr):
+            return True
+        return any(
+            isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+            and n.func.id in data_ptr_helpers
+            for n in ast.walk(expr)
+        ) if expr is not None else False
+
+    def _has_ver(expr: ast.AST | None) -> bool:
+        if _expr_has_tensor_version(expr):
+            return True
+        return any(
+            isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+            and n.func.id in version_helpers
+            for n in ast.walk(expr)
+        ) if expr is not None else False
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not is_entrypoint_name(node.name):
+            continue
+
+        signature_features: dict[str, set[str]] = defaultdict(set)
+        saved_state_features: dict[str, set[str]] = defaultdict(set)
+
+        for child in ast.walk(node):
+            if not isinstance(child, ast.Assign):
+                continue
+
+            direct_features = set()
+            if _has_ptr(child.value):
+                direct_features.add("pointer")
+            if _has_ver(child.value):
+                direct_features.add("version")
+
+            for target in child.targets:
+                target_root = _ast_root_name(target)
+                if target_root is None:
+                    continue
+
+                if direct_features:
+                    if isinstance(target, ast.Name) and not _looks_stateful_name(target.id):
+                        signature_features[target.id].update(direct_features)
+                    else:
+                        saved_state_features[target_root].update(direct_features)
+
+                indirect_features = set()
+                if isinstance(child.value, ast.Name):
+                    indirect_features.update(signature_features.get(child.value.id, set()))
+                    indirect_features.update(saved_state_features.get(child.value.id, set()))
+                if indirect_features and target_root != _ast_root_name(child.value):
+                    saved_state_features[target_root].update(indirect_features)
+
+        for child in ast.walk(node):
+            if not isinstance(child, ast.If):
+                continue
+            if _body_has_calls(child.body):
+                continue
+
+            return_roots = {
+                _ast_root_name(stmt.value)
+                for stmt in child.body
+                if isinstance(stmt, ast.Return) and stmt.value is not None
+            } - {None}
+            if len(return_roots) != 1:
+                continue
+            returned_root = next(iter(return_roots))
+
+            guard_features: set[str] = set()
+            for compare in ast.walk(child.test):
+                if not isinstance(compare, ast.Compare):
+                    continue
+                if not any(isinstance(op, (ast.Eq, ast.Is)) for op in compare.ops):
+                    continue
+                rights = compare.comparators
+                if len(rights) != 1:
+                    continue
+
+                left = compare.left
+                right = rights[0]
+
+                left_saved = set().union(*(saved_state_features.get(name, set()) for name in _expr_names(left)))
+                right_saved = set().union(*(saved_state_features.get(name, set()) for name in _expr_names(right)))
+
+                left_current = set().union(*(signature_features.get(name, set()) for name in _expr_names(left)))
+                right_current = set().union(*(signature_features.get(name, set()) for name in _expr_names(right)))
+
+                if _has_ptr(left):
+                    left_current.add("pointer")
+                if _has_ptr(right):
+                    right_current.add("pointer")
+                if _has_ver(left):
+                    left_current.add("version")
+                if _has_ver(right):
+                    right_current.add("version")
+
+                guard_features.update(left_saved & right_current)
+                guard_features.update(right_saved & left_current)
+
+            if not guard_features:
+                continue
+
+            stores_output = False
+            for assign in ast.walk(node):
+                if not isinstance(assign, ast.Assign):
+                    continue
+                for target in assign.targets:
+                    if _ast_root_name(target) != returned_root:
+                        continue
+                    stores_output = True
+                    break
+                if stores_output:
+                    break
+
+            if not stores_output:
+                continue
+
+            evidence_bits = []
+            if "pointer" in guard_features:
+                evidence_bits.append("pointer signature")
+            if "version" in guard_features:
+                evidence_bits.append("tensor version")
+            return [{
+                "pattern": "LAST_CALL_REPLAY",
+                "severity": "critical",
+                "evidence": (
+                    f"{entrypoint_name} returns saved output when prior "
+                    f"{' + '.join(evidence_bits)} matches the current call"
+                ),
+            }]
+
+        # Secondary pass: direct object-identity replay.
+        # Pattern: if <input> is <stateful_var>: return <stateful_var2>
+        # where both stateful vars are stored elsewhere in the function body.
+        # Catches: if data is _LAST_DATA: return _LAST_OUTPUT
+        # Also catches abbreviated names like _cd/_co when initialized to None
+        # at module level (detected via none_inited).
+
+        # Names assigned only inside nested functions are not in the outer
+        # entrypoint's scope, so exclude them from the stateful-stored set.
+        _nested_assigned: set[str] = set()
+        for _fn in ast.walk(node):
+            if _fn is node or not isinstance(_fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for _ch in ast.walk(_fn):
+                if isinstance(_ch, ast.Assign):
+                    for _t in _ch.targets:
+                        _n = _ast_root_name(_t)
+                        if _n:
+                            _nested_assigned.add(_n)
+
+        stateful_stored: set[str] = {
+            _ast_root_name(t)
+            for child in ast.walk(node)
+            if isinstance(child, ast.Assign)
+            for t in child.targets
+            if _looks_stateful_name(_ast_root_name(t) or "")
+        } - _nested_assigned - {None}
+
+        # All names assigned anywhere inside the entrypoint — used to confirm
+        # that a none_inited var is actually used as a storage slot (not just
+        # a sentinel that's never written inside the function).
+        assigned_in_node: set[str] = {
+            _ast_root_name(t)
+            for child in ast.walk(node)
+            if isinstance(child, ast.Assign)
+            for t in child.targets
+        } - {None}
+
+        for child in ast.walk(node):
+            if not isinstance(child, ast.If):
+                continue
+            if _body_has_calls(child.body):
+                continue
+            # Find `is` comparisons in the test (excluding `is None`)
+            is_pairs: list[tuple[str, str]] = []
+            for subnode in ast.walk(child.test):
+                if not isinstance(subnode, ast.Compare):
+                    continue
+                operands = [subnode.left] + list(subnode.comparators)
+                for i, op in enumerate(subnode.ops):
+                    if not isinstance(op, ast.Is):
+                        continue
+                    lname = _ast_root_name(operands[i])
+                    rname = _ast_root_name(operands[i + 1])
+                    if lname and rname:
+                        is_pairs.append((lname, rname))
+
+            if not any(
+                _looks_stateful_name(l) or _looks_stateful_name(r)
+                or l in none_inited or r in none_inited
+                for l, r in is_pairs
+            ):
+                continue
+
+            # Fix: use child.body only — not ast.walk(child) which would
+            # also walk elif/else branches and produce spurious return roots.
+            returned = {
+                _ast_root_name(stmt.value)
+                for stmt in child.body
+                if isinstance(stmt, ast.Return) and stmt.value is not None
+            } - {None}
+
+            if not any(
+                (_looks_stateful_name(r) and r in stateful_stored)
+                or (r in none_inited and r in assigned_in_node)
+                for r in returned
+            ):
+                continue
+
+            return [{
+                "pattern": "LAST_CALL_REPLAY",
+                "severity": "critical",
+                "evidence": (
+                    f"{entrypoint_name} returns saved output on object-identity "
+                    f"match with previous call input"
+                ),
             }]
 
     return []
@@ -1889,32 +2243,11 @@ def detect_config_cache_exploit(code: str | SubmissionFacts) -> list[dict]:
         if not is_entrypoint_name(node.name):
             continue
 
-        def _root_name(expr: ast.AST | None) -> Optional[str]:
-            cur = expr
-            while cur is not None:
-                if isinstance(cur, ast.Name):
-                    return cur.id
-                if isinstance(cur, ast.Attribute):
-                    cur = cur.value
-                    continue
-                if isinstance(cur, ast.Subscript):
-                    cur = cur.value
-                    continue
-                break
-            return None
-
         def _lookup_source(expr: ast.AST | None, sources: dict[str, str]) -> Optional[str]:
-            root = _root_name(expr)
+            root = _ast_root_name(expr)
             if root is None:
                 return None
             return sources.get(root, root)
-
-        def _body_has_calls(body: list[ast.stmt]) -> bool:
-            for stmt in body:
-                for nested in ast.walk(stmt):
-                    if isinstance(nested, ast.Call):
-                        return True
-            return False
 
         cache_reads: dict[str, str] = {}
         for child in ast.walk(node):
@@ -1926,9 +2259,9 @@ def detect_config_cache_exploit(code: str | SubmissionFacts) -> list[dict]:
             if (isinstance(child.value, ast.Call)
                     and isinstance(child.value.func, ast.Attribute)
                     and child.value.func.attr == "get"):
-                source = _root_name(child.value.func.value)
+                source = _ast_root_name(child.value.func.value)
             elif isinstance(child.value, ast.Subscript):
-                source = _root_name(child.value.value)
+                source = _ast_root_name(child.value.value)
             if source:
                 cache_reads[child.targets[0].id] = source
 
@@ -1978,11 +2311,11 @@ def detect_config_cache_exploit(code: str | SubmissionFacts) -> list[dict]:
                         continue
                     source = None
                     if isinstance(stmt.value, ast.Subscript):
-                        source = _root_name(stmt.value.value)
+                        source = _ast_root_name(stmt.value.value)
                     elif (isinstance(stmt.value, ast.Call)
                           and isinstance(stmt.value.func, ast.Attribute)
                           and stmt.value.func.attr == "get"):
-                        source = _root_name(stmt.value.func.value)
+                        source = _ast_root_name(stmt.value.func.value)
                     if source:
                         local_sources[stmt.targets[0].id] = source
                 for stmt in child.body:
@@ -1997,7 +2330,7 @@ def detect_config_cache_exploit(code: str | SubmissionFacts) -> list[dict]:
                     continue
                 for target in child.targets:
                     if isinstance(target, ast.Subscript):
-                        target_root = _root_name(target.value)
+                        target_root = _ast_root_name(target.value)
                         if target_root:
                             store_containers.add(target_root)
 
@@ -2014,10 +2347,43 @@ def detect_config_cache_exploit(code: str | SubmissionFacts) -> list[dict]:
     return matches
 
 
+def _is_obfuscated_exec(node: ast.Call) -> bool:
+    """Return True when an exec/eval call wraps an encoded/compressed payload.
+
+    Detects patterns like:
+      exec(lzma.decompress(base64.b64decode(...)))
+      exec(zlib.decompress(base64.b64decode(...)))
+      eval(base64.b64decode(...))
+    These hide exploit code that static analysis cannot see.
+    """
+    if not node.args:
+        return False
+    arg = node.args[0]
+    # Walk the nested call chain looking for encoding/compression functions
+    obfuscation_names = {
+        "decompress", "b64decode", "b32decode", "b16decode",
+        "urlsafe_b64decode", "decodebytes", "decodestring",
+    }
+    obfuscation_modules = {"base64", "lzma", "zlib", "gzip", "bz2", "codecs"}
+    for inner in ast.walk(arg):
+        if not isinstance(inner, ast.Call):
+            continue
+        if isinstance(inner.func, ast.Attribute):
+            if inner.func.attr in obfuscation_names:
+                return True
+            if isinstance(inner.func.value, ast.Name) and inner.func.value.id in obfuscation_modules:
+                return True
+        elif isinstance(inner.func, ast.Name) and inner.func.id in obfuscation_names:
+            return True
+    return False
+
+
 def detect_dynamic_execution(code: str | SubmissionFacts) -> list[dict]:
     """AST pattern 6: exec/eval/compile and dynamic import.
 
-    These can hide exploit code that static analysis cannot see.
+    Splits into two sub-patterns:
+      OBFUSCATED_EXEC — exec/eval wrapping base64/lzma/zlib payloads (auto_filter)
+      DYNAMIC_EXECUTION — plain exec/eval/compile/__import__ (telemetry)
     """
     facts = ensure_submission_facts(code)
     tree = facts.ast_tree
@@ -2037,7 +2403,24 @@ def detect_dynamic_execution(code: str | SubmissionFacts) -> list[dict]:
         elif isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name):
             func_name = f"{node.func.value.id}.{node.func.attr}"
 
-        if func_name in ("exec", "eval", "compile", "__import__") and func_name not in seen:
+        if func_name in ("exec", "eval") and func_name not in seen:
+            if _is_obfuscated_exec(node):
+                key = f"obfuscated_{func_name}"
+                if key not in seen:
+                    seen.add(key)
+                    matches.append({
+                        "pattern": "OBFUSCATED_EXEC",
+                        "severity": "critical",
+                        "evidence": f"{func_name}() with encoded/compressed payload (hides exploit code)",
+                    })
+            else:
+                seen.add(func_name)
+                matches.append({
+                    "pattern": "DYNAMIC_EXECUTION",
+                    "severity": "high",
+                    "evidence": f"{func_name}() call (could hide exploit code)",
+                })
+        elif func_name in ("compile", "__import__") and func_name not in seen:
             seen.add(func_name)
             matches.append({
                 "pattern": "DYNAMIC_EXECUTION",
@@ -2415,6 +2798,7 @@ AMD_CONFIG_CACHE_FIXTURES = ("amd:520921", "amd:521087", "amd:521134", "amd:5211
 AMD_MANUAL_HARNESS_FIXTURES = ("manual_review:515117",)
 AMD_MANUAL_PRECOMPUTE_FIXTURES = ("manual_review:514553",)
 AMD_MANUAL_POINTER_REPLAY_FIXTURES = ("manual_review:515367",)
+AMD_MANUAL_LAST_CALL_REPLAY_FIXTURES = ()
 AMD_MANUAL_FRAME_MUTATION_FIXTURES = ("manual_review:516235",)
 TOP5_LOWCONF_RESULT_BANK_FIXTURES = ("top5low:506336",)
 AMD_PACKAGE_TIMED_INPUT_REPLAY_FIXTURES = ()
@@ -2461,8 +2845,12 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
         (), "remove",
     ),
     "OUTPUT_REPLAY_CACHE": RulePolicy(
-        "OUTPUT_REPLAY_CACHE", "result_reuse", "support", SUSPICIOUS_ONLY, (),
+        "OUTPUT_REPLAY_CACHE", "result_reuse", "hard", AUTO_FILTER, (),
         AMD_CONFIG_CACHE_FIXTURES, "rewrite",
+    ),
+    "LAST_CALL_REPLAY": RulePolicy(
+        "LAST_CALL_REPLAY", "result_reuse", "hard", AUTO_FILTER, (),
+        AMD_MANUAL_LAST_CALL_REPLAY_FIXTURES, "keep",
     ),
     "SHAPE_OUTPUT_REPLAY": RulePolicy(
         "SHAPE_OUTPUT_REPLAY", "result_reuse", "hard", AUTO_FILTER, (),
@@ -2570,6 +2958,10 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
         "RESULT_BANK_REPLAY", "result_reuse", "hard", AUTO_FILTER, (),
         TOP5_LOWCONF_RESULT_BANK_FIXTURES, "keep",
     ),
+    "OBFUSCATED_EXEC": RulePolicy(
+        "OBFUSCATED_EXEC", "dynamic_execution", "hard", AUTO_FILTER, (),
+        (), "keep",
+    ),
     "DYNAMIC_EXECUTION": RulePolicy(
         "DYNAMIC_EXECUTION", "dynamic_execution", "telemetry", TELEMETRY_ONLY, (),
         (), "split",
@@ -2643,6 +3035,14 @@ BASE_CLASSIFICATION_CONFIG = {
     "none_reason": "none",
 }
 
+BASE_AUDIT_CONFIG = {
+    "archive_dir": "",
+    "ground_truth_dir": "",
+    "manual_review_files": [],
+    "filtered_results_path": "",
+    "result_files": {},
+}
+
 RULE_REGISTRY: dict[str, RulePolicy] = dict(BASE_RULE_REGISTRY)
 SCORE_CONFIG: dict[str, Any] = copy.deepcopy(BASE_SCORE_CONFIG)
 DUPLICATE_CONFIG: dict[str, Any] = copy.deepcopy(BASE_DUPLICATE_CONFIG)
@@ -2711,6 +3111,7 @@ CODE_DETECTORS = [
     detect_scaled_mm_ref,
     detect_decode_mm_ref,
     detect_result_caching,
+    detect_last_call_replay,
     detect_shape_output_replay,
     detect_timed_input_replay,
     detect_cuda_graph_replay,
@@ -2745,6 +3146,7 @@ BASE_DETECTOR_SPECS = [
     ("scaled_mm_ref", detect_scaled_mm_ref),
     ("decode_mm_ref", detect_decode_mm_ref),
     ("result_caching", detect_result_caching),
+    ("last_call_replay", detect_last_call_replay),
     ("shape_output_replay", detect_shape_output_replay),
     ("timed_input_replay", detect_timed_input_replay),
     ("cuda_graph_replay", detect_cuda_graph_replay),
@@ -2884,6 +3286,7 @@ def build_default_runtime_config() -> dict[str, Any]:
         },
         "duplicates": copy.deepcopy(BASE_DUPLICATE_CONFIG),
         "classification": copy.deepcopy(BASE_CLASSIFICATION_CONFIG),
+        "audit": copy.deepcopy(BASE_AUDIT_CONFIG),
         "detectors": {
             "enabled": [name for name, _ in BASE_DETECTOR_SPECS],
             "disabled": [],
@@ -3051,6 +3454,25 @@ def _validate_runtime_config(config: dict[str, Any]) -> None:
             )
         if key.endswith("_reason") and not isinstance(value, str):
             raise ValueError(f"classification.{key} must be a string")
+
+    audit_cfg = config.get("audit", {})
+    required_audit_keys = set(BASE_AUDIT_CONFIG)
+    if set(audit_cfg) < required_audit_keys:
+        missing = sorted(required_audit_keys - set(audit_cfg))
+        raise ValueError(f"audit missing keys: {', '.join(missing)}")
+    for key in ("archive_dir", "ground_truth_dir", "filtered_results_path"):
+        value = audit_cfg.get(key)
+        if not isinstance(value, str):
+            raise ValueError(f"audit.{key} must be a string")
+    manual_review_files = audit_cfg.get("manual_review_files", [])
+    if not isinstance(manual_review_files, list) or not all(isinstance(item, str) for item in manual_review_files):
+        raise ValueError("audit.manual_review_files must be a list of strings")
+    result_files = audit_cfg.get("result_files", {})
+    if not isinstance(result_files, dict):
+        raise ValueError("audit.result_files must be a table/object")
+    for label, path in result_files.items():
+        if not isinstance(label, str) or not isinstance(path, str):
+            raise ValueError("audit.result_files entries must map string labels to string paths")
 
     detector_cfg = config.get("detectors", {})
     valid_detector_ids = {name for name, _ in BASE_DETECTOR_SPECS}
@@ -3236,7 +3658,7 @@ def runtime_config_to_toml(config: Optional[dict[str, Any]] = None) -> str:
     """Serialize a runtime config dict to TOML."""
     data = copy.deepcopy(config or ACTIVE_RUNTIME_CONFIG or build_default_runtime_config())
     lines = [
-        "# detect_hacks.py runtime configuration",
+        "# kernelguard runtime configuration",
         "# Generated from the current built-in defaults/profile resolution.",
         "",
     ]
@@ -3435,7 +3857,7 @@ def _worker_parquet(args: tuple) -> dict:
 # Precision audit
 # ---------------------------------------------------------------------------
 
-AUDIT_RESULT_FILES = (
+DEFAULT_AUDIT_RESULT_FILES = (
     ("nvidia_archive", ("detection_results_nvidia_archive.jsonl", "detection_results_allnvidia.jsonl")),
     ("amd", ("detection_results_amd_submissions.jsonl", "detection_results_amd-latest-submissions-20260330.jsonl")),
     ("nvidia", ("detection_results_nvidia_submissions.jsonl", "detection_results_nvidia_nvfp4_submissions.jsonl")),
@@ -3445,12 +3867,12 @@ AUDIT_RULE_ORDER = [
     "EVALUATOR_EXPLOIT", "HARNESS_RUNTIME_PATCHING", "MODULE_MUTATION", "GLOBALS_MUTATION", "CODE_REPLACEMENT",
     "FRAME_WALK_ACCESS", "FRAME_WALK_MUTATION", "SYS_MODULES_ACCESS", "GLOBALS_ACCESS", "CODE_ACCESS",
     "TRUSTED_MODULE_IMPORT",
-    "OUTPUT_REPLAY_CACHE", "SHAPE_OUTPUT_REPLAY", "TIMED_INPUT_REPLAY", "CONFIG_CACHE_EXPLOIT", "POINTER_REPLAY", "RESULT_BANK_REPLAY", "PREPROCESS_CACHE", "WORKSPACE_CACHE",
+    "OUTPUT_REPLAY_CACHE", "LAST_CALL_REPLAY", "SHAPE_OUTPUT_REPLAY", "TIMED_INPUT_REPLAY", "CONFIG_CACHE_EXPLOIT", "POINTER_REPLAY", "RESULT_BANK_REPLAY", "PREPROCESS_CACHE", "WORKSPACE_CACHE",
     "RUNNER_PLAN_CACHE", "CUDA_GRAPH_PYTHON", "CUDA_GRAPH_REPLAY",
     "TIMER_MONKEYPATCH", "FAKE_BENCHMARK_EMIT", "STDIO_REDIRECT", "UNSYNC_MULTISTREAM", "CUDA_EVENT_DISABLE_TIMING",
     "SCALED_MM_REF", "DECODE_MM_REF", "SILENT_FALLBACK", "REFERENCE_PRECOMPUTE_REPLAY", "TORCH_COMPILE_CACHE",
     "HARDCODED_SHAPES", "TRIVIAL_PROBE",
-    "DYNAMIC_EXECUTION", "MODULE_RELOAD", "THREAD_INJECTION", "LAZY_TENSOR",
+    "OBFUSCATED_EXEC", "DYNAMIC_EXECUTION", "MODULE_RELOAD", "THREAD_INJECTION", "LAZY_TENSOR",
     "PRECISION_DOWNGRADE", "SCORE_IMPOSSIBLE", "SCORE_SUSPECT_FLOOR",
     "SCORE_BROKEN", "SCORE_EXTREME_SPEEDUP", "DUPLICATE_SPAM", "NEAR_CLONE_SPAM",
 ]
@@ -3498,6 +3920,10 @@ def _resolve_existing_file_candidates(candidates: tuple[str, ...]) -> Optional[s
     return None
 
 
+def _existing_file_candidates(candidates: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(candidate for candidate in candidates if os.path.exists(candidate))
+
+
 def _fixture_id_aliases(fixture_id: str) -> tuple[str, ...]:
     aliases = {fixture_id}
     if ":" not in fixture_id:
@@ -3529,14 +3955,24 @@ LEGACY_EXTRA_MANUAL_REVIEW_PATHS = (
 NVIDIA_HACKING_MANIFEST_FILENAMES = ("nvidia_hacking_manifest.json", "nvidia_hacking_submissions_all.json")
 
 
+def _require_existing_dir(path: str, label: str) -> str:
+    if not os.path.isdir(path):
+        raise FileNotFoundError(f"{label} not found: {path}")
+    return path
+
+
+def _require_existing_file(path: str, label: str) -> str:
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"{label} not found: {path}")
+    return path
+
+
 def build_classifier_fixture_manifest(
-    nvidia_archive_dir: str = "NvidiaArchive",
-    amd_dir: str = "amd_fixture_archive",
-    filtered_nvidia_archive_path: str = "filtered_nvidia_archive.jsonl",
-    manual_judgments_path: str = "manual_review_archive/manual_judgments.json",
-    extra_manual_review_paths: tuple[str, ...] = (
-        "top_competitions_review/low_confidence_review/manual_judgments.json",
-    ),
+    nvidia_archive_dir: Optional[str] = None,
+    amd_dir: Optional[str] = None,
+    filtered_nvidia_archive_path: Optional[str] = None,
+    manual_judgments_path: Optional[str] = None,
+    extra_manual_review_paths: Optional[tuple[str, ...]] = None,
 ) -> dict:
     """Build the precision-audit fixture manifest.
 
@@ -3549,28 +3985,55 @@ def build_classifier_fixture_manifest(
       - deduplicated NvidiaArchive sources not in the hard-positive manifest and not
         already present in filtered_nvidia_archive.jsonl
     """
-    nvidia_archive_dir = _resolve_existing_dir(nvidia_archive_dir, LEGACY_NVIDIA_ARCHIVE_DIRS)
-    amd_dir = _resolve_existing_dir(amd_dir, LEGACY_AMD_FIXTURE_DIRS)
-    filtered_nvidia_archive_path = _resolve_existing_file(
-        filtered_nvidia_archive_path, LEGACY_FILTERED_NVIDIA_ARCHIVE_PATHS
-    )
-    manual_judgments_path = _resolve_existing_file(
-        manual_judgments_path, LEGACY_MANUAL_JUDGMENTS_PATHS
-    )
-    resolved_extra_manual_review_paths = []
-    for idx, review_path in enumerate(extra_manual_review_paths):
-        legacy_fallback = (
-            LEGACY_EXTRA_MANUAL_REVIEW_PATHS[idx]
-            if idx < len(LEGACY_EXTRA_MANUAL_REVIEW_PATHS)
-            else ()
+    if nvidia_archive_dir is None:
+        nvidia_archive_dir = _resolve_existing_dir("NvidiaArchive", LEGACY_NVIDIA_ARCHIVE_DIRS)
+    else:
+        nvidia_archive_dir = _require_existing_dir(nvidia_archive_dir, "Audit NVIDIA archive directory")
+
+    if amd_dir is None:
+        amd_dir = _resolve_existing_dir("amd_fixture_archive", LEGACY_AMD_FIXTURE_DIRS)
+    else:
+        amd_dir = _require_existing_dir(amd_dir, "Audit AMD fixture directory")
+
+    if filtered_nvidia_archive_path is None:
+        filtered_nvidia_archive_path = _resolve_existing_file(
+            "filtered_nvidia_archive.jsonl", LEGACY_FILTERED_NVIDIA_ARCHIVE_PATHS
         )
-        if legacy_fallback:
-            resolved_extra_manual_review_paths.append(
-                _resolve_existing_file(review_path, (legacy_fallback,))
+    else:
+        filtered_nvidia_archive_path = _require_existing_file(
+            filtered_nvidia_archive_path, "Filtered NVIDIA archive results"
+        )
+
+    if manual_judgments_path is None:
+        manual_judgments_path = _resolve_existing_file(
+            "manual_review_archive/manual_judgments.json", LEGACY_MANUAL_JUDGMENTS_PATHS
+        )
+    else:
+        manual_judgments_path = _require_existing_file(
+            manual_judgments_path, "Manual judgments file"
+        )
+
+    if extra_manual_review_paths is None:
+        resolved_extra_manual_review_paths = []
+        default_extra_paths = ("top_competitions_review/low_confidence_review/manual_judgments.json",)
+        for idx, review_path in enumerate(default_extra_paths):
+            legacy_fallback = (
+                LEGACY_EXTRA_MANUAL_REVIEW_PATHS[idx]
+                if idx < len(LEGACY_EXTRA_MANUAL_REVIEW_PATHS)
+                else ()
             )
-        else:
-            resolved_extra_manual_review_paths.append(review_path)
-    extra_manual_review_paths = tuple(resolved_extra_manual_review_paths)
+            if legacy_fallback:
+                resolved_extra_manual_review_paths.append(
+                    _resolve_existing_file(review_path, (legacy_fallback,))
+                )
+            else:
+                resolved_extra_manual_review_paths.append(review_path)
+        extra_manual_review_paths = tuple(resolved_extra_manual_review_paths)
+    else:
+        extra_manual_review_paths = tuple(
+            _require_existing_file(path, "Extra manual review file")
+            for path in extra_manual_review_paths
+        )
 
     manifest = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -3718,43 +4181,92 @@ def _load_rule_examples_from_results(
 ) -> tuple[Counter, dict[str, list[dict]]]:
     sole_counts: Counter = Counter()
     sole_examples: dict[str, list[dict]] = defaultdict(list)
-    result_path = _resolve_existing_file_candidates(result_paths)
-    if result_path is None:
+    existing_paths = _existing_file_candidates(result_paths)
+    if not existing_paths:
         return sole_counts, sole_examples
-    if not os.path.exists(result_path):
-        return sole_counts, sole_examples
+    seen_rows: set[tuple[Any, ...]] = set()
 
-    with open(result_path, encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            row = json.loads(line)
-            if not row.get("should_filter"):
-                continue
-            patterns = sorted({p["pattern"] for p in row.get("matched_patterns", [])})
-            if len(patterns) != 1:
-                continue
-            pattern = patterns[0]
-            sole_counts[pattern] += 1
-            if len(sole_examples[pattern]) < 20:
-                sole_examples[pattern].append({
-                    "source": source_name,
-                    "submission_id": row.get("submission_id"),
-                    "id": row.get("id"),
-                    "user": row.get("user"),
-                    "problem_name": row.get("problem_name"),
-                    "filename": row.get("filename"),
-                })
+    for result_path in existing_paths:
+        with open(result_path, encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                row = json.loads(line)
+                if not row.get("should_filter"):
+                    continue
+                patterns = sorted({p["pattern"] for p in row.get("matched_patterns", [])})
+                if len(patterns) != 1:
+                    continue
+                pattern = patterns[0]
+                dedupe_key = (
+                    pattern,
+                    row.get("submission_id"),
+                    row.get("id"),
+                    row.get("user"),
+                    row.get("problem_name"),
+                    row.get("filename"),
+                )
+                if dedupe_key in seen_rows:
+                    continue
+                seen_rows.add(dedupe_key)
+                sole_counts[pattern] += 1
+                if len(sole_examples[pattern]) < 20:
+                    sole_examples[pattern].append({
+                        "source": source_name,
+                        "submission_id": row.get("submission_id"),
+                        "id": row.get("id"),
+                        "user": row.get("user"),
+                        "problem_name": row.get("problem_name"),
+                        "filename": row.get("filename"),
+                    })
     return sole_counts, sole_examples
 
 
-def generate_rule_audit_report(manifest: dict) -> dict:
+def _parse_audit_result_spec(spec: str) -> tuple[str, tuple[str, ...]]:
+    if "=" not in spec:
+        raise ValueError(
+            f"Invalid --audit-result value {spec!r}; expected label=/path/to/results.jsonl"
+        )
+    label, path = spec.split("=", 1)
+    label = label.strip()
+    path = path.strip()
+    if not label or not path:
+        raise ValueError(
+            f"Invalid --audit-result value {spec!r}; expected label=/path/to/results.jsonl"
+        )
+    return label, (path,)
+
+
+def resolve_audit_result_files(specs: list[str]) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    if not specs:
+        return DEFAULT_AUDIT_RESULT_FILES
+    return tuple(_parse_audit_result_spec(spec) for spec in specs)
+
+
+def _audit_result_specs_from_config(config: dict[str, Any]) -> list[str]:
+    audit_cfg = config.get("audit", {})
+    result_files = audit_cfg.get("result_files", {})
+    return [f"{label}={path}" for label, path in result_files.items() if path]
+
+
+def _nonempty_str(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None
+
+
+def generate_rule_audit_report(
+    manifest: dict,
+    audit_result_files: Optional[tuple[tuple[str, tuple[str, ...]], ...]] = None,
+) -> dict:
     """Generate a precision-audit report for every registered rule."""
+    audit_result_files = audit_result_files or DEFAULT_AUDIT_RESULT_FILES
     hard_positive_hits = _fixture_pattern_hits(manifest["hard_positives"])
     hard_negative_hits = _fixture_pattern_hits(manifest["hard_negatives"])
     soft_negative_hits = _fixture_pattern_hits(manifest["soft_review_negatives"])
 
     sole_counts_by_source: dict[str, Counter] = {}
     sole_examples_by_source: dict[str, dict[str, list[dict]]] = {}
-    for source_name, result_paths in AUDIT_RESULT_FILES:
+    for source_name, result_paths in audit_result_files:
         counts, examples = _load_rule_examples_from_results(result_paths, source_name)
         sole_counts_by_source[source_name] = counts
         sole_examples_by_source[source_name] = examples
@@ -3803,11 +4315,11 @@ def generate_rule_audit_report(manifest: dict) -> dict:
             "soft_negative_hit_samples": soft_hits[:20],
             "sole_hit_frequency": {
                 source_name: sole_counts_by_source[source_name].get(rule_name, 0)
-                for source_name, _ in AUDIT_RESULT_FILES
+                for source_name, _ in audit_result_files
             },
             "sole_hit_examples": [
                 example
-                for source_name, _ in AUDIT_RESULT_FILES
+                for source_name, _ in audit_result_files
                 for example in sole_examples_by_source[source_name].get(rule_name, [])
             ][:20],
             "final_verdict": policy.default_verdict,
@@ -4323,13 +4835,6 @@ def scan_parquet(parquet_path: str, results_path: str, best_path: str, summary_p
 
 def main():
     parser = argparse.ArgumentParser(description="Hacky Kernel Fingerprinting Pipeline")
-    parser.add_argument(
-        "--nvidia_archive",
-        "--allnvidia",
-        dest="nvidia_archive",
-        type=str,
-        help="Path to NvidiaArchive directory (legacy --allnvidia alias supported)",
-    )
     parser.add_argument("--jsonl", type=str, help="Path to JSONL dataset")
     parser.add_argument("--parquet", type=str, help="Path to submission parquet file")
     parser.add_argument(
@@ -4361,6 +4866,39 @@ def main():
         "--audit-rules",
         action="store_true",
         help="Build the precision-audit fixture manifest and rule audit report",
+    )
+    parser.add_argument(
+        "--audit-archive-dir",
+        dest="audit_archive_dir",
+        type=str,
+        help="Path to the NVIDIA archive directory for --audit-rules",
+    )
+    parser.add_argument(
+        "--audit-ground-truth-dir",
+        dest="audit_ground_truth_dir",
+        type=str,
+        help="Path to the AMD fixture archive directory for --audit-rules",
+    )
+    parser.add_argument(
+        "--audit-manual-review",
+        dest="audit_manual_review",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="Manual review / judgments file for --audit-rules (repeatable; first is primary)",
+    )
+    parser.add_argument(
+        "--audit-filtered-results",
+        dest="audit_filtered_results",
+        type=str,
+        help="Path to filtered NVIDIA archive results JSONL for --audit-rules",
+    )
+    parser.add_argument(
+        "--audit-result",
+        action="append",
+        default=[],
+        metavar="LABEL=PATH",
+        help="Result JSONL to include in the audit report, e.g. nvidia=/path/results.jsonl (repeatable)",
     )
     parser.add_argument("--output-dir", type=str, default=".", help="Output directory")
     parser.add_argument("--workers", type=int, default=0,
@@ -4398,24 +4936,48 @@ def main():
         print(json.dumps(result))
         return
 
-    if not args.nvidia_archive and not args.jsonl and not args.parquet and not args.audit_rules:
-        parser.error("Must specify at least one of --nvidia_archive, --jsonl, --parquet, --audit-rules")
+    if not args.jsonl and not args.parquet and not args.audit_rules:
+        parser.error("Must specify at least one of --jsonl, --parquet, or --audit-rules")
 
     os.makedirs(args.output_dir, exist_ok=True)
 
     if args.audit_rules:
-        nvidia_archive_dir = args.nvidia_archive or _resolve_existing_dir(
-            "NvidiaArchive", LEGACY_NVIDIA_ARCHIVE_DIRS
-        )
-        manifest = build_classifier_fixture_manifest(nvidia_archive_dir=nvidia_archive_dir)
+        try:
+            audit_cfg = resolved_config.get("audit", {})
+            audit_result_specs = args.audit_result or _audit_result_specs_from_config(resolved_config)
+            audit_result_files = resolve_audit_result_files(audit_result_specs)
+            audit_archive_dir = (
+                _nonempty_str(args.audit_archive_dir)
+                or _nonempty_str(audit_cfg.get("archive_dir"))
+            )
+            audit_ground_truth_dir = (
+                _nonempty_str(args.audit_ground_truth_dir)
+                or _nonempty_str(audit_cfg.get("ground_truth_dir"))
+            )
+            audit_filtered_results = (
+                _nonempty_str(args.audit_filtered_results)
+                or _nonempty_str(audit_cfg.get("filtered_results_path"))
+            )
+            audit_manual_review_paths = tuple(args.audit_manual_review) or tuple(
+                path for path in audit_cfg.get("manual_review_files", []) if path
+            ) or None
+            manifest = build_classifier_fixture_manifest(
+                nvidia_archive_dir=audit_archive_dir,
+                amd_dir=audit_ground_truth_dir,
+                filtered_nvidia_archive_path=audit_filtered_results,
+                manual_judgments_path=(audit_manual_review_paths[0] if audit_manual_review_paths else None),
+                extra_manual_review_paths=(audit_manual_review_paths[1:] if audit_manual_review_paths and len(audit_manual_review_paths) > 1 else None),
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            parser.exit(2, f"{exc}\n")
         manifest_counts = _manifest_fixture_counts(manifest)
         if not any(manifest_counts.values()):
             parser.exit(
                 2,
                 "No audit fixtures discovered. Run from a workspace containing the audit corpora "
-                "or pass explicit archive locations before using --audit-rules.\n",
+                "or pass explicit audit corpus locations before using --audit-rules.\n",
             )
-        report = generate_rule_audit_report(manifest)
+        report = generate_rule_audit_report(manifest, audit_result_files=audit_result_files)
         manifest_path, report_json_path, report_md_path = write_rule_audit_report(
             args.output_dir, manifest, report,
         )
@@ -4423,10 +4985,6 @@ def main():
         print(f"  Manifest: {manifest_path}")
         print(f"  Report:   {report_json_path}")
         print(f"  Summary:  {report_md_path}")
-
-    if args.nvidia_archive:
-        output_path = os.path.join(args.output_dir, "detection_results_nvidia_archive.jsonl")
-        scan_nvidia_archive(args.nvidia_archive, output_path)
 
     if args.jsonl:
         results_path = os.path.join(args.output_dir, "detection_results_jsonl.jsonl")

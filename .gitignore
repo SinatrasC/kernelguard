@@ -1,6 +1,10 @@
 __pycache__/
 *.py[cod]
 *.so
+tests/*
+!tests/*.py
+test_*.py
+
 
 .pytest_cache/
 .mypy_cache/
