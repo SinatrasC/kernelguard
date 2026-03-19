@@ -214,7 +214,7 @@ def strip_python_comments(code: str) -> str:
             for tok in tokenize.generate_tokens(io.StringIO(code).readline)
             if tok.type != tokenize.COMMENT
         ]
-    except tokenize.TokenError:
+    except (tokenize.TokenError, IndentationError, SyntaxError):
         return code
     return tokenize.untokenize(tokens)
 
@@ -419,11 +419,27 @@ def _expr_has_tensor_version(expr: ast.AST | None) -> bool:
     )
 
 
+_TRIVIAL_GPU_OPS = frozenset({
+    "fill_", "zero_", "copy_", "fill", "zero", "record",
+})
+
+
 def _body_has_calls(body: list[ast.stmt]) -> bool:
+    """Return True if the body contains non-trivial function calls.
+
+    Tiny GPU ops like ``_tiny.fill_(0)`` or ``_anchor.copy_(_anchor)`` are
+    common dummy work used to keep CUDA timers non-zero; they don't count
+    as real compute and should not prevent replay detection.
+    """
     for stmt in body:
         for nested in ast.walk(stmt):
-            if isinstance(nested, ast.Call):
-                return True
+            if not isinstance(nested, ast.Call):
+                continue
+            # Allow trivial method calls: obj.fill_(0), obj.copy_(obj), etc.
+            if (isinstance(nested.func, ast.Attribute)
+                    and nested.func.attr in _TRIVIAL_GPU_OPS):
+                continue
+            return True
     return False
 
 
@@ -1564,6 +1580,7 @@ def detect_code_replacement(code: str | SubmissionFacts) -> list[dict]:
 BASE_TRUSTED_HARNESS_NAMES = frozenset({
     "generate_input", "check_implementation", "clear_l2_cache",
     "clear_l2_cache_large", "_clone_data", "ref_kernel",
+    "calculate_stats", "run_single_benchmark", "Stats",
 })
 TRUSTED_HARNESS_NAMES = BASE_TRUSTED_HARNESS_NAMES
 
@@ -1602,6 +1619,14 @@ def detect_harness_runtime_patching(code: str | SubmissionFacts) -> list[dict]:
             if node.value in TRUSTED_HARNESS_NAMES:
                 trusted_targets.add(node.value)
 
+        # hasattr(mod, "calculate_stats") — probing for harness functions
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "hasattr" and len(node.args) >= 2):
+            attr_arg = node.args[1]
+            if isinstance(attr_arg, ast.Constant) and isinstance(attr_arg.value, str):
+                if attr_arg.value in TRUSTED_HARNESS_NAMES:
+                    trusted_targets.add(attr_arg.value)
+
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "setattr":
             if len(node.args) >= 2:
                 name_arg = node.args[1]
@@ -1618,8 +1643,13 @@ def detect_harness_runtime_patching(code: str | SubmissionFacts) -> list[dict]:
                         for sub in ast.walk(target)
                     ):
                         globals_write = True
+                # Direct attribute assignment: mod.calculate_stats = fake_fn
+                if isinstance(target, ast.Attribute):
+                    if target.attr in TRUSTED_HARNESS_NAMES:
+                        setattr_write = True
+                        trusted_targets.add(target.attr)
 
-    if dynamic_discovery and (globals_write or setattr_write) and len(trusted_targets) >= 2:
+    if dynamic_discovery and (globals_write or setattr_write) and len(trusted_targets) >= 1:
         channels = ", ".join(sorted(dynamic_discovery))
         targets = ", ".join(sorted(trusted_targets))
         return [{
@@ -2166,6 +2196,65 @@ def detect_last_call_replay(code: str | SubmissionFacts) -> list[dict]:
                 ),
             }]
 
+        # Tertiary pass: identity+version replay via dict cache.
+        # Pattern: cached = _cache.get(key)
+        #          if cached is not None:
+        #              ref, ver, result = cached   (or ref = cached[0])
+        #              if ref is <input> and <input>._version == ver:
+        #                  return result
+        # This catches dict-based replay where identity and ._version guard
+        # a stored result, but variables are local (not module-level stateful).
+        for child in ast.walk(node):
+            if not isinstance(child, ast.If):
+                continue
+            # Look for both `is` and `._version` / `== ` in the test or
+            # nested if-tests within the body
+            all_tests = [child.test]
+            for inner_stmt in child.body:
+                if isinstance(inner_stmt, ast.If):
+                    all_tests.append(inner_stmt.test)
+
+            has_is = False
+            has_version = False
+            for test_node in all_tests:
+                for cmp in ast.walk(test_node):
+                    if not isinstance(cmp, ast.Compare):
+                        continue
+                    for op in cmp.ops:
+                        if isinstance(op, ast.Is):
+                            has_is = True
+                    if _has_ver(cmp):
+                        has_version = True
+
+            if not (has_is and has_version):
+                continue
+
+            # Check the deepest if-body for a return without real compute
+            target_body = child.body
+            for inner_stmt in child.body:
+                if isinstance(inner_stmt, ast.If):
+                    target_body = inner_stmt.body
+                    break
+
+            if _body_has_calls(target_body):
+                continue
+
+            has_return = any(
+                isinstance(s, ast.Return) and s.value is not None
+                for s in target_body
+            )
+            if not has_return:
+                continue
+
+            return [{
+                "pattern": "LAST_CALL_REPLAY",
+                "severity": "critical",
+                "evidence": (
+                    f"{entrypoint_name} returns cached output guarded by "
+                    f"object identity + tensor version check"
+                ),
+            }]
+
     return []
 
 
@@ -2363,8 +2452,9 @@ def _is_obfuscated_exec(node: ast.Call) -> bool:
     obfuscation_names = {
         "decompress", "b64decode", "b32decode", "b16decode",
         "urlsafe_b64decode", "decodebytes", "decodestring",
+        "unhexlify", "a2b_hex", "a2b_base64",
     }
-    obfuscation_modules = {"base64", "lzma", "zlib", "gzip", "bz2", "codecs"}
+    obfuscation_modules = {"base64", "lzma", "zlib", "gzip", "bz2", "codecs", "binascii"}
     for inner in ast.walk(arg):
         if not isinstance(inner, ast.Call):
             continue
@@ -2374,6 +2464,23 @@ def _is_obfuscated_exec(node: ast.Call) -> bool:
             if isinstance(inner.func.value, ast.Name) and inner.func.value.id in obfuscation_modules:
                 return True
         elif isinstance(inner.func, ast.Name) and inner.func.id in obfuscation_names:
+            return True
+    return False
+
+
+def _scope_has_obfuscation(scope: ast.AST) -> bool:
+    """Return True if the scope contains decode/decompress calls (even not nested in exec)."""
+    obfuscation_names = {
+        "decompress", "b64decode", "b32decode", "b16decode",
+        "urlsafe_b64decode", "decodebytes", "decodestring",
+        "unhexlify", "a2b_hex", "a2b_base64",
+    }
+    for n in ast.walk(scope):
+        if not isinstance(n, ast.Call):
+            continue
+        if isinstance(n.func, ast.Attribute) and n.func.attr in obfuscation_names:
+            return True
+        if isinstance(n.func, ast.Name) and n.func.id in obfuscation_names:
             return True
     return False
 
@@ -2393,6 +2500,21 @@ def detect_dynamic_execution(code: str | SubmissionFacts) -> list[dict]:
     matches = []
     seen: set[str] = set()
 
+    # Pre-scan: check if any function scope contains both exec/eval AND
+    # decode/decompress calls (catches split-variable patterns like:
+    #   b = unhexlify(hex_str); s = decompress(b); exec(compile(s, ...)))
+    obfuscated_scopes: set[int] = set()
+    for scope in ast.walk(tree):
+        if not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Module)):
+            continue
+        has_exec = any(
+            isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+            and n.func.id in ("exec", "eval")
+            for n in ast.walk(scope)
+        )
+        if has_exec and _scope_has_obfuscation(scope):
+            obfuscated_scopes.add(id(scope))
+
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
@@ -2404,7 +2526,21 @@ def detect_dynamic_execution(code: str | SubmissionFacts) -> list[dict]:
             func_name = f"{node.func.value.id}.{node.func.attr}"
 
         if func_name in ("exec", "eval") and func_name not in seen:
-            if _is_obfuscated_exec(node):
+            is_obfuscated = _is_obfuscated_exec(node)
+            # Also check if this exec lives in a scope that has decode/decompress
+            if not is_obfuscated:
+                for scope in ast.walk(tree):
+                    if not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Module)):
+                        continue
+                    if id(scope) in obfuscated_scopes:
+                        # Verify this exec node is inside this scope
+                        for inner in ast.walk(scope):
+                            if inner is node:
+                                is_obfuscated = True
+                                break
+                    if is_obfuscated:
+                        break
+            if is_obfuscated:
                 key = f"obfuscated_{func_name}"
                 if key not in seen:
                     seen.add(key)
@@ -3564,7 +3700,7 @@ def apply_runtime_config(config: dict[str, Any]) -> dict[str, Any]:
     ENTRYPOINT_NAMES = tuple(config["entrypoints"]["names"])
     TRUSTED_MODULES = frozenset(config["trusted"]["modules"])
     TRUSTED_FUNCTIONS = frozenset(config["trusted"]["functions"])
-    TRUSTED_HARNESS_NAMES = frozenset(TRUSTED_FUNCTIONS)
+    TRUSTED_HARNESS_NAMES = frozenset(TRUSTED_FUNCTIONS | BASE_TRUSTED_HARNESS_NAMES)
     SCORE_CONFIG = copy.deepcopy(config["thresholds"]["score"])
     DUPLICATE_CONFIG = copy.deepcopy(config["duplicates"])
     CLASSIFICATION_CONFIG = copy.deepcopy(config["classification"])
