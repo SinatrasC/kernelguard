@@ -8,7 +8,7 @@ version = "0.2.0"
 description = "Rule-based GPU kernel hack detector."
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
+license = "MIT"
 authors = [
   { name = "Sinatras" },
 ]
@@ -22,7 +22,6 @@ keywords = [
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: Developers",
-  "License :: OSI Approved :: MIT License",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
@@ -43,4 +42,3 @@ kguard-mcp = "kernelguard_mcp:main"
 
 [tool.setuptools]
 py-modules = ["kernelguard", "kernelguard_mcp"]
-license-files = ["LICENSE"]
