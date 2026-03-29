@@ -1249,6 +1249,122 @@ def detect_cuda_event_disable_timing(code: str | SubmissionFacts) -> list[dict]:
     return matches
 
 
+# C preprocessor token-paste obfuscation of CUDA API names.
+# Detects patterns like:
+#   #define CAT(a,b) a##b
+#   #define Q NVFP4_CAT2(cudaSt, reamCreateWithFlags)
+# where the author explicitly splits CUDA runtime identifiers to evade
+# string-based detectors.
+RE_TOKEN_PASTE_DEF = re.compile(
+    r'#\s*define\s+\w+\s*\([^)]*\)\s*\w+\s*##\s*\w+'
+)
+RE_SPLIT_CUDA_RUNTIME = re.compile(
+    r'\b\w+\(\s*cuda(?:St|Ev|Me|La|De|Dr|Gr)'
+    r'\s*,\s*(?:ream|ent|mory|unch|vice|iver|aph)'
+    r'(?:_t|CreateWithFlags|WaitEvent|NonBlocking|Record|'
+    r'Synchronize|Destroy|Launch|GetLastError|Alloc|Free)\s*\)',
+    re.IGNORECASE,
+)
+
+
+def detect_token_paste_cuda_api(code: str | SubmissionFacts) -> list[dict]:
+    """Detect C preprocessor token-paste obfuscation of CUDA API names.
+
+    This is explicit filter evasion: the author splits CUDA runtime
+    identifiers (e.g. cudaStreamCreateWithFlags → cudaSt + reamCreateWithFlags)
+    using ## token-pasting to bypass string-based detectors.
+
+    Confirmed 3,700x enrichment on nvfp4_group_gemm (17/26 hacked vs 2/8749 legit).
+    """
+    facts = ensure_submission_facts(code)
+    raw = facts.raw_code
+    if not RE_TOKEN_PASTE_DEF.search(raw):
+        return []
+    if not RE_SPLIT_CUDA_RUNTIME.search(raw):
+        return []
+    return [{
+        "pattern": "TOKEN_PASTE_CUDA_API",
+        "severity": "critical",
+        "evidence": (
+            "C preprocessor ## token-paste reconstructs CUDA runtime API names "
+            "(explicit filter evasion)"
+        ),
+    }]
+
+
+# Sequence-aware batch graph exploit: learns repeated call sequences
+# and builds a batch CUDA graph that launches all calls at once.
+RE_CALL_SEQUENCE = re.compile(r'\b_?call_sequence\b|\b_?known_seq\b|\bbatch_graph\b|\bbatch_handle\b')
+RE_CTYPES_CUDART = re.compile(r'ctypes\.CDLL\s*\(\s*["\'].*libcudart|ctypes\.CDLL\s*\(\s*\w+\.__file__')
+RE_NATIVE_GRAPH_LAUNCH = re.compile(r'\bcudaGraphLaunch\b|\binstant_launch\b|\bm_changed_launch\b')
+
+
+def detect_sequence_batch_graph(code: str | SubmissionFacts) -> list[dict]:
+    """Detect sequence-learning graph replay exploits.
+
+    Pattern: submission learns the benchmark's call sequence, then builds
+    a batch CUDA graph that executes all calls in the sequence at once,
+    returning cached outputs for subsequent calls without per-call launches.
+
+    Also detects native graph launch via ctypes (bypassing Python overhead).
+    """
+    facts = ensure_submission_facts(code)
+    raw = facts.raw_code
+    matches = []
+
+    # Sequence-batch graph
+    if RE_CALL_SEQUENCE.search(raw) and RE_NATIVE_GRAPH_LAUNCH.search(raw):
+        matches.append({
+            "pattern": "SEQUENCE_BATCH_GRAPH",
+            "severity": "high",
+            "evidence": (
+                "Learns benchmark call sequence and builds batch CUDA graph "
+                "(benchmark-order exploitation)"
+            ),
+        })
+
+    # Partial graph key with native launch (weak identity cache)
+    if RE_CTYPES_CUDART.search(raw) and RE_NATIVE_GRAPH_LAUNCH.search(raw):
+        if not matches:  # don't double-fire
+            matches.append({
+                "pattern": "PARTIAL_GRAPH_KEY",
+                "severity": "high",
+                "evidence": (
+                    "Native CUDA graph launch via ctypes with partial-identity "
+                    "cache key (bypasses Python overhead, weak cache identity)"
+                ),
+            })
+
+    return matches
+
+
+# Runtime package installation: pip install inside submission code.
+RE_RUNTIME_PIP_INSTALL = re.compile(
+    r'(?:subprocess|os\.system|Popen)\s*\([^)]*pip\s+install'
+    r'|check_call\s*\([^)]*pip.*install'
+    r'|check_output\s*\([^)]*pip.*install',
+    re.DOTALL,
+)
+
+
+def detect_runtime_package_install(code: str | SubmissionFacts) -> list[dict]:
+    """Detect runtime package installation (sandbox violation).
+
+    Submissions should not install packages during benchmark execution.
+    This is a runner attack surface, not necessarily the exploit mechanism,
+    but it should be blocked.
+    """
+    facts = ensure_submission_facts(code)
+    raw = facts.raw_code
+    if RE_RUNTIME_PIP_INSTALL.search(raw):
+        return [{
+            "pattern": "RUNTIME_PACKAGE_INSTALL",
+            "severity": "critical",
+            "evidence": "Runtime pip install inside submission code (sandbox violation)",
+        }]
+    return []
+
+
 # ---------------------------------------------------------------------------
 # AST-based detectors (Layer 2: structural analysis beyond regex)
 # ---------------------------------------------------------------------------
@@ -2475,11 +2591,15 @@ def _scope_has_obfuscation(scope: ast.AST) -> bool:
         "urlsafe_b64decode", "decodebytes", "decodestring",
         "unhexlify", "a2b_hex", "a2b_base64",
     }
+    obfuscation_modules = {"base64", "lzma", "zlib", "gzip", "bz2", "codecs", "binascii"}
     for n in ast.walk(scope):
         if not isinstance(n, ast.Call):
             continue
-        if isinstance(n.func, ast.Attribute) and n.func.attr in obfuscation_names:
-            return True
+        if isinstance(n.func, ast.Attribute):
+            if n.func.attr in obfuscation_names:
+                return True
+            if isinstance(n.func.value, ast.Name) and n.func.value.id in obfuscation_modules:
+                return True
         if isinstance(n.func, ast.Name) and n.func.id in obfuscation_names:
             return True
     return False
@@ -2824,6 +2944,259 @@ def detect_precision_downgrade(code: str | SubmissionFacts) -> list[dict]:
 # Score anomaly detection
 # ---------------------------------------------------------------------------
 
+def _collect_scores(metadata: Optional[dict]) -> tuple[list[float], Optional[float], Optional[float]]:
+    """Extract all available scores from metadata into a unified list."""
+    if not metadata:
+        return [], None, None
+    all_scores: list[float] = []
+    score = metadata.get("score")
+    if score is not None and isinstance(score, (int, float)):
+        all_scores.append(score)
+    for s in metadata.get("scores", []):
+        if isinstance(s, (int, float)):
+            all_scores.append(s)
+    improved_score = metadata.get("improved_score")
+    baseline_score = metadata.get("baseline_score")
+    if improved_score is not None and isinstance(improved_score, (int, float)):
+        all_scores.append(improved_score)
+    return all_scores, improved_score, baseline_score
+
+
+# ---------------------------------------------------------------------------
+# Roofline physics floor
+# ---------------------------------------------------------------------------
+# The theoretical minimum execution time for a GEMM on a given GPU is bounded
+# by: t_min = max(FLOPs / Peak_FLOPS, Bytes / Peak_BW, kernel_launch_overhead)
+#
+# Any benchmark score (geometric mean of execution times) below this floor is
+# physically impossible regardless of how optimized the kernel is.
+#
+# Score in KernelBot = geometric_mean(benchmark_times_in_seconds).
+
+# GPU specifications — conservative peak values per hardware platform.
+GPU_PROFILES: dict[str, dict[str, Any]] = {
+    "B200": {
+        "name": "B200",
+        "fp4_tflops": 4500,        # FP4 dense tensor core TFLOPS
+        "fp16_tflops": 2250,       # FP16 tensor core TFLOPS
+        "hbm_bw_tb_s": 8.0,        # HBM3e bandwidth in TB/s
+        "launch_overhead_ns": 3000, # ~3µs CUDA launch
+        "scale_block_size": 16,     # NVFP4: 16 elements per scale factor
+    },
+    "MI355X": {
+        "name": "MI355X",
+        "fp4_tflops": 20100,       # MXFP4 dense TFLOPS (CDNA4)
+        "fp16_tflops": 5000,       # FP16 TFLOPS
+        "hbm_bw_tb_s": 8.0,        # HBM3E bandwidth in TB/s
+        "launch_overhead_ns": 4000, # ~4µs HIP launch
+        "scale_block_size": 32,     # OCP MX: 32 elements per E8M0 scale
+    },
+}
+BASE_GPU_SPECS: dict[str, Any] = copy.deepcopy(GPU_PROFILES["B200"])
+
+# Per-problem benchmark specifications.
+# Each entry maps a problem name to a list of benchmark shapes + the GPU profile.
+# Shapes are dicts with keys: m, k, n (optional, default 1), l (optional, default 1),
+# g (optional, for group gemm — value is a list of per-group shapes).
+# multiplier: how many GEMMs per benchmark case (e.g. 2 for dual_gemm).
+BASE_BENCHMARK_SPECS: dict[str, list[dict]] = {
+    # ---- NVIDIA B200 competitions ----
+    "nvfp4_gemv": [
+        {"m": 7168, "k": 16384, "n": 1, "l": 1},
+        {"m": 4096, "k": 7168,  "n": 1, "l": 8},
+        {"m": 7168, "k": 2048,  "n": 1, "l": 4},
+    ],
+    "nvfp4_gemm": [
+        {"m": 128, "k": 16384, "n": 7168, "l": 1},
+        {"m": 128, "k": 7168,  "n": 4096, "l": 1},
+        {"m": 128, "k": 2048,  "n": 7168, "l": 1},
+    ],
+    "nvfp4_dual_gemm": [
+        {"m": 256, "k": 7168, "n": 4096, "l": 1, "multiplier": 2},
+        {"m": 512, "k": 7168, "n": 4096, "l": 1, "multiplier": 2},
+        {"m": 256, "k": 4096, "n": 3072, "l": 1, "multiplier": 2},
+        {"m": 512, "k": 7168, "n": 3072, "l": 1, "multiplier": 2},
+    ],
+    "modal_nvfp4_dual_gemm": [
+        {"m": 256, "k": 7168, "n": 4096, "l": 1, "multiplier": 2},
+        {"m": 512, "k": 7168, "n": 4096, "l": 1, "multiplier": 2},
+        {"m": 256, "k": 4096, "n": 3072, "l": 1, "multiplier": 2},
+        {"m": 512, "k": 7168, "n": 3072, "l": 1, "multiplier": 2},
+    ],
+    "nvfp4_group_gemm": [
+        {"groups": [
+            {"m": 80, "k": 7168, "n": 4096}, {"m": 176, "k": 7168, "n": 4096},
+            {"m": 128, "k": 7168, "n": 4096}, {"m": 72, "k": 7168, "n": 4096},
+            {"m": 64, "k": 7168, "n": 4096}, {"m": 248, "k": 7168, "n": 4096},
+            {"m": 96, "k": 7168, "n": 4096}, {"m": 160, "k": 7168, "n": 4096},
+        ]},
+        {"groups": [
+            {"m": 40, "k": 2048, "n": 7168}, {"m": 76, "k": 2048, "n": 7168},
+            {"m": 168, "k": 2048, "n": 7168}, {"m": 72, "k": 2048, "n": 7168},
+            {"m": 164, "k": 2048, "n": 7168}, {"m": 148, "k": 2048, "n": 7168},
+            {"m": 196, "k": 2048, "n": 7168}, {"m": 160, "k": 2048, "n": 7168},
+        ]},
+        {"groups": [
+            {"m": 192, "k": 4096, "n": 3072}, {"m": 320, "k": 4096, "n": 3072},
+        ]},
+        {"groups": [
+            {"m": 128, "k": 1536, "n": 4096}, {"m": 384, "k": 1536, "n": 4096},
+        ]},
+    ],
+    # ---- AMD MI355X competitions (DeepSeek-R1 dimensions) ----
+    # Shapes from gpu-mode/reference-kernels problems/amd_202602/*/task.yml
+    "amd-mxfp4-mm": [
+        # bf16 A [M,K] x MXFP4 B [N,K] -> MXFP4 GEMM -> bf16 C [M,N]
+        {"m": 4,   "k": 512,  "n": 2880, "gpu": "MI355X"},
+        {"m": 16,  "k": 7168, "n": 2112, "gpu": "MI355X"},
+        {"m": 32,  "k": 512,  "n": 4096, "gpu": "MI355X"},
+        {"m": 32,  "k": 512,  "n": 2880, "gpu": "MI355X"},
+        {"m": 64,  "k": 2048, "n": 7168, "gpu": "MI355X"},
+        {"m": 256, "k": 1536, "n": 3072, "gpu": "MI355X"},
+    ],
+    # MoE: fused gate_up + SwiGLU + down GEMM with MXFP4.
+    # Each benchmark case runs top-9 experts (8 routed + 1 shared).
+    # Floor approximation: 2 GEMMs per expert × top_k active experts.
+    # Stage 1: [bs, d_hidden] × [2*d_expert, d_hidden] (gate+up)
+    # Stage 2: [bs, d_expert] × [d_hidden, d_expert] (down)
+    "amd-moe-mxfp4": [
+        # TP=8: 257 experts, d_expert=256
+        {"m": 16,  "k": 7168, "n": 512,  "gpu": "MI355X", "multiplier": 9},  # bs=16, 9 active
+        {"m": 128, "k": 7168, "n": 512,  "gpu": "MI355X", "multiplier": 9},
+        {"m": 512, "k": 7168, "n": 512,  "gpu": "MI355X", "multiplier": 9},
+        # TP=4: 33 experts, d_expert=512
+        {"m": 16,  "k": 7168, "n": 1024, "gpu": "MI355X", "multiplier": 9},
+        {"m": 128, "k": 7168, "n": 1024, "gpu": "MI355X", "multiplier": 9},
+        {"m": 512, "k": 7168, "n": 1024, "gpu": "MI355X", "multiplier": 9},
+        # EP: 33 experts, d_expert=2048
+        {"m": 512, "k": 7168, "n": 4096, "gpu": "MI355X", "multiplier": 9},
+    ],
+    # MLA decode: attention with compressed KV cache.
+    # Memory-bound: loads KV cache (total_kv × 1 × 576 × element_size).
+    # Compute: 2 × batch × kv_len × qk_head_dim × num_heads (Q×K^T + softmax×V).
+    # Using FP16 compute for attention (not FP4).
+    "amd-mixed-mla": [
+        # attention floor ≈ max(kv_cache_load_time, attention_compute_time)
+        # kv_cache in mxfp4: 0.5 bytes/element, 576 dims → 288 bytes/row
+        {"batch": 4,   "kv_len": 1024, "heads": 16, "head_dim": 576, "v_dim": 512, "gpu": "MI355X"},
+        {"batch": 4,   "kv_len": 8192, "heads": 16, "head_dim": 576, "v_dim": 512, "gpu": "MI355X"},
+        {"batch": 32,  "kv_len": 1024, "heads": 16, "head_dim": 576, "v_dim": 512, "gpu": "MI355X"},
+        {"batch": 32,  "kv_len": 8192, "heads": 16, "head_dim": 576, "v_dim": 512, "gpu": "MI355X"},
+        {"batch": 64,  "kv_len": 1024, "heads": 16, "head_dim": 576, "v_dim": 512, "gpu": "MI355X"},
+        {"batch": 64,  "kv_len": 8192, "heads": 16, "head_dim": 576, "v_dim": 512, "gpu": "MI355X"},
+        {"batch": 256, "kv_len": 1024, "heads": 16, "head_dim": 576, "v_dim": 512, "gpu": "MI355X"},
+        {"batch": 256, "kv_len": 8192, "heads": 16, "head_dim": 576, "v_dim": 512, "gpu": "MI355X"},
+    ],
+}
+
+# Problem → GPU profile mapping (for problems that don't embed "gpu" in shapes)
+PROBLEM_GPU_MAP: dict[str, str] = {
+    "nvfp4_gemv": "B200",
+    "nvfp4_gemm": "B200",
+    "nvfp4_dual_gemm": "B200",
+    "modal_nvfp4_dual_gemm": "B200",
+    "nvfp4_group_gemm": "B200",
+    "amd-mxfp4-mm": "MI355X",
+    "amd-moe-mxfp4": "MI355X",
+    "amd-mixed-mla": "MI355X",
+}
+
+GPU_SPECS: dict[str, Any] = copy.deepcopy(BASE_GPU_SPECS)
+BENCHMARK_SPECS: dict[str, list[dict]] = copy.deepcopy(BASE_BENCHMARK_SPECS)
+
+
+def _gemm_floor_ns(m: int, k: int, n: int, l: int = 1, multiplier: int = 1,
+                    gpu: Optional[dict] = None) -> float:
+    """Roofline lower bound in nanoseconds for a single GEMM(m, k, n) x l batches."""
+    specs = gpu or GPU_SPECS
+    peak_flops = specs["fp4_tflops"] * 1e12
+    peak_bw = specs["hbm_bw_tb_s"] * 1e12
+    launch_ns = float(specs["launch_overhead_ns"])
+    scale_block = specs.get("scale_block_size", 16)
+
+    flops = 2.0 * m * k * n * l * multiplier
+    compute_ns = flops / peak_flops * 1e9
+
+    # FP4 inputs (0.5B), FP16/BF16 output (2B), block scales
+    input_bytes = (m * k + k * n) * l * 0.5
+    output_bytes = m * n * l * 2.0
+    scale_bytes = (m * k // scale_block + k * n // scale_block) * l * 1.0
+    total_bytes = (input_bytes + output_bytes + scale_bytes) * multiplier
+    memory_ns = total_bytes / peak_bw * 1e9
+
+    return max(compute_ns, memory_ns, launch_ns)
+
+
+def _resolve_gpu_specs(problem_name: str, spec: Optional[dict] = None) -> dict:
+    """Resolve GPU specs for a problem, checking spec-level override first."""
+    if spec and "gpu" in spec:
+        profile_name = spec["gpu"]
+        if profile_name in GPU_PROFILES:
+            return GPU_PROFILES[profile_name]
+    profile_name = PROBLEM_GPU_MAP.get(problem_name, "")
+    if profile_name in GPU_PROFILES:
+        return GPU_PROFILES[profile_name]
+    return GPU_SPECS  # fallback to active global specs
+
+
+def compute_physics_floor(problem_name: str) -> Optional[float]:
+    """Compute the roofline physics floor score for a benchmark problem.
+
+    Returns the geometric mean of per-benchmark-case minimum times in seconds,
+    which is the absolute minimum achievable score.  Returns None if the problem
+    has no registered benchmark specs.
+    """
+    specs = BENCHMARK_SPECS.get(problem_name)
+    if not specs:
+        return None
+
+    import math as _math
+    floors_ns: list[float] = []
+    for spec in specs:
+        gpu = _resolve_gpu_specs(problem_name, spec)
+        if "groups" in spec:
+            group_total = sum(
+                _gemm_floor_ns(g["m"], g["k"], g["n"], gpu=gpu)
+                for g in spec["groups"]
+            )
+            floors_ns.append(group_total)
+        elif "batch" in spec and "kv_len" in spec:
+            # MLA attention: memory-bound KV cache load + attention compute
+            batch = spec["batch"]
+            kv_len = spec["kv_len"]
+            heads = spec.get("heads", 16)
+            head_dim = spec.get("head_dim", 576)
+            v_dim = spec.get("v_dim", 512)
+            peak_bw = gpu["hbm_bw_tb_s"] * 1e12
+            peak_flops = gpu["fp16_tflops"] * 1e12  # attention in FP16
+            launch_ns = float(gpu["launch_overhead_ns"])
+            # KV cache load: total_kv × 1 × head_dim × 0.5 bytes (mxfp4)
+            total_kv = batch * kv_len
+            kv_bytes = total_kv * head_dim * 0.5  # mxfp4 compressed
+            # Q load + output write
+            q_bytes = batch * heads * head_dim * 2  # bf16
+            out_bytes = batch * heads * v_dim * 2   # bf16
+            total_bytes = kv_bytes + q_bytes + out_bytes
+            memory_ns = total_bytes / peak_bw * 1e9
+            # Attention FLOPs: batch × heads × (2 × kv_len × head_dim + 2 × kv_len × v_dim)
+            attn_flops = batch * heads * kv_len * (2.0 * head_dim + 2.0 * v_dim)
+            compute_ns = attn_flops / peak_flops * 1e9
+            floors_ns.append(max(compute_ns, memory_ns, launch_ns))
+        else:
+            m = spec.get("m", 1)
+            k = spec.get("k", 1)
+            n = spec.get("n", 1)
+            l = spec.get("l", 1)
+            mult = spec.get("multiplier", 1)
+            floors_ns.append(_gemm_floor_ns(m, k, n, l, mult, gpu=gpu))
+
+    if not floors_ns:
+        return None
+
+    log_sum = sum(_math.log(f * 1e-9) for f in floors_ns)
+    return _math.exp(log_sum / len(floors_ns))
+
+
 def detect_score_anomaly(metadata: Optional[dict]) -> list[dict]:
     """Score-based anomaly detection.
 
@@ -2831,31 +3204,41 @@ def detect_score_anomaly(metadata: Optional[dict]) -> list[dict]:
     - parquet: metadata has "score" (float)
     - nvidia_archive: metadata has "scores" (list of floats)
     - jsonl: metadata has "improved_score" / "baseline_score"
+
+    Includes roofline physics floor check when problem_name and benchmark
+    specs are available.
     """
     if not metadata or not SCORE_CONFIG.get("enabled", True):
         return []
     matches = []
 
-    # Normalize: collect all available scores into a unified list
-    all_scores: list[float] = []
+    all_scores, improved_score, baseline_score = _collect_scores(metadata)
 
-    # Parquet mode: singular "score"
-    score = metadata.get("score")
-    if score is not None and isinstance(score, (int, float)):
-        all_scores.append(score)
+    # --- Physics floor check (roofline model) ---
+    # This uses per-problem benchmark shapes + GPU specs to compute the
+    # absolute minimum achievable score.  Anything below is mathematically
+    # impossible regardless of kernel quality.
+    problem_name = metadata.get("problem_name") or metadata.get("problem")
+    if problem_name and all_scores:
+        physics_floor = compute_physics_floor(problem_name)
+        if physics_floor is not None:
+            for s in all_scores:
+                if not isinstance(s, (int, float)) or s <= 0:
+                    continue
+                if s < physics_floor:
+                    matches.append({
+                        "pattern": "SCORE_PHYSICS_FLOOR",
+                        "severity": "critical",
+                        "evidence": (
+                            f"Score {s:.2e}s is below the roofline physics floor "
+                            f"({physics_floor:.2e}s) for {problem_name} — "
+                            f"mathematically impossible on {GPU_SPECS.get('name', 'target GPU')}"
+                        ),
+                        "field": "metadata",
+                    })
+                    break
 
-    # NvidiaArchive mode: "scores" list
-    for s in metadata.get("scores", []):
-        if isinstance(s, (int, float)):
-            all_scores.append(s)
-
-    # JSONL mode
-    improved_score = metadata.get("improved_score")
-    baseline_score = metadata.get("baseline_score")
-    if improved_score is not None and isinstance(improved_score, (int, float)):
-        all_scores.append(improved_score)
-
-    # Check score anomalies
+    # --- Fixed threshold checks ---
     impossible_below = float(SCORE_CONFIG["impossible_below"])
     suspect_floor_below = float(SCORE_CONFIG["suspect_floor_below"])
     broken_above = float(SCORE_CONFIG["broken_above"])
@@ -3118,12 +3501,32 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
         "PRECISION_DOWNGRADE", "approximation", "telemetry", TELEMETRY_ONLY, (),
         (), "downgrade",
     ),
+    "TOKEN_PASTE_CUDA_API": RulePolicy(
+        "TOKEN_PASTE_CUDA_API", "filter_evasion", "hard", AUTO_FILTER, (),
+        (), "keep",
+    ),
+    "SEQUENCE_BATCH_GRAPH": RulePolicy(
+        "SEQUENCE_BATCH_GRAPH", "result_reuse", "hard", AUTO_FILTER, (),
+        (), "keep",
+    ),
+    "PARTIAL_GRAPH_KEY": RulePolicy(
+        "PARTIAL_GRAPH_KEY", "result_reuse", "support", SUSPICIOUS_ONLY, (),
+        (), "keep",
+    ),
+    "RUNTIME_PACKAGE_INSTALL": RulePolicy(
+        "RUNTIME_PACKAGE_INSTALL", "sandbox_violation", "hard", AUTO_FILTER, (),
+        (), "keep",
+    ),
+    "SCORE_PHYSICS_FLOOR": RulePolicy(
+        "SCORE_PHYSICS_FLOOR", "score_anomaly", "hard", AUTO_FILTER, (),
+        (), "keep",
+    ),
     "SCORE_IMPOSSIBLE": RulePolicy(
         "SCORE_IMPOSSIBLE", "score_anomaly", "hard", AUTO_FILTER, (),
         (), "keep",
     ),
     "SCORE_SUSPECT_FLOOR": RulePolicy(
-        "SCORE_SUSPECT_FLOOR", "score_anomaly", "support", SUSPICIOUS_ONLY, (),
+        "SCORE_SUSPECT_FLOOR", "score_anomaly", "hard", AUTO_FILTER, (),
         (), "keep",
     ),
     "SCORE_BROKEN": RulePolicy(
@@ -3146,10 +3549,13 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
 
 BASE_SCORE_CONFIG = {
     "enabled": True,
-    "impossible_below": 1e-8,
-    "suspect_floor_below": 5e-6,
+    "impossible_below": 1e-8,       # Global absolute floor (~10ns, below any real GPU op)
+    "suspect_floor_below": 5e-6,    # Near HIP/CUDA event timing floor (~4-5µs)
     "broken_above": 0.5,
     "extreme_speedup_above": 100.0,
+    # Per-problem detection uses SCORE_PHYSICS_FLOOR (roofline model) instead
+    # of these global thresholds.  These are last-resort fallbacks for problems
+    # without registered benchmark specs.
 }
 
 BASE_DUPLICATE_CONFIG = {
@@ -3258,6 +3664,9 @@ CODE_DETECTORS = [
     detect_hardcoded_shapes,
     detect_unsync_multistream,
     detect_cuda_event_disable_timing,
+    detect_token_paste_cuda_api,
+    detect_sequence_batch_graph,
+    detect_runtime_package_install,
     # AST-based detectors (Layer 2)
     detect_trusted_module_import,
     detect_module_mutation,
@@ -3293,6 +3702,9 @@ BASE_DETECTOR_SPECS = [
     ("hardcoded_shapes", detect_hardcoded_shapes),
     ("unsync_multistream", detect_unsync_multistream),
     ("cuda_event_disable_timing", detect_cuda_event_disable_timing),
+    ("token_paste_cuda_api", detect_token_paste_cuda_api),
+    ("sequence_batch_graph", detect_sequence_batch_graph),
+    ("runtime_package_install", detect_runtime_package_install),
     ("trusted_module_import", detect_trusted_module_import),
     ("module_mutation", detect_module_mutation),
     ("globals_mutation", detect_globals_mutation),
@@ -3379,16 +3791,19 @@ def classify(matched_patterns: list[dict]) -> tuple[str, bool]:
 
     code_patterns, metadata_patterns, admin_patterns = split_match_domains(matched_patterns)
 
-    if is_default_reference(code_patterns):
-        return str(CLASSIFICATION_CONFIG["default_reference_classification"]), False
-
     code_strongest = strongest_rule_outcome(code_patterns) if code_patterns else TELEMETRY_ONLY
     metadata_strongest = strongest_rule_outcome(metadata_patterns) if metadata_patterns else TELEMETRY_ONLY
     admin_strongest = strongest_rule_outcome(admin_patterns) if admin_patterns else TELEMETRY_ONLY
 
-    if code_strongest == AUTO_FILTER:
-        return "hacked", True
+    # Score/metadata auto-filter always takes priority — even default reference
+    # implementations should be filtered if their score is physically impossible.
     if metadata_strongest == AUTO_FILTER:
+        return "hacked", True
+
+    if is_default_reference(code_patterns):
+        return str(CLASSIFICATION_CONFIG["default_reference_classification"]), False
+
+    if code_strongest == AUTO_FILTER:
         return "hacked", True
 
     if code_patterns:
@@ -3450,7 +3865,7 @@ def _builtin_profile_overrides(profile_name: str) -> dict[str, Any]:
             },
             "thresholds": {
                 "score": {
-                    "suspect_floor_below": 1e-5,
+                    "suspect_floor_below": 1e-3,
                     "extreme_speedup_above": 50.0,
                 },
             },
@@ -3873,6 +4288,33 @@ def code_hash(code: str) -> str:
 # Analyze a single code sample
 # ---------------------------------------------------------------------------
 
+_RE_POPCORN_LEADERBOARD = re.compile(
+    r'^#!POPCORN\s+leaderboard\s+(\S+)', re.MULTILINE,
+)
+_RE_PEP723_LEADERBOARD = re.compile(
+    r'#\s*///\s*script\b.*?#\s*leaderboard\s*=\s*["\']([^"\']+)["\']',
+    re.DOTALL,
+)
+
+
+def extract_problem_name(code: str) -> Optional[str]:
+    """Extract competition/leaderboard name from submission code headers.
+
+    Supports two formats:
+      #!POPCORN leaderboard nvfp4_dual_gemm     (older NVIDIA subs)
+      # /// script                               (PEP 723 inline metadata)
+      # leaderboard = "amd-mixed-mla"
+      # ///
+    """
+    m = _RE_POPCORN_LEADERBOARD.search(code[:500])
+    if m:
+        return m.group(1).strip()
+    m = _RE_PEP723_LEADERBOARD.search(code[:500])
+    if m:
+        return m.group(1).strip()
+    return None
+
+
 def analyze_code(code: str, metadata: Optional[dict] = None, field: str = "code",
                  compute_structural_hash: bool = True) -> dict:
     """Run all detectors on a code sample, return result dict.
@@ -3887,6 +4329,14 @@ def analyze_code(code: str, metadata: Optional[dict] = None, field: str = "code"
         for h in hits:
             h["field"] = field
         all_matches.extend(hits)
+
+    # Auto-detect problem_name from code if not in metadata
+    if metadata is None:
+        metadata = {}
+    if not metadata.get("problem_name") and not metadata.get("problem"):
+        extracted = extract_problem_name(code)
+        if extracted:
+            metadata = {**metadata, "problem_name": extracted}
 
     # Score anomaly (uses metadata, not code)
     score_hits = detect_score_anomaly(metadata)
@@ -3906,6 +4356,38 @@ def analyze_code(code: str, metadata: Optional[dict] = None, field: str = "code"
         "code_hash": code_hash(code),
         "structural_hash": sh,
     }
+
+
+def _extract_nvidia_archive_scores(runs_payload: Any) -> list[float]:
+    """Extract leaderboard / run scores from legacy and current archive layouts."""
+    scores: list[float] = []
+
+    def add_score(value: Any) -> None:
+        if isinstance(value, (int, float)) and value > 0:
+            scores.append(float(value))
+
+    def visit_row(row: Any) -> None:
+        if not isinstance(row, dict):
+            return
+        add_score(row.get("score"))
+        leaderboard = row.get("leaderboard")
+        if isinstance(leaderboard, dict):
+            add_score(leaderboard.get("score"))
+        result = row.get("result")
+        if isinstance(result, dict):
+            add_score(result.get("score"))
+
+    if isinstance(runs_payload, list):
+        for row in runs_payload:
+            visit_row(row)
+    elif isinstance(runs_payload, dict):
+        visit_row(runs_payload)
+        nested_runs = runs_payload.get("runs")
+        if isinstance(nested_runs, list):
+            for row in nested_runs:
+                visit_row(row)
+
+    return list(dict.fromkeys(scores))
 
 
 # ---------------------------------------------------------------------------
@@ -4009,7 +4491,8 @@ AUDIT_RULE_ORDER = [
     "SCALED_MM_REF", "DECODE_MM_REF", "SILENT_FALLBACK", "REFERENCE_PRECOMPUTE_REPLAY", "TORCH_COMPILE_CACHE",
     "HARDCODED_SHAPES", "TRIVIAL_PROBE",
     "OBFUSCATED_EXEC", "DYNAMIC_EXECUTION", "MODULE_RELOAD", "THREAD_INJECTION", "LAZY_TENSOR",
-    "PRECISION_DOWNGRADE", "SCORE_IMPOSSIBLE", "SCORE_SUSPECT_FLOOR",
+    "TOKEN_PASTE_CUDA_API", "SEQUENCE_BATCH_GRAPH", "PARTIAL_GRAPH_KEY", "RUNTIME_PACKAGE_INSTALL",
+    "PRECISION_DOWNGRADE", "SCORE_PHYSICS_FLOOR", "SCORE_IMPOSSIBLE", "SCORE_SUSPECT_FLOOR",
     "SCORE_BROKEN", "SCORE_EXTREME_SPEEDUP", "DUPLICATE_SPAM", "NEAR_CLONE_SPAM",
 ]
 
@@ -4542,11 +5025,9 @@ def scan_nvidia_archive(directory: str, output_path: str):
             try:
                 with open(runs_path) as f:
                     runs = json.load(f)
-                # Extract scores from runs
-                if isinstance(runs, dict) and "leaderboard" in runs:
-                    lb = runs["leaderboard"]
-                    if isinstance(lb, dict) and "score" in lb:
-                        metadata["scores"] = [lb["score"]]
+                scores = _extract_nvidia_archive_scores(runs)
+                if scores:
+                    metadata["scores"] = scores
             except Exception:
                 pass
 
