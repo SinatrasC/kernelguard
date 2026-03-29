@@ -3865,7 +3865,7 @@ def _builtin_profile_overrides(profile_name: str) -> dict[str, Any]:
             },
             "thresholds": {
                 "score": {
-                    "suspect_floor_below": 1e-3,
+                    "suspect_floor_below": 2e-5,
                     "extreme_speedup_above": 50.0,
                 },
             },
@@ -4315,6 +4315,106 @@ def extract_problem_name(code: str) -> Optional[str]:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Default / reference submission detection (for dataset cleaning, not hack detection)
+# ---------------------------------------------------------------------------
+
+def _normalize_func(func_src: str) -> str:
+    """Strip comments, docstrings, blank lines from a function body."""
+    lines = []
+    in_doc = False
+    for line in func_src.splitlines():
+        s = line.strip()
+        if '"""' in s or "'''" in s:
+            if s.count('"""') + s.count("'''") == 1:
+                in_doc = not in_doc
+            continue
+        if in_doc or not s or s.startswith('#'):
+            continue
+        lines.append(s)
+    return "\n".join(lines)
+
+
+def _extract_func_body(code: str, name: str) -> str:
+    """Extract a function body source using AST."""
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return ""
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return ast.get_source_segment(code, node) or ""
+    return ""
+
+
+def _hash_func(func_src: str) -> str:
+    """Hash a normalized function body."""
+    import hashlib
+    return hashlib.sha256(_normalize_func(func_src).encode()).hexdigest()[:16]
+
+
+# Reference kernel hashes — generated from gpu-mode/reference-kernels repo.
+# Key: ref_kernel body hash. Value: list of problem directory names.
+# To regenerate: hash ref_kernel from each problems/*/reference.py
+_REFERENCE_HASHES: dict[str, list[str]] = {}
+
+
+def _load_reference_hashes() -> None:
+    """Load reference hashes from the bundled reference-kernels directory."""
+    global _REFERENCE_HASHES
+    if _REFERENCE_HASHES:
+        return
+    import hashlib as _hl
+    ref_base = os.path.join(os.path.dirname(__file__), "reference-kernels", "problems")
+    if not os.path.isdir(ref_base):
+        return
+    for root, _dirs, files in os.walk(ref_base):
+        if "reference.py" not in files:
+            continue
+        ref_code = open(os.path.join(root, "reference.py")).read()
+        body = _extract_func_body(ref_code, "ref_kernel")
+        if not body:
+            continue
+        h = _hl.sha256(_normalize_func(body).encode()).hexdigest()[:16]
+        rel = os.path.relpath(root, ref_base)
+        _REFERENCE_HASHES.setdefault(h, []).append(rel)
+
+
+def is_default_submission(code: str) -> dict:
+    """Check if a submission is a default/reference copy.
+
+    Returns dict with:
+        is_default: bool
+        reason: str  ("ref_passthrough", "ref_clone", or None)
+        detail: str  (human-readable explanation)
+
+    This is for dataset cleaning — not used in hack detection or filtering.
+    """
+    _load_reference_hashes()
+
+    # 1. Literal passthrough: from reference import ref_kernel; return ref_kernel(data)
+    if re.search(r'from\s+reference\s+import\s+ref_kernel', code):
+        body = _extract_func_body(code, "custom_kernel")
+        norm = _normalize_func(body)
+        # Check the function does nothing but call ref_kernel
+        active = [l for l in norm.splitlines()
+                  if l and not l.startswith("def ") and not l.startswith("from ") and not l.startswith("import ")]
+        if len(active) <= 2:
+            return {"is_default": True, "reason": "ref_passthrough",
+                    "detail": "Directly calls ref_kernel with no custom logic"}
+
+    # 2. Code clone: custom_kernel body hashes to same as a known ref_kernel
+    body = _extract_func_body(code, "custom_kernel")
+    if body:
+        h = _hash_func(body)
+        if h in _REFERENCE_HASHES:
+            problems = _REFERENCE_HASHES[h]
+            return {"is_default": True, "reason": "ref_clone",
+                    "detail": f"custom_kernel body matches ref_kernel from {problems}"}
+
+    return {"is_default": False, "reason": None, "detail": None}
+
+
 def analyze_code(code: str, metadata: Optional[dict] = None, field: str = "code",
                  compute_structural_hash: bool = True) -> dict:
     """Run all detectors on a code sample, return result dict.
@@ -4348,6 +4448,7 @@ def analyze_code(code: str, metadata: Optional[dict] = None, field: str = "code"
 
     reason = filter_reason(all_matches) if should_filter else None
     sh = structural_hash(code) if compute_structural_hash else ""
+    default_info = is_default_submission(code)
     return {
         "matched_patterns": all_matches,
         "classification": classification,
@@ -4355,6 +4456,8 @@ def analyze_code(code: str, metadata: Optional[dict] = None, field: str = "code"
         "filter_reason": reason,
         "code_hash": code_hash(code),
         "structural_hash": sh,
+        "is_default": default_info["is_default"],
+        "default_reason": default_info["reason"],
     }
 
 
@@ -5488,13 +5591,13 @@ def main():
         "--audit-archive-dir",
         dest="audit_archive_dir",
         type=str,
-        help="Path to the NVIDIA archive directory for --audit-rules",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--audit-ground-truth-dir",
         dest="audit_ground_truth_dir",
         type=str,
-        help="Path to the AMD fixture archive directory for --audit-rules",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--audit-manual-review",
@@ -5502,20 +5605,20 @@ def main():
         action="append",
         default=[],
         metavar="PATH",
-        help="Manual review / judgments file for --audit-rules (repeatable; first is primary)",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--audit-filtered-results",
         dest="audit_filtered_results",
         type=str,
-        help="Path to filtered NVIDIA archive results JSONL for --audit-rules",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--audit-result",
         action="append",
         default=[],
         metavar="LABEL=PATH",
-        help="Result JSONL to include in the audit report, e.g. nvidia=/path/results.jsonl (repeatable)",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument("--output-dir", type=str, default=".", help="Output directory")
     parser.add_argument("--workers", type=int, default=0,
