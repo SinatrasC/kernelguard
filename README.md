@@ -17,33 +17,38 @@ The core module is `kernelguard.py`, which can:
 
 ## Install
 
-From PyPI:
-
 ```bash
 pip install kernelguard
 ```
 
-With parquet support:
+With extras:
 
 ```bash
-pip install kernelguard[parquet]
+pip install "kernelguard[parquet]"
+pip install "kernelguard[mcp]"
 ```
 
-Via uv (no install needed):
+### uv
+
+One-shot (no install):
 
 ```bash
 uvx kernelguard --help
-uvx --with pyarrow kernelguard --parquet submissions.parquet
+uvx kernelguard --api-mode < submission.py
+uvx --from "kernelguard[parquet]" kernelguard --parquet submissions.parquet
+uvx --from "kernelguard[mcp]" kernelguard-mcp --version
 ```
 
-Or install permanently with uv:
+Permanent install:
 
 ```bash
-uv tool install kernelguard
-uv tool install kernelguard[parquet]
+uv tool install kernelguard                # core only
+uv tool install "kernelguard[parquet]"     # + parquet scanning
+uv tool install "kernelguard[mcp]"         # + MCP server
+uv tool install "kernelguard[parquet,mcp]" # everything
 ```
 
-Both `kernelguard` and `kguard` are available as entry points after installation.
+Entry points after installation: `kernelguard`, `kguard`, `kernelguard-mcp`, `kguard-mcp`.
 
 ## Quick Start
 
@@ -64,6 +69,25 @@ Parquet scan:
 ```bash
 kernelguard --parquet /path/to/submissions.parquet --output-dir out/
 ```
+
+## MCP Server
+
+KernelGuard runs as a local MCP server over stdio.
+
+```bash
+kernelguard-mcp                  # default profile
+kernelguard-mcp --profile strict # higher-recall review mode
+kernelguard-mcp --version
+```
+
+Two tools:
+
+- `analyze_code` — analyze a code string, return detection results.
+- `analyze_file` — read a file path, return detection results plus resolved path.
+
+Both accept optional `metadata` (for score-based detection) and `profile` parameters.
+
+The server is read-only: no resources, prompts, scan tools, or write operations.
 
 ## Runtime Config
 
