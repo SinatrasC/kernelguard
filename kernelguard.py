@@ -308,6 +308,24 @@ class SubmissionFacts:
     _function_blocks: dict[str, str] = field(default_factory=dict)
     _active_function_blocks: dict[str, str] = field(default_factory=dict)
 
+    # --- Pre-computed AST indices (populated by _build_ast_index) ---
+    # Nodes that contain a .data_ptr() call anywhere in their subtree
+    _nodes_with_data_ptr: set[int] = field(default_factory=set)
+    # Nodes that contain ._version attribute access
+    _nodes_with_version: set[int] = field(default_factory=set)
+    # Function names (non-entrypoint) whose body contains data_ptr / _version
+    _data_ptr_helpers: set[str] = field(default_factory=set)
+    _version_helpers: set[str] = field(default_factory=set)
+    # Module-level vars initialized to None
+    _none_inited: set[str] = field(default_factory=set)
+    # All assignments: {target_name: [value_node, ...]}
+    _assignments_by_target: dict[str, list] = field(default_factory=dict)
+    # All import statements
+    _imports: list = field(default_factory=list)
+    _import_froms: list = field(default_factory=list)
+    # Class definitions
+    _class_defs: list = field(default_factory=list)
+
     def get_function_block(self, func_name: str) -> str:
         block = self._function_blocks.get(func_name)
         if block is None:
@@ -363,7 +381,94 @@ def build_submission_facts(code: str) -> SubmissionFacts:
         facts._active_function_blocks[entrypoint_name] = custom_kernel_active
     facts._function_blocks["custom_kernel"] = custom_kernel_code
     facts._active_function_blocks["custom_kernel"] = custom_kernel_active
+    _build_ast_index(facts)
     return facts
+
+
+def _build_ast_index(facts: SubmissionFacts) -> None:
+    """Single-pass AST walk to populate all index fields on facts."""
+    tree = facts.ast_tree
+    if tree is None:
+        return
+
+    nodes_with_data_ptr: set[int] = set()
+    nodes_with_version: set[int] = set()
+    data_ptr_helpers: set[str] = set()
+    version_helpers: set[str] = set()
+    none_inited: set[str] = set()
+    imports: list = []
+    import_froms: list = []
+    class_defs: list = []
+
+    # Single walk: tag every node that is a data_ptr call or _version access
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if node.func.attr == "data_ptr":
+                nodes_with_data_ptr.add(id(node))
+        if isinstance(node, ast.Attribute) and node.attr == "_version":
+            nodes_with_version.add(id(node))
+        if isinstance(node, ast.Import):
+            imports.append(node)
+        elif isinstance(node, ast.ImportFrom):
+            import_froms.append(node)
+        elif isinstance(node, ast.ClassDef):
+            class_defs.append(node)
+
+    # Module-level None-initialized vars
+    for stmt in tree.body:
+        if isinstance(stmt, ast.Assign):
+            if isinstance(stmt.value, ast.Constant) and stmt.value.value is None:
+                for t in stmt.targets:
+                    n = _ast_root_name(t)
+                    if n:
+                        none_inited.add(n)
+
+    # Find helper functions (non-entrypoint) that contain data_ptr / _version
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if is_entrypoint_name(node.name):
+            continue
+        for child in ast.walk(node):
+            if id(child) in nodes_with_data_ptr:
+                data_ptr_helpers.add(node.name)
+            if id(child) in nodes_with_version:
+                version_helpers.add(node.name)
+            if node.name in data_ptr_helpers and node.name in version_helpers:
+                break
+
+    # Propagate: mark ancestor expressions as containing data_ptr / _version
+    # We need this for _expr_has_data_ptr / _expr_has_tensor_version replacements
+    # Walk each assignment value and check if any descendant has the tag
+    # This is still O(n) total since we do one walk and check set membership
+
+    facts._nodes_with_data_ptr = nodes_with_data_ptr
+    facts._nodes_with_version = nodes_with_version
+    facts._data_ptr_helpers = data_ptr_helpers
+    facts._version_helpers = version_helpers
+    facts._none_inited = none_inited
+    facts._imports = imports
+    facts._import_froms = import_froms
+    facts._class_defs = class_defs
+
+
+def _expr_has_data_ptr_fast(expr: ast.AST | None, index: set[int]) -> bool:
+    """O(subtree) check using pre-computed index — avoids full ast.walk per call."""
+    if expr is None:
+        return False
+    for node in ast.walk(expr):
+        if id(node) in index:
+            return True
+    return False
+
+
+def _expr_has_version_fast(expr: ast.AST | None, index: set[int]) -> bool:
+    if expr is None:
+        return False
+    for node in ast.walk(expr):
+        if id(node) in index:
+            return True
+    return False
 
 
 def ensure_submission_facts(code_or_facts: str | SubmissionFacts) -> SubmissionFacts:
@@ -1427,29 +1532,27 @@ def detect_trusted_module_import(code: str | SubmissionFacts) -> list[dict]:
     Severity medium — the import alone is suspicious but not conclusive.
     """
     facts = ensure_submission_facts(code)
-    tree = facts.ast_tree
-    if tree is None:
+    if facts.ast_tree is None:
         return []
 
     matches = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                mod_root = alias.name.split(".")[0]
-                if mod_root in TRUSTED_MODULES:
-                    matches.append({
-                        "pattern": "TRUSTED_MODULE_IMPORT",
-                        "severity": "medium",
-                        "evidence": f"import {alias.name} (trusted evaluator module)",
-                    })
-        elif isinstance(node, ast.ImportFrom):
-            if node.module and node.module.split(".")[0] in TRUSTED_MODULES:
-                names = ", ".join(a.name for a in node.names)
+    for node in facts._imports:
+        for alias in node.names:
+            mod_root = alias.name.split(".")[0]
+            if mod_root in TRUSTED_MODULES:
                 matches.append({
                     "pattern": "TRUSTED_MODULE_IMPORT",
                     "severity": "medium",
-                    "evidence": f"from {node.module} import {names}",
+                    "evidence": f"import {alias.name} (trusted evaluator module)",
                 })
+    for node in facts._import_froms:
+        if node.module and node.module.split(".")[0] in TRUSTED_MODULES:
+            names = ", ".join(a.name for a in node.names)
+            matches.append({
+                "pattern": "TRUSTED_MODULE_IMPORT",
+                "severity": "medium",
+                "evidence": f"from {node.module} import {names}",
+            })
     return matches
 
 
@@ -1964,7 +2067,7 @@ def detect_pointer_replay(code: str | SubmissionFacts) -> list[dict]:
             if isinstance(child, ast.Assign):
                 if len(child.targets) == 1 and isinstance(child.targets[0], ast.Name):
                     # Catches bare data_ptr() AND tuples/containers that contain data_ptr()
-                    if _expr_has_data_ptr(child.value):
+                    if _expr_has_data_ptr_fast(child.value, facts._nodes_with_data_ptr):
                         pointer_aliases.add(child.targets[0].id)
 
         for child in ast.walk(node):
@@ -2065,49 +2168,34 @@ def detect_last_call_replay(code: str | SubmissionFacts) -> list[dict]:
         return []
     entrypoint_name = entrypoint_label(facts.entrypoint_name)
 
-    # Collect module-level vars initialized to None — these are common last-call
-    # storage slots that use abbreviated names (e.g. _cd = None; _co = None).
-    none_inited: set[str] = set()
-    for _stmt in tree.body:
-        if isinstance(_stmt, ast.Assign):
-            if isinstance(_stmt.value, ast.Constant) and _stmt.value.value is None:
-                for _t in _stmt.targets:
-                    _n = _ast_root_name(_t)
-                    if _n:
-                        none_inited.add(_n)
-
-    # Collect module-level helper functions that internally use data_ptr or ._version.
-    # This lets the detector see through one layer of indirection (e.g. _tensor_sig,
-    # _make_tensor_sig) without full interprocedural analysis.
-    data_ptr_helpers: set[str] = set()
-    version_helpers: set[str] = set()
-    for fn in ast.walk(tree):
-        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        if is_entrypoint_name(fn.name):
-            continue
-        if any(_expr_has_data_ptr(n) for n in ast.walk(fn)):
-            data_ptr_helpers.add(fn.name)
-        if any(_expr_has_tensor_version(n) for n in ast.walk(fn)):
-            version_helpers.add(fn.name)
+    # Use pre-computed indices from build_submission_facts
+    none_inited = facts._none_inited
+    data_ptr_helpers = facts._data_ptr_helpers
+    version_helpers = facts._version_helpers
+    dp_index = facts._nodes_with_data_ptr
+    ver_index = facts._nodes_with_version
 
     def _has_ptr(expr: ast.AST | None) -> bool:
-        if _expr_has_data_ptr(expr):
+        if _expr_has_data_ptr_fast(expr, dp_index):
             return True
+        if expr is None:
+            return False
         return any(
             isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
             and n.func.id in data_ptr_helpers
             for n in ast.walk(expr)
-        ) if expr is not None else False
+        )
 
     def _has_ver(expr: ast.AST | None) -> bool:
-        if _expr_has_tensor_version(expr):
+        if _expr_has_version_fast(expr, ver_index):
             return True
+        if expr is None:
+            return False
         return any(
             isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
             and n.func.id in version_helpers
             for n in ast.walk(expr)
-        ) if expr is not None else False
+        )
 
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -2810,15 +2898,12 @@ def detect_lazy_tensor(code: str | SubmissionFacts) -> list[dict]:
     Ref: reference exploit note: lazy evaluation
     """
     facts = ensure_submission_facts(code)
-    tree = facts.ast_tree
-    if tree is None:
+    if facts.ast_tree is None:
         return []
 
     matches = []
 
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.ClassDef):
-            continue
+    for node in facts._class_defs:
 
         # Check if class inherits from torch.Tensor
         is_tensor_subclass = False
