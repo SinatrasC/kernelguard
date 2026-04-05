@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kernelguard"
-version = "0.2.0"
+version = "0.2.1"
 description = "Rule-based GPU kernel hack detector."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -31,6 +31,7 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
+api = ["starlette>=0.37", "uvicorn[standard]>=0.29"]
 mcp = ["mcp[cli]>=1.2.0"]
 parquet = ["pyarrow>=15"]
 
@@ -39,6 +40,8 @@ kernelguard = "kernelguard:main"
 kguard = "kernelguard:main"
 kernelguard-mcp = "kernelguard_mcp:main"
 kguard-mcp = "kernelguard_mcp:main"
+kernelguard-api = "kernelguard_api:main"
+kguard-api = "kernelguard_api:main"
 
 [tool.setuptools]
-py-modules = ["kernelguard", "kernelguard_mcp"]
+py-modules = ["kernelguard", "kernelguard_mcp", "kernelguard_api"]

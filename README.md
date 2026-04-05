@@ -45,10 +45,11 @@ Permanent install:
 uv tool install kernelguard                # core only
 uv tool install "kernelguard[parquet]"     # + parquet scanning
 uv tool install "kernelguard[mcp]"         # + MCP server
-uv tool install "kernelguard[parquet,mcp]" # everything
+uv tool install "kernelguard[parquet,mcp]" # + parquet + MCP
+uv tool install "kernelguard[api]"         # + HTTP API server
 ```
 
-Entry points after installation: `kernelguard`, `kguard`, `kernelguard-mcp`, `kguard-mcp`.
+Entry points after installation: `kernelguard`, `kguard`, `kernelguard-mcp`, `kguard-mcp`, `kernelguard-api`, `kguard-api`.
 
 ## Quick Start
 
@@ -88,6 +89,23 @@ Two tools:
 Both accept optional `metadata` (for score-based detection) and `profile` parameters.
 
 The server is read-only: no resources, prompts, scan tools, or write operations.
+
+## HTTP API Server
+
+KernelGuard runs as an HTTP API server for integration with services like KernelBot.
+
+```bash
+kernelguard-api                           # default: 127.0.0.1:8088
+kernelguard-api --host 0.0.0.0 --port 80 # public
+kernelguard-api --profile strict          # higher-recall mode
+```
+
+Endpoints:
+
+- `GET /health` — returns `{"status": "ok", "version": "...", "profile": "..."}`.
+- `POST /analyze` — accepts `{"code": "...", "metadata": null, "profile": "default"}`, returns detection results.
+
+The API server keeps KernelGuard loaded in memory, eliminating cold-start latency from subprocess invocations.
 
 ## Runtime Config
 
