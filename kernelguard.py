@@ -3327,6 +3327,22 @@ def detect_score_anomaly(metadata: Optional[dict]) -> list[dict]:
     impossible_below = float(SCORE_CONFIG["impossible_below"])
     suspect_floor_below = float(SCORE_CONFIG["suspect_floor_below"])
     broken_above = float(SCORE_CONFIG["broken_above"])
+
+    # When a per-problem physics floor exists, use it instead of the static
+    # threshold.  SCORE_PHYSICS_FLOOR (critical) catches scores below the
+    # floor.  SCORE_SUSPECT_FLOOR only adds value for problems without a
+    # physics floor — otherwise the floor itself is the boundary and scores
+    # above it are achievable by definition.
+    effective_suspect = suspect_floor_below
+    pf = None
+    if problem_name:
+        pf = compute_physics_floor(problem_name)
+        if pf is not None:
+            # Physics floor is authoritative — disable the blunt threshold.
+            # Anything above the floor is achievable; anything below is
+            # already caught by SCORE_PHYSICS_FLOOR.
+            effective_suspect = 0.0
+
     for s in all_scores:
         if not isinstance(s, (int, float)) or s <= 0:
             continue
@@ -3337,11 +3353,18 @@ def detect_score_anomaly(metadata: Optional[dict]) -> list[dict]:
                 "evidence": f"Score {s:.2e} is physically impossible (<{impossible_below:.2e}s)",
             })
             break
-        if s < suspect_floor_below:
+        if s < effective_suspect:
+            # Skip if already caught by SCORE_PHYSICS_FLOOR above
+            if any(m["pattern"] == "SCORE_PHYSICS_FLOOR" for m in matches):
+                break
             matches.append({
                 "pattern": "SCORE_SUSPECT_FLOOR",
                 "severity": "high",
-                "evidence": f"Score {s:.2e}s is at/near timing floor (<{suspect_floor_below:.2e}s)",
+                "evidence": (
+                    f"Score {s:.2e}s is at/near timing floor (<{effective_suspect:.2e}s"
+                    + (f", physics floor={pf:.2e}s" if problem_name and pf is not None else "")
+                    + ")"
+                ),
             })
             break
         if s > broken_above:
