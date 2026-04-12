@@ -1,0 +1,48 @@
+name: blue-pr-sync
+
+on:
+  pull_request_target:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - edited
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: blue-pr-sync-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: kernelguard-api-control-plane
+    steps:
+      - name: Checkout trusted default-branch automation code
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          ref: refs/heads/${{ github.event.repository.default_branch }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: "3.12"
+
+      - name: Register or update blue PR submission in KernelGuard API
+        env:
+          KERNELGUARD_API_BASE_URL: ${{ secrets.KERNELGUARD_API_BASE_URL }}
+          KERNELGUARD_API_INTERNAL_TOKEN: ${{ secrets.KERNELGUARD_API_INTERNAL_TOKEN }}
+        run: |
+          test -n "$KERNELGUARD_API_BASE_URL"
+          test -n "$KERNELGUARD_API_INTERNAL_TOKEN"
+          python scripts/github/sync_blue_pr_submission.py \
+            --api-base-url "$KERNELGUARD_API_BASE_URL" \
+            --internal-token "$KERNELGUARD_API_INTERNAL_TOKEN" \
+            --event-path "$GITHUB_EVENT_PATH" \
+            --output-json "$RUNNER_TEMP/blue-pr-sync.json"
