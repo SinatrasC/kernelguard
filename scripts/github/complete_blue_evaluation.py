@@ -1,0 +1,61 @@
+from __future__ import annotations
+
+import argparse
+
+from common import (
+    api_request_json,
+    append_step_summary,
+    build_evaluation_lease_headers,
+    read_json,
+    set_github_output,
+    write_json,
+)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Post a completed trusted KernelGuard blue evaluation back to the API")
+    parser.add_argument("--api-base-url", required=True)
+    parser.add_argument("--claim-json", required=True)
+    parser.add_argument("--result-json", required=True)
+    parser.add_argument("--output-json", required=True)
+    args = parser.parse_args(argv)
+
+    claim = read_json(args.claim_json)
+    result = read_json(args.result_json)
+    evaluation_job_id = int(claim["evaluation_job"]["id"])
+    claim_lease = claim.get("claim_lease") or {}
+    lease_token = claim_lease.get("token")
+    if not isinstance(lease_token, str) or not lease_token.strip():
+        append_step_summary(
+            "## KernelGuard Trusted Blue Eval\n"
+            "Completion failed: claim payload did not include a lease token.\n"
+        )
+        return 1
+
+    status, payload = api_request_json(
+        method="POST",
+        url=(
+            f"{args.api_base_url.rstrip('/')}"
+            f"/v1/internal/evaluations/{evaluation_job_id}/complete"
+        ),
+        payload=result,
+        headers=build_evaluation_lease_headers(lease_token),
+    )
+    if status != 200:
+        append_step_summary(
+            "## KernelGuard Trusted Blue Eval\n"
+            f"Completion failed with HTTP {status}.\n"
+        )
+        if payload is not None:
+            append_step_summary(f"```json\n{payload}\n```\n")
+        return 1
+
+    write_json(args.output_json, payload)
+    passed = bool((payload.get("summary") or {}).get("passed"))
+    set_github_output("evaluation_passed", "true" if passed else "false")
+    set_github_output("evaluation_status", str(payload.get("status")))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
