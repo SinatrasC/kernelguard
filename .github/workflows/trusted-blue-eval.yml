@@ -1,0 +1,248 @@
+name: trusted-blue-eval
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile_override:
+        description: Optional runtime profile override for this evaluation run
+        required: false
+        type: string
+      publish_pr_comment:
+        description: Publish or update a PR comment with the evaluation result
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: trusted-blue-eval
+  cancel-in-progress: false
+
+jobs:
+  claim:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: trusted-blue-eval
+    outputs:
+      claimed: ${{ steps.claim.outputs.claimed }}
+      evaluation_job_id: ${{ steps.claim.outputs.evaluation_job_id }}
+      repo_full_name: ${{ steps.claim.outputs.repo_full_name }}
+      pr_number: ${{ steps.claim.outputs.pr_number }}
+      head_sha: ${{ steps.claim.outputs.head_sha }}
+      server_profile: ${{ steps.claim.outputs.server_profile }}
+    env:
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - name: Checkout trusted default-branch automation code
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          ref: refs/heads/${{ github.event.repository.default_branch }}
+          path: trusted
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: "3.12"
+
+      - name: Claim next evaluation job
+        id: claim
+        env:
+          KERNELGUARD_API_BASE_URL: ${{ secrets.KERNELGUARD_API_BASE_URL }}
+          KERNELGUARD_API_INTERNAL_TOKEN: ${{ secrets.KERNELGUARD_API_INTERNAL_TOKEN }}
+        run: |
+          python trusted/scripts/github/claim_blue_evaluation.py \
+            --api-base-url "$KERNELGUARD_API_BASE_URL" \
+            --internal-token "$KERNELGUARD_API_INTERNAL_TOKEN" \
+            --output-json "$RUNNER_TEMP/kernelguard-claim.json"
+
+      - name: Upload claim payload
+        if: steps.claim.outputs.claimed == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kernelguard-claim-${{ steps.claim.outputs.evaluation_job_id }}
+          path: ${{ runner.temp }}/kernelguard-claim.json
+          if-no-files-found: error
+
+  evaluate:
+    needs: claim
+    if: needs.claim.outputs.claimed == 'true'
+    runs-on:
+      - self-hosted
+      - linux
+      - kernelguard-blue-eval
+    timeout-minutes: 30
+    env:
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - name: Checkout trusted default-branch automation code
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          ref: refs/heads/${{ github.event.repository.default_branch }}
+          path: trusted
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Download claim payload
+        uses: actions/download-artifact@cc203385981b70ca67e1cc392babf9cc229d5806
+        with:
+          name: kernelguard-claim-${{ needs.claim.outputs.evaluation_job_id }}
+          path: ${{ runner.temp }}/claim
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: "3.12"
+
+      - name: Checkout candidate PR head
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          repository: ${{ needs.claim.outputs.repo_full_name }}
+          ref: refs/pull/${{ needs.claim.outputs.pr_number }}/head
+          path: candidate
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Verify candidate checkout matches claimed head SHA
+        run: |
+          actual_sha="$(git -C candidate rev-parse HEAD)"
+          test "$actual_sha" = "${{ needs.claim.outputs.head_sha }}"
+
+      - name: Evaluate candidate PR in isolated runner context
+        run: |
+          if [ -n "${{ inputs.profile_override }}" ]; then
+            python trusted/scripts/github/evaluate_blue_pr.py \
+              --claim-json "$RUNNER_TEMP/claim/kernelguard-claim.json" \
+              --pr-checkout candidate \
+              --output-json "$RUNNER_TEMP/kernelguard-result.json" \
+              --profile "${{ inputs.profile_override }}"
+          else
+            python trusted/scripts/github/evaluate_blue_pr.py \
+              --claim-json "$RUNNER_TEMP/claim/kernelguard-claim.json" \
+              --pr-checkout candidate \
+              --output-json "$RUNNER_TEMP/kernelguard-result.json"
+          fi
+
+      - name: Upload evaluator result
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kernelguard-result-${{ needs.claim.outputs.evaluation_job_id }}
+          path: ${{ runner.temp }}/kernelguard-result.json
+          if-no-files-found: error
+
+  report:
+    needs:
+      - claim
+      - evaluate
+    if: always() && needs.claim.outputs.claimed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: trusted-blue-eval
+    permissions:
+      contents: read
+      issues: write
+    env:
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - name: Checkout trusted default-branch automation code
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          ref: refs/heads/${{ github.event.repository.default_branch }}
+          path: trusted
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: "3.12"
+
+      - name: Download claim payload
+        uses: actions/download-artifact@cc203385981b70ca67e1cc392babf9cc229d5806
+        with:
+          name: kernelguard-claim-${{ needs.claim.outputs.evaluation_job_id }}
+          path: ${{ runner.temp }}/claim
+
+      - name: Download evaluator result
+        continue-on-error: true
+        uses: actions/download-artifact@cc203385981b70ca67e1cc392babf9cc229d5806
+        with:
+          name: kernelguard-result-${{ needs.claim.outputs.evaluation_job_id }}
+          path: ${{ runner.temp }}/result
+
+      - name: Synthesize evaluator failure result if needed
+        env:
+          RESULT_JSON: ${{ runner.temp }}/result/kernelguard-result.json
+          EVALUATE_JOB_RESULT: ${{ needs.evaluate.result }}
+        run: |
+          mkdir -p "$(dirname "$RESULT_JSON")"
+          if [ ! -f "$RESULT_JSON" ]; then
+            python - <<'PY'
+            import json
+            import os
+
+            result_path = os.environ["RESULT_JSON"]
+            evaluate_job_result = os.environ.get("EVALUATE_JOB_RESULT") or "unknown"
+            payload = {
+                "status": "failed",
+                "worker_version": "trusted-blue-evaluator/1.0",
+                "error": f"evaluation job did not produce a result artifact: {evaluate_job_result}",
+                "summary": {
+                    "passed": False,
+                    "failure_reason": (
+                        "evaluation job did not produce a result artifact: "
+                        f"{evaluate_job_result}"
+                    ),
+                },
+                "case_results": [],
+                "artifacts": [
+                    {
+                        "kind": "evaluation_error",
+                        "value": (
+                            "evaluation job did not produce a result artifact: "
+                            f"{evaluate_job_result}"
+                        ),
+                    }
+                ],
+            }
+            with open(result_path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, indent=2, sort_keys=True)
+                handle.write("\\n")
+            PY
+          fi
+
+      - name: Post evaluation result back to KernelGuard API
+        id: complete
+        env:
+          KERNELGUARD_API_BASE_URL: ${{ secrets.KERNELGUARD_API_BASE_URL }}
+        run: |
+          python trusted/scripts/github/complete_blue_evaluation.py \
+            --api-base-url "$KERNELGUARD_API_BASE_URL" \
+            --claim-json "$RUNNER_TEMP/claim/kernelguard-claim.json" \
+            --result-json "$RUNNER_TEMP/result/kernelguard-result.json" \
+            --output-json "$RUNNER_TEMP/kernelguard-complete.json"
+
+      - name: Update PR comment with evaluation summary
+        if: inputs.publish_pr_comment
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          WORKFLOW_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python trusted/scripts/github/post_blue_evaluation_comment.py \
+            --claim-json "$RUNNER_TEMP/claim/kernelguard-claim.json" \
+            --completion-json "$RUNNER_TEMP/kernelguard-complete.json" \
+            --github-token "$GITHUB_TOKEN" \
+            --workflow-run-url "$WORKFLOW_RUN_URL"
+
+      - name: Upload completion payload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kernelguard-complete-${{ needs.claim.outputs.evaluation_job_id }}
+          path: ${{ runner.temp }}/kernelguard-complete.json
+          if-no-files-found: error
