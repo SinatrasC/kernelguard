@@ -146,6 +146,7 @@ jobs:
     permissions:
       contents: read
       issues: write
+      pull-requests: write
     env:
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
       PYTHONDONTWRITEBYTECODE: "1"
