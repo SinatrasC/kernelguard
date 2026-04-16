@@ -48,7 +48,6 @@ jobs:
         run: |
           python - <<'PY'
           import kernelguard_api
-
-          app = kernelguard_api.build_app(profile="strict")
-          print(app.state.server_profile)
+          app = kernelguard_api.build_app()
+          print(sorted(route.path for route in app.routes))
           PY

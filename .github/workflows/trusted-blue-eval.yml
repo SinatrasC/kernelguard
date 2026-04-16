@@ -183,38 +183,7 @@ jobs:
         run: |
           mkdir -p "$(dirname "$RESULT_JSON")"
           if [ ! -f "$RESULT_JSON" ]; then
-            python - <<'PY'
-            import json
-            import os
-
-            result_path = os.environ["RESULT_JSON"]
-            evaluate_job_result = os.environ.get("EVALUATE_JOB_RESULT") or "unknown"
-            payload = {
-                "status": "failed",
-                "worker_version": "trusted-blue-evaluator/1.0",
-                "error": f"evaluation job did not produce a result artifact: {evaluate_job_result}",
-                "summary": {
-                    "passed": False,
-                    "failure_reason": (
-                        "evaluation job did not produce a result artifact: "
-                        f"{evaluate_job_result}"
-                    ),
-                },
-                "case_results": [],
-                "artifacts": [
-                    {
-                        "kind": "evaluation_error",
-                        "value": (
-                            "evaluation job did not produce a result artifact: "
-                            f"{evaluate_job_result}"
-                        ),
-                    }
-                ],
-            }
-            with open(result_path, "w", encoding="utf-8") as handle:
-                json.dump(payload, handle, indent=2, sort_keys=True)
-                handle.write("\\n")
-            PY
+            python -c 'import json, os; result_path = os.environ["RESULT_JSON"]; evaluate_job_result = os.environ.get("EVALUATE_JOB_RESULT") or "unknown"; message = f"evaluation job did not produce a result artifact: {evaluate_job_result}"; payload = {"status": "failed", "worker_version": "trusted-blue-evaluator/1.0", "error": message, "summary": {"passed": False, "failure_reason": message}, "case_results": [], "artifacts": [{"kind": "evaluation_error", "value": message}]}; open(result_path, "w", encoding="utf-8").write(json.dumps(payload, indent=2, sort_keys=True) + "\\n")'
           fi
 
       - name: Post evaluation result back to KernelGuard API
