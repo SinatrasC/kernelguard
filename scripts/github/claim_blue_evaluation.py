@@ -7,6 +7,7 @@ from common import (
     append_step_summary,
     build_internal_headers,
     log_error,
+    mask_github_value,
     set_github_output,
     write_json,
 )
@@ -58,6 +59,7 @@ def main(argv: list[str] | None = None) -> int:
 
     write_json(args.output_json, payload)
     blue_submission = payload["blue_submission"]
+    mask_github_value(claim_lease["token"])
     set_github_output("claimed", "true")
     set_github_output("evaluation_job_id", str(payload["evaluation_job"]["id"]))
     set_github_output("blue_submission_id", str(blue_submission["id"]))
@@ -65,6 +67,8 @@ def main(argv: list[str] | None = None) -> int:
     set_github_output("pr_number", str(claim_payload["github_pr_number"]))
     set_github_output("head_sha", str(claim_payload["github_head_sha"]))
     set_github_output("server_profile", str(payload.get("server_profile") or "default"))
+    set_github_output("claim_lease_token", str(claim_lease["token"]))
+    set_github_output("api_base_url", str(args.api_base_url.rstrip("/")))
     return 0
 
 

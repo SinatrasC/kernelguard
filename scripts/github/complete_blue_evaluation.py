@@ -16,20 +16,32 @@ from common import (
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Post a completed trusted KernelGuard blue evaluation back to the API")
     parser.add_argument("--api-base-url", required=True)
-    parser.add_argument("--claim-json", required=True)
+    parser.add_argument("--claim-json", required=False, default=None)
+    parser.add_argument("--evaluation-job-id", required=False, type=int, default=None)
+    parser.add_argument("--lease-token", required=False, default=None)
     parser.add_argument("--result-json", required=True)
     parser.add_argument("--output-json", required=True)
     args = parser.parse_args(argv)
 
-    claim = read_json(args.claim_json)
     result = read_json(args.result_json)
-    evaluation_job_id = int(claim["evaluation_job"]["id"])
-    claim_lease = claim.get("claim_lease") or {}
-    lease_token = claim_lease.get("token")
+    evaluation_job_id = args.evaluation_job_id
+    lease_token = args.lease_token
+    if args.claim_json:
+        claim = read_json(args.claim_json)
+        evaluation_job_id = int(claim["evaluation_job"]["id"])
+        if not lease_token:
+            claim_lease = claim.get("claim_lease") or {}
+            lease_token = claim_lease.get("token")
+    if evaluation_job_id is None:
+        append_step_summary(
+            "## KernelGuard Trusted Blue Eval\n"
+            "Completion failed: evaluation job id was not provided.\n"
+        )
+        return 1
     if not isinstance(lease_token, str) or not lease_token.strip():
         append_step_summary(
             "## KernelGuard Trusted Blue Eval\n"
-            "Completion failed: claim payload did not include a lease token.\n"
+            "Completion failed: evaluation lease token was not provided.\n"
         )
         return 1
 
