@@ -34,6 +34,7 @@ def api_request_json(
 ) -> tuple[int, Any]:
     request_headers = {
         "accept": "application/json",
+        "user-agent": "KernelGuardActions/1.0 (+https://github.com/SinatrasC/kernelguard)",
     }
     if headers:
         request_headers.update(headers)

@@ -22,10 +22,7 @@ concurrency:
 
 jobs:
   claim:
-    runs-on:
-      - self-hosted
-      - linux
-      - kernelguard-blue-eval
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     environment: trusted-blue-eval
     outputs:
@@ -143,10 +140,7 @@ jobs:
       - claim
       - evaluate
     if: always() && needs.claim.outputs.claimed == 'true'
-    runs-on:
-      - self-hosted
-      - linux
-      - kernelguard-blue-eval
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     environment: trusted-blue-eval
     permissions:
