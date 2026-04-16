@@ -1,0 +1,54 @@
+name: blue-pr-prechecks
+
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: blue-pr-prechecks-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  prechecks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: "3.12"
+
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[api]"
+
+      - name: Compile core Python entrypoints
+        run: |
+          python -m py_compile kernelguard.py kernelguard_api.py
+
+      - name: Smoke test lightweight API startup
+        run: |
+          python - <<'PY'
+          import kernelguard_api
+
+          app = kernelguard_api.build_app(profile="strict")
+          print(app.state.server_profile)
+          PY
