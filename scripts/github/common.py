@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import sys
 import urllib.error
 import urllib.request
 from typing import Any
@@ -101,6 +102,16 @@ def append_step_summary(markdown: str) -> None:
         handle.write(markdown)
         if not markdown.endswith("\n"):
             handle.write("\n")
+
+
+def log_error(message: str, payload: Any = None) -> None:
+    print(message, file=sys.stderr)
+    if payload is not None:
+        try:
+            rendered = json.dumps(payload, indent=2, sort_keys=True)
+        except TypeError:
+            rendered = str(payload)
+        print(rendered, file=sys.stderr)
 
 
 def write_json(path: str, payload: Any) -> None:

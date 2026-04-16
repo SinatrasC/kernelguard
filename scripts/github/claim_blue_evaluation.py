@@ -6,6 +6,7 @@ from common import (
     api_request_json,
     append_step_summary,
     build_internal_headers,
+    log_error,
     set_github_output,
     write_json,
 )
@@ -31,6 +32,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
     if status != 200:
+        log_error(f"KernelGuard claim failed with HTTP {status}.", payload)
         append_step_summary(
             "## KernelGuard Trusted Blue Eval\n"
             f"Claim failed with HTTP {status}.\n"

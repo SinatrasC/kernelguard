@@ -7,6 +7,7 @@ from common import (
     api_request_json,
     append_step_summary,
     build_internal_headers,
+    log_error,
     read_json,
     set_github_output,
     write_json,
@@ -85,6 +86,7 @@ def main(argv: list[str] | None = None) -> int:
         headers=build_internal_headers(args.internal_token),
     )
     if status not in {200, 201}:
+        log_error(f"KernelGuard PR sync failed with HTTP {status}.", payload)
         append_step_summary(
             "## KernelGuard Blue PR Sync\n"
             f"Registration failed with HTTP {status}.\n"

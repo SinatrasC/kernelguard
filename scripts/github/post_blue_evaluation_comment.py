@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 
-from common import api_request_json, append_step_summary, github_headers, read_json
+from common import api_request_json, append_step_summary, github_headers, log_error, read_json
 
 
 COMMENT_MARKER = "<!-- kernelguard-blue-eval -->"
@@ -101,6 +101,7 @@ def main(argv: list[str] | None = None) -> int:
         headers=headers,
     )
     if error_message is not None:
+        log_error(error_message)
         append_step_summary(
             "## KernelGuard Trusted Blue Eval\n"
             f"{error_message}\n"
@@ -115,6 +116,7 @@ def main(argv: list[str] | None = None) -> int:
             payload={"body": body},
         )
         if post_status != 201:
+            log_error(f"Unable to create PR feedback comment (HTTP {post_status}).")
             append_step_summary(
                 "## KernelGuard Trusted Blue Eval\n"
                 f"Unable to create PR feedback comment (HTTP {post_status}).\n"
@@ -128,6 +130,7 @@ def main(argv: list[str] | None = None) -> int:
             payload={"body": body},
         )
         if patch_status != 200:
+            log_error(f"Unable to update PR feedback comment (HTTP {patch_status}).")
             append_step_summary(
                 "## KernelGuard Trusted Blue Eval\n"
                 f"Unable to update PR feedback comment (HTTP {patch_status}).\n"

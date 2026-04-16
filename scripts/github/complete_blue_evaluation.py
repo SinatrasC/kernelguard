@@ -6,6 +6,7 @@ from common import (
     api_request_json,
     append_step_summary,
     build_evaluation_lease_headers,
+    log_error,
     read_json,
     set_github_output,
     write_json,
@@ -42,6 +43,7 @@ def main(argv: list[str] | None = None) -> int:
         headers=build_evaluation_lease_headers(lease_token),
     )
     if status != 200:
+        log_error(f"KernelGuard completion failed with HTTP {status}.", payload)
         append_step_summary(
             "## KernelGuard Trusted Blue Eval\n"
             f"Completion failed with HTTP {status}.\n"
