@@ -17,6 +17,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Post a completed trusted KernelGuard blue evaluation back to the API")
     parser.add_argument("--api-base-url", required=True)
     parser.add_argument("--claim-json", required=False, default=None)
+    parser.add_argument("--claim-ref-json", required=False, default=None)
     parser.add_argument("--evaluation-job-id", required=False, type=int, default=None)
     parser.add_argument("--lease-token", required=False, default=None)
     parser.add_argument("--result-json", required=True)
@@ -32,6 +33,11 @@ def main(argv: list[str] | None = None) -> int:
         if not lease_token:
             claim_lease = claim.get("claim_lease") or {}
             lease_token = claim_lease.get("token")
+    if args.claim_ref_json:
+        claim_ref = read_json(args.claim_ref_json)
+        evaluation_job_id = int(claim_ref["evaluation_job_id"])
+        if not lease_token:
+            lease_token = claim_ref.get("claim_lease_token")
     if evaluation_job_id is None:
         append_step_summary(
             "## KernelGuard Trusted Blue Eval\n"

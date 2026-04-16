@@ -95,11 +95,6 @@ def set_github_output(name: str, value: str) -> None:
         handle.write(f"{name}={value}\n")
 
 
-def mask_github_value(value: str) -> None:
-    if value:
-        print(f"::add-mask::{value}")
-
-
 def append_step_summary(markdown: str) -> None:
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
     if not summary_path:
