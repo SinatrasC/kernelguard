@@ -62,7 +62,7 @@ jobs:
 
       - name: Upload claim payload
         if: steps.claim.outputs.claimed == 'true'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: kernelguard-claim-${{ steps.claim.outputs.evaluation_job_id }}
           path: ${{ runner.temp }}/kernelguard-claim.json
@@ -89,7 +89,7 @@ jobs:
           fetch-depth: 1
 
       - name: Download claim payload
-        uses: actions/download-artifact@cc203385981b70ca67e1cc392babf9cc229d5806
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: kernelguard-claim-${{ needs.claim.outputs.evaluation_job_id }}
           path: ${{ runner.temp }}/claim
@@ -129,7 +129,7 @@ jobs:
           fi
 
       - name: Upload evaluator result
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: kernelguard-result-${{ needs.claim.outputs.evaluation_job_id }}
           path: ${{ runner.temp }}/kernelguard-result.json
@@ -165,14 +165,14 @@ jobs:
           python-version: "3.12"
 
       - name: Download claim payload
-        uses: actions/download-artifact@cc203385981b70ca67e1cc392babf9cc229d5806
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: kernelguard-claim-${{ needs.claim.outputs.evaluation_job_id }}
           path: ${{ runner.temp }}/claim
 
       - name: Download evaluator result
         continue-on-error: true
-        uses: actions/download-artifact@cc203385981b70ca67e1cc392babf9cc229d5806
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: kernelguard-result-${{ needs.claim.outputs.evaluation_job_id }}
           path: ${{ runner.temp }}/result
@@ -211,7 +211,7 @@ jobs:
             --workflow-run-url "$WORKFLOW_RUN_URL"
 
       - name: Upload completion payload
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: kernelguard-complete-${{ needs.claim.outputs.evaluation_job_id }}
           path: ${{ runner.temp }}/kernelguard-complete.json
