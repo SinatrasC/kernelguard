@@ -220,3 +220,4 @@ Generated scan artifacts include:
 - `cleaned_pairs.jsonl`
 
 These generated files are ignored by the repo-level `.gitignore`.
+# staging e2e run 20260421T2318
