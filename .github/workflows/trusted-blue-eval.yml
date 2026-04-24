@@ -71,10 +71,7 @@ jobs:
   evaluate:
     needs: claim
     if: needs.claim.outputs.claimed == 'true'
-    runs-on:
-      - self-hosted
-      - linux
-      - kernelguard-blue-eval
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
