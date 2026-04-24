@@ -7,6 +7,7 @@ on:
       - synchronize
       - reopened
       - ready_for_review
+      - edited
 
 permissions:
   contents: read
@@ -24,9 +25,11 @@ jobs:
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
       PYTHONDONTWRITEBYTECODE: "1"
     steps:
-      - name: Checkout PR head
+      - name: Checkout trusted gate code
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
         with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: trusted
           persist-credentials: false
           fetch-depth: 1
 
@@ -35,16 +38,79 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Check blue PR eligibility
+        id: gate
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python trusted/scripts/github/blue_pr_gate.py \
+            --event-path "$GITHUB_EVENT_PATH" \
+            --github-token "$GITHUB_TOKEN" \
+            --output-json "$RUNNER_TEMP/blue-pr-gate.json"
+
+      - name: Upload blue PR gate result
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: blue-pr-gate-${{ github.event.pull_request.number }}
+          path: ${{ runner.temp }}/blue-pr-gate.json
+          if-no-files-found: error
+
+      - name: Reject ineligible blue PR
+        if: steps.gate.outputs.is_blue_submission == 'true' && steps.gate.outputs.eligible_for_trusted_eval != 'true'
+        run: |
+          echo "This PR declares a KernelGuard blue submission but is not eligible for automatic trusted evaluation."
+          echo "See the KernelGuard Blue PR Gate summary for the blocking reason."
+          exit 1
+
+      - name: Checkout candidate PR
+        if: steps.gate.outputs.eligible_for_trusted_eval == 'true'
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          path: candidate
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Static RCE security check
+        if: steps.gate.outputs.eligible_for_trusted_eval == 'true'
+        id: static
+        continue-on-error: true
+        run: |
+          python trusted/scripts/github/blue_pr_static_security.py \
+            --base-file trusted/kernelguard.py \
+            --candidate-file candidate/kernelguard.py \
+            --output-json "$RUNNER_TEMP/blue-pr-static-security.json"
+
+      - name: Upload static security result
+        if: steps.gate.outputs.eligible_for_trusted_eval == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: blue-pr-static-security-${{ github.event.pull_request.number }}
+          path: ${{ runner.temp }}/blue-pr-static-security.json
+          if-no-files-found: error
+
+      - name: Reject blue PR with possible RCE risk
+        if: steps.gate.outputs.eligible_for_trusted_eval == 'true' && steps.static.outcome != 'success'
+        run: |
+          echo "Static security checks found possible RCE-capable changes."
+          echo "See the KernelGuard Blue PR Static Security summary for details."
+          exit 1
+
       - name: Install package
+        if: steps.gate.outputs.eligible_for_trusted_eval == 'true'
+        working-directory: candidate
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e ".[api]"
 
       - name: Compile core Python entrypoints
+        if: steps.gate.outputs.eligible_for_trusted_eval == 'true'
+        working-directory: candidate
         run: |
           python -m py_compile kernelguard.py kernelguard_api.py
 
       - name: Smoke test lightweight API startup
+        if: steps.gate.outputs.eligible_for_trusted_eval == 'true'
+        working-directory: candidate
         run: |
           python - <<'PY'
           import kernelguard_api

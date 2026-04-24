@@ -119,6 +119,13 @@ jobs:
           actual_sha="$(git -C candidate rev-parse HEAD)"
           test "$actual_sha" = "${{ needs.claim.outputs.head_sha }}"
 
+      - name: Static RCE security check
+        run: |
+          python trusted/scripts/github/blue_pr_static_security.py \
+            --base-file trusted/kernelguard.py \
+            --candidate-file candidate/kernelguard.py \
+            --output-json "$RUNNER_TEMP/blue-pr-static-security.json"
+
       - name: Evaluate candidate PR in isolated runner context
         run: |
           if [ -n "${{ inputs.profile_override }}" ]; then
