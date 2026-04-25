@@ -16,6 +16,9 @@ on:
 permissions:
   contents: read
 
+env:
+  KERNELGUARD_API_BASE_URL: https://kguard.sinatras.dev
+
 concurrency:
   group: trusted-blue-eval
   cancel-in-progress: false
@@ -33,7 +36,6 @@ jobs:
       pr_number: ${{ steps.claim.outputs.pr_number }}
       head_sha: ${{ steps.claim.outputs.head_sha }}
       server_profile: ${{ steps.claim.outputs.server_profile }}
-      api_base_url: ${{ steps.claim.outputs.api_base_url }}
       claim_lease_token: ${{ steps.claim.outputs.claim_lease_token }}
       claim_lease_expires_at: ${{ steps.claim.outputs.claim_lease_expires_at }}
     env:
@@ -56,7 +58,6 @@ jobs:
       - name: Claim next evaluation job
         id: claim
         env:
-          KERNELGUARD_API_BASE_URL: ${{ secrets.KERNELGUARD_API_BASE_URL }}
           KERNELGUARD_API_INTERNAL_TOKEN: ${{ secrets.KERNELGUARD_API_INTERNAL_TOKEN }}
         run: |
           python trusted/scripts/github/claim_blue_evaluation.py \
@@ -89,7 +90,7 @@ jobs:
       - name: Fetch claimed evaluation payload
         run: |
           python trusted/scripts/github/fetch_blue_evaluation_claim.py \
-            --api-base-url "${{ needs.claim.outputs.api_base_url }}" \
+            --api-base-url "$KERNELGUARD_API_BASE_URL" \
             --evaluation-job-id "${{ needs.claim.outputs.evaluation_job_id }}" \
             --lease-token "${{ needs.claim.outputs.claim_lease_token }}" \
             --output-json "$RUNNER_TEMP/kernelguard-claim.json"
@@ -133,7 +134,7 @@ jobs:
       - name: Post evaluation result back to KernelGuard API
         run: |
           python trusted/scripts/github/complete_blue_evaluation.py \
-            --api-base-url "${{ needs.claim.outputs.api_base_url }}" \
+            --api-base-url "$KERNELGUARD_API_BASE_URL" \
             --evaluation-job-id "${{ needs.claim.outputs.evaluation_job_id }}" \
             --lease-token "${{ needs.claim.outputs.claim_lease_token }}" \
             --result-json "$RUNNER_TEMP/kernelguard-result.json" \
@@ -187,6 +188,7 @@ jobs:
           python-version: "3.12"
 
       - name: Download public evaluation summary
+        if: needs.evaluate.result == 'success'
         continue-on-error: true
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
@@ -204,7 +206,7 @@ jobs:
             mkdir -p "$(dirname "$PUBLIC_SUMMARY_JSON")"
             python -c 'import json, os; result_path = os.environ["RESULT_JSON"]; evaluate_job_result = os.environ.get("EVALUATE_JOB_RESULT") or "unknown"; message = f"evaluation job did not produce a public summary artifact: {evaluate_job_result}"; payload = {"status": "failed", "worker_version": "trusted-blue-evaluator/1.0", "error": message, "summary": {"passed": False, "failure_reason": message, "target_red_submission": {"passed": False}, "validation_suite": {"true_positive_passed": 0, "true_positive_total": 0, "false_positive_passed": 0, "false_positive_total": 0, "passed": False}, "surgicalness_score": 0.0}, "case_results": [], "artifacts": [{"kind": "evaluation_error", "value": message}]}; open(result_path, "w", encoding="utf-8").write(json.dumps(payload, indent=2, sort_keys=True) + "\\n")'
             python trusted/scripts/github/complete_blue_evaluation.py \
-              --api-base-url "${{ needs.claim.outputs.api_base_url }}" \
+              --api-base-url "$KERNELGUARD_API_BASE_URL" \
               --evaluation-job-id "${{ needs.claim.outputs.evaluation_job_id }}" \
               --lease-token "${{ needs.claim.outputs.claim_lease_token }}" \
               --result-json "$RESULT_JSON" \
