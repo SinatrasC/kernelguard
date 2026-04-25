@@ -65,7 +65,6 @@ def main(argv: list[str] | None = None) -> int:
         "head_sha": str(claim_payload["github_head_sha"]),
         "server_profile": str(payload.get("server_profile") or "default"),
         "api_base_url": str(args.api_base_url.rstrip("/")),
-        "claim_lease_token": str(claim_lease["token"]),
         "claim_lease_expires_at": payload.get("claim_lease", {}).get("expires_at"),
     })
     set_github_output("claimed", "true")
@@ -75,6 +74,9 @@ def main(argv: list[str] | None = None) -> int:
     set_github_output("pr_number", str(claim_payload["github_pr_number"]))
     set_github_output("head_sha", str(claim_payload["github_head_sha"]))
     set_github_output("server_profile", str(payload.get("server_profile") or "default"))
+    set_github_output("api_base_url", str(args.api_base_url.rstrip("/")))
+    set_github_output("claim_lease_token", str(claim_lease["token"]))
+    set_github_output("claim_lease_expires_at", str(payload.get("claim_lease", {}).get("expires_at") or ""))
     return 0
 
 

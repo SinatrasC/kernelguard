@@ -37,6 +37,30 @@ def _build_comment_body(claim: dict, completion: dict, workflow_run_url: str | N
     return "\n".join(lines)
 
 
+def _build_comment_body_from_public_summary(summary: dict, workflow_run_url: str | None) -> str:
+    suite = summary.get("validation_suite") or {}
+    lines = [
+        COMMENT_MARKER,
+        "## KernelGuard Blue Evaluation",
+        f"- Evaluation job: `{summary.get('evaluation_job_id')}`",
+        f"- Blue submission: `{summary.get('blue_submission_id')}`",
+        f"- Result: `{summary.get('result')}`",
+        f"- Target red submission caught: `{summary.get('target_red_submission_caught')}`",
+        (
+            "- Validation suite: "
+            f"TP `{suite.get('true_positive_passed')}`/`{suite.get('true_positive_total')}`, "
+            f"FP `{suite.get('false_positive_passed')}`/`{suite.get('false_positive_total')}`"
+        ),
+        f"- Surgicalness score: `{summary.get('surgicalness_score')}`",
+    ]
+    if workflow_run_url:
+        lines.append(f"- Workflow run: {workflow_run_url}")
+    error = summary.get("error")
+    if error:
+        lines.append(f"- Error: `{error}`")
+    return "\n".join(lines)
+
+
 def _find_existing_comment_id(
     *,
     github_api_url: str,
@@ -79,20 +103,29 @@ def _find_existing_comment_id(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Upsert a KernelGuard evaluation comment on the target PR")
-    parser.add_argument("--claim-json", required=True)
-    parser.add_argument("--completion-json", required=True)
+    parser.add_argument("--claim-json", required=False, default=None)
+    parser.add_argument("--completion-json", required=False, default=None)
+    parser.add_argument("--public-summary-json", required=False, default=None)
     parser.add_argument("--github-token", required=True)
     parser.add_argument("--github-api-url", default="https://api.github.com")
     parser.add_argument("--workflow-run-url", default=None)
     args = parser.parse_args(argv)
 
-    claim = read_json(args.claim_json)
-    completion = read_json(args.completion_json)
-    repo_full_name = claim["claim_payload"]["github_repo_full_name"]
-    pr_number = int(claim["claim_payload"]["github_pr_number"])
+    if args.public_summary_json:
+        public_summary = read_json(args.public_summary_json)
+        repo_full_name = str(public_summary["repo_full_name"])
+        pr_number = int(public_summary["pr_number"])
+        body = _build_comment_body_from_public_summary(public_summary, args.workflow_run_url)
+    else:
+        if not args.claim_json or not args.completion_json:
+            parser.error("--claim-json and --completion-json are required without --public-summary-json")
+        claim = read_json(args.claim_json)
+        completion = read_json(args.completion_json)
+        repo_full_name = claim["claim_payload"]["github_repo_full_name"]
+        pr_number = int(claim["claim_payload"]["github_pr_number"])
+        body = _build_comment_body(claim, completion, args.workflow_run_url)
     headers = github_headers(args.github_token)
 
-    body = _build_comment_body(claim, completion, args.workflow_run_url)
     comments_url = f"{args.github_api_url.rstrip('/')}/repos/{repo_full_name}/issues/{pr_number}/comments"
     existing_comment_id, error_message = _find_existing_comment_id(
         github_api_url=args.github_api_url,

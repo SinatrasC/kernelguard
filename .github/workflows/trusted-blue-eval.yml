@@ -28,10 +28,14 @@ jobs:
     outputs:
       claimed: ${{ steps.claim.outputs.claimed }}
       evaluation_job_id: ${{ steps.claim.outputs.evaluation_job_id }}
+      blue_submission_id: ${{ steps.claim.outputs.blue_submission_id }}
       repo_full_name: ${{ steps.claim.outputs.repo_full_name }}
       pr_number: ${{ steps.claim.outputs.pr_number }}
       head_sha: ${{ steps.claim.outputs.head_sha }}
       server_profile: ${{ steps.claim.outputs.server_profile }}
+      api_base_url: ${{ steps.claim.outputs.api_base_url }}
+      claim_lease_token: ${{ steps.claim.outputs.claim_lease_token }}
+      claim_lease_expires_at: ${{ steps.claim.outputs.claim_lease_expires_at }}
     env:
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
       PYTHONDONTWRITEBYTECODE: "1"
@@ -60,14 +64,6 @@ jobs:
             --internal-token "$KERNELGUARD_API_INTERNAL_TOKEN" \
             --output-json "$RUNNER_TEMP/kernelguard-claim-ref.json"
 
-      - name: Upload claim reference
-        if: steps.claim.outputs.claimed == 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: kernelguard-claim-ref-${{ steps.claim.outputs.evaluation_job_id }}
-          path: ${{ runner.temp }}/kernelguard-claim-ref.json
-          if-no-files-found: error
-
   evaluate:
     needs: claim
     if: needs.claim.outputs.claimed == 'true'
@@ -90,16 +86,12 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Download claim reference
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
-        with:
-          name: kernelguard-claim-ref-${{ needs.claim.outputs.evaluation_job_id }}
-          path: ${{ runner.temp }}/claim-ref
-
       - name: Fetch claimed evaluation payload
         run: |
           python trusted/scripts/github/fetch_blue_evaluation_claim.py \
-            --claim-ref-json "$RUNNER_TEMP/claim-ref/kernelguard-claim-ref.json" \
+            --api-base-url "${{ needs.claim.outputs.api_base_url }}" \
+            --evaluation-job-id "${{ needs.claim.outputs.evaluation_job_id }}" \
+            --lease-token "${{ needs.claim.outputs.claim_lease_token }}" \
             --output-json "$RUNNER_TEMP/kernelguard-claim.json"
 
       - name: Checkout candidate PR head
@@ -138,12 +130,33 @@ jobs:
               --output-json "$RUNNER_TEMP/kernelguard-result.json"
           fi
 
-      - name: Upload evaluator result
+      - name: Post evaluation result back to KernelGuard API
+        run: |
+          python trusted/scripts/github/complete_blue_evaluation.py \
+            --api-base-url "${{ needs.claim.outputs.api_base_url }}" \
+            --evaluation-job-id "${{ needs.claim.outputs.evaluation_job_id }}" \
+            --lease-token "${{ needs.claim.outputs.claim_lease_token }}" \
+            --result-json "$RUNNER_TEMP/kernelguard-result.json" \
+            --output-json "$RUNNER_TEMP/kernelguard-complete.json"
+
+      - name: Write public evaluation summary
+        run: |
+          python trusted/scripts/github/write_blue_public_summary.py \
+            --completion-json "$RUNNER_TEMP/kernelguard-complete.json" \
+            --evaluation-job-id "${{ needs.claim.outputs.evaluation_job_id }}" \
+            --blue-submission-id "${{ needs.claim.outputs.blue_submission_id }}" \
+            --repo-full-name "${{ needs.claim.outputs.repo_full_name }}" \
+            --pr-number "${{ needs.claim.outputs.pr_number }}" \
+            --head-sha "${{ needs.claim.outputs.head_sha }}" \
+            --output-json "$RUNNER_TEMP/kernelguard-public-summary.json"
+
+      - name: Upload public evaluation summary
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: kernelguard-result-${{ needs.claim.outputs.evaluation_job_id }}
-          path: ${{ runner.temp }}/kernelguard-result.json
+          name: kernelguard-public-summary-${{ needs.claim.outputs.evaluation_job_id }}
+          path: ${{ runner.temp }}/kernelguard-public-summary.json
           if-no-files-found: error
+          retention-days: 7
 
   report:
     needs:
@@ -152,7 +165,6 @@ jobs:
     if: always() && needs.claim.outputs.claimed == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    environment: trusted-blue-eval
     permissions:
       contents: read
       issues: write
@@ -174,45 +186,38 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Download evaluator result
+      - name: Download public evaluation summary
         continue-on-error: true
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
-          name: kernelguard-result-${{ needs.claim.outputs.evaluation_job_id }}
-          path: ${{ runner.temp }}/result
+          name: kernelguard-public-summary-${{ needs.claim.outputs.evaluation_job_id }}
+          path: ${{ runner.temp }}/public-summary
 
-      - name: Download claim reference
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
-        with:
-          name: kernelguard-claim-ref-${{ needs.claim.outputs.evaluation_job_id }}
-          path: ${{ runner.temp }}/claim-ref
-
-      - name: Synthesize evaluator failure result if needed
+      - name: Complete failed evaluation if needed
         env:
-          RESULT_JSON: ${{ runner.temp }}/result/kernelguard-result.json
+          RESULT_JSON: ${{ runner.temp }}/kernelguard-failure-result.json
+          COMPLETE_JSON: ${{ runner.temp }}/kernelguard-complete.json
+          PUBLIC_SUMMARY_JSON: ${{ runner.temp }}/public-summary/kernelguard-public-summary.json
           EVALUATE_JOB_RESULT: ${{ needs.evaluate.result }}
         run: |
-          mkdir -p "$(dirname "$RESULT_JSON")"
-          if [ ! -f "$RESULT_JSON" ]; then
-            python -c 'import json, os; result_path = os.environ["RESULT_JSON"]; evaluate_job_result = os.environ.get("EVALUATE_JOB_RESULT") or "unknown"; message = f"evaluation job did not produce a result artifact: {evaluate_job_result}"; payload = {"status": "failed", "worker_version": "trusted-blue-evaluator/1.0", "error": message, "summary": {"passed": False, "failure_reason": message}, "case_results": [], "artifacts": [{"kind": "evaluation_error", "value": message}]}; open(result_path, "w", encoding="utf-8").write(json.dumps(payload, indent=2, sort_keys=True) + "\\n")'
+          if [ ! -f "$PUBLIC_SUMMARY_JSON" ]; then
+            mkdir -p "$(dirname "$PUBLIC_SUMMARY_JSON")"
+            python -c 'import json, os; result_path = os.environ["RESULT_JSON"]; evaluate_job_result = os.environ.get("EVALUATE_JOB_RESULT") or "unknown"; message = f"evaluation job did not produce a public summary artifact: {evaluate_job_result}"; payload = {"status": "failed", "worker_version": "trusted-blue-evaluator/1.0", "error": message, "summary": {"passed": False, "failure_reason": message, "target_red_submission": {"passed": False}, "validation_suite": {"true_positive_passed": 0, "true_positive_total": 0, "false_positive_passed": 0, "false_positive_total": 0, "passed": False}, "surgicalness_score": 0.0}, "case_results": [], "artifacts": [{"kind": "evaluation_error", "value": message}]}; open(result_path, "w", encoding="utf-8").write(json.dumps(payload, indent=2, sort_keys=True) + "\\n")'
+            python trusted/scripts/github/complete_blue_evaluation.py \
+              --api-base-url "${{ needs.claim.outputs.api_base_url }}" \
+              --evaluation-job-id "${{ needs.claim.outputs.evaluation_job_id }}" \
+              --lease-token "${{ needs.claim.outputs.claim_lease_token }}" \
+              --result-json "$RESULT_JSON" \
+              --output-json "$COMPLETE_JSON"
+            python trusted/scripts/github/write_blue_public_summary.py \
+              --completion-json "$COMPLETE_JSON" \
+              --evaluation-job-id "${{ needs.claim.outputs.evaluation_job_id }}" \
+              --blue-submission-id "${{ needs.claim.outputs.blue_submission_id }}" \
+              --repo-full-name "${{ needs.claim.outputs.repo_full_name }}" \
+              --pr-number "${{ needs.claim.outputs.pr_number }}" \
+              --head-sha "${{ needs.claim.outputs.head_sha }}" \
+              --output-json "$PUBLIC_SUMMARY_JSON"
           fi
-
-      - name: Fetch claimed evaluation payload
-        run: |
-          python trusted/scripts/github/fetch_blue_evaluation_claim.py \
-            --claim-ref-json "$RUNNER_TEMP/claim-ref/kernelguard-claim-ref.json" \
-            --output-json "$RUNNER_TEMP/kernelguard-claim.json"
-
-      - name: Post evaluation result back to KernelGuard API
-        id: complete
-        env:
-          KERNELGUARD_API_BASE_URL: ${{ secrets.KERNELGUARD_API_BASE_URL }}
-        run: |
-          python trusted/scripts/github/complete_blue_evaluation.py \
-            --api-base-url "$KERNELGUARD_API_BASE_URL" \
-            --claim-ref-json "$RUNNER_TEMP/claim-ref/kernelguard-claim-ref.json" \
-            --result-json "$RUNNER_TEMP/result/kernelguard-result.json" \
-            --output-json "$RUNNER_TEMP/kernelguard-complete.json"
 
       - name: Update PR comment with evaluation summary
         if: inputs.publish_pr_comment
@@ -221,14 +226,6 @@ jobs:
           WORKFLOW_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           python trusted/scripts/github/post_blue_evaluation_comment.py \
-            --claim-json "$RUNNER_TEMP/kernelguard-claim.json" \
-            --completion-json "$RUNNER_TEMP/kernelguard-complete.json" \
+            --public-summary-json "$RUNNER_TEMP/public-summary/kernelguard-public-summary.json" \
             --github-token "$GITHUB_TOKEN" \
             --workflow-run-url "$WORKFLOW_RUN_URL"
-
-      - name: Upload completion payload
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: kernelguard-complete-${{ needs.claim.outputs.evaluation_job_id }}
-          path: ${{ runner.temp }}/kernelguard-complete.json
-          if-no-files-found: error

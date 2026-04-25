@@ -54,6 +54,7 @@ jobs:
           name: blue-pr-gate-${{ github.event.pull_request.number }}
           path: ${{ runner.temp }}/blue-pr-gate.json
           if-no-files-found: error
+          retention-days: 7
 
       - name: Reject ineligible blue PR
         if: steps.gate.outputs.is_blue_submission == 'true' && steps.gate.outputs.eligible_for_trusted_eval != 'true'
@@ -87,6 +88,7 @@ jobs:
           name: blue-pr-static-security-${{ github.event.pull_request.number }}
           path: ${{ runner.temp }}/blue-pr-static-security.json
           if-no-files-found: error
+          retention-days: 7
 
       - name: Reject blue PR with possible RCE risk
         if: steps.gate.outputs.eligible_for_trusted_eval == 'true' && steps.static.outcome != 'success'
