@@ -32,6 +32,8 @@ from typing import Any, Optional
 CONFIG_VERSION = 1
 DEFAULT_PROFILE_NAME = "default"
 
+# Blue PR workflow e2e smoke marker: 2026-04-25 sanitized artifacts retry.
+
 # ---------------------------------------------------------------------------
 # Compiled regex patterns (module-level for performance)
 # ---------------------------------------------------------------------------
