@@ -1303,8 +1303,8 @@ def detect_unsync_multistream(code: str | SubmissionFacts) -> list[dict]:
                 "high",
                 f"Python: {py_stream_creates} stream creates, no sync/wait primitives",
             ))
-        elif py_sync_calls * 2 < py_stream_creates:
-            # Significantly under-synchronized: fewer than half as many syncs as streams
+        elif py_sync_calls < py_stream_creates:
+            # Under-synchronized: fewer sync/wait calls than stream creates
             candidates.append((
                 "medium",
                 f"Python: {py_stream_creates} stream creates, only {py_sync_calls} sync/wait calls",
