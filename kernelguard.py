@@ -3524,7 +3524,7 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
         (), "downgrade",
     ),
     "UNSYNC_MULTISTREAM": RulePolicy(
-        "UNSYNC_MULTISTREAM", "timing_manipulation", "telemetry", TELEMETRY_ONLY, (),
+        "UNSYNC_MULTISTREAM", "timing_manipulation", "support", SUSPICIOUS_ONLY, (),
         (), "downgrade",
     ),
     "CUDA_EVENT_DISABLE_TIMING": RulePolicy(
