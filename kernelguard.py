@@ -1321,7 +1321,8 @@ def detect_unsync_multistream(code: str | SubmissionFacts) -> list[dict]:
                 "high",
                 f"C++: {cpp_stream_creates} getStreamFromPool calls, no sync/wait primitives",
             ))
-        elif cpp_sync_calls * 2 < cpp_stream_creates:
+        elif cpp_sync_calls < cpp_stream_creates:
+            # Under-synchronized: fewer sync/wait calls than stream creates (C++)
             candidates.append((
                 "medium",
                 f"C++: {cpp_stream_creates} getStreamFromPool calls, only {cpp_sync_calls} sync/wait calls",
