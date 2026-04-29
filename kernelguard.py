@@ -1279,6 +1279,7 @@ def detect_hardcoded_shapes(code: str | SubmissionFacts) -> list[dict]:
 
 
 def detect_unsync_multistream(code: str | SubmissionFacts) -> list[dict]:
+    # KernelGuard E2E auto-trigger smoke test 20260429T1230Z (no behavior change)
     """Pattern 14: Unsynchronized multi-stream dispatch to exploit timing.
 
     Checks both Python code AND C++ inline code, since getStreamFromPool
