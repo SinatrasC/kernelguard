@@ -232,7 +232,10 @@ jobs:
           fi
 
       - name: Update PR comment with evaluation summary
-        if: inputs.publish_pr_comment
+        # Post the comment by default. inputs.* only resolves for
+        # workflow_dispatch, so for workflow_run we want the comment;
+        # for explicit dispatch we honor the publish_pr_comment toggle.
+        if: github.event_name != 'workflow_dispatch' || inputs.publish_pr_comment
         env:
           GITHUB_TOKEN: ${{ github.token }}
           WORKFLOW_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
