@@ -12,6 +12,12 @@ on:
         required: false
         default: true
         type: boolean
+  # Auto-fire after blue-pr-sync registers a new patch in the API queue.
+  # The claim step returns HTTP 204 when the queue is empty, so spurious
+  # triggers are no-ops.
+  workflow_run:
+    workflows: ["blue-pr-sync"]
+    types: [completed]
 
 permissions:
   contents: read
@@ -25,6 +31,10 @@ concurrency:
 
 jobs:
   claim:
+    # Skip when triggered by a failed blue-pr-sync (rejected gate, static
+    # security failure, etc.). Manual workflow_dispatch always passes this
+    # check because workflow_run context is empty in that case.
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment: trusted-blue-eval
