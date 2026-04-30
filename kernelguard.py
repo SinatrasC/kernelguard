@@ -2161,7 +2161,11 @@ def detect_pointer_replay(code: str | SubmissionFacts) -> list[dict]:
 
 
 def detect_last_call_replay(code: str | SubmissionFacts) -> list[dict]:
-    """Pattern: saved-output replay when prior call signature matches current state."""
+    """Pattern: saved-output replay when prior call signature matches current state.
+
+    Covers identity-keyed (``data is _LAST``), pointer/version-signature
+    (``data.data_ptr() == _LAST_PTR``), and tuple-of-input replay shapes.
+    """
     facts = ensure_submission_facts(code)
     tree = facts.ast_tree
     if tree is None:
