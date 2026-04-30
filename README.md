@@ -14,6 +14,10 @@ The core module is `kernelguard.py`, which can:
 
 - `kernelguard.py`
   Main detector and audit tool.
+- `kernelguard_api.py`
+  HTTP API for the competition (kernels, validation suites, red/blue submissions).
+- `kernelguard_mcp.py`
+  MCP server exposing `analyze_code` to MCP clients.
 
 ## Install
 
