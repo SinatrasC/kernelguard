@@ -2459,6 +2459,69 @@ def detect_last_call_replay(code: str | SubmissionFacts) -> list[dict]:
                 ),
             }]
 
+        # Quaternary pass: replay state stored as attributes on the entrypoint
+        # function object. This is semantically the same as a module-level
+        # flag/output replay, but it avoids `global` declarations and captured
+        # dict/object slots:
+        #     if getattr(custom_kernel, "ready", False):
+        #         return custom_kernel.out
+        #     custom_kernel.ready = True
+        #     custom_kernel.out = result
+        param_names = {a.arg for a in node.args.args}
+        param_names.update(a.arg for a in getattr(node.args, "posonlyargs", []) or [])
+        param_names.update(a.arg for a in getattr(node.args, "kwonlyargs", []) or [])
+
+        entrypoint_attr_assigns: set[str] = set()
+        for child in ast.walk(node):
+            if not isinstance(child, ast.Assign):
+                continue
+            for target in child.targets:
+                if not (
+                    isinstance(target, ast.Attribute)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id == node.name
+                ):
+                    continue
+                entrypoint_attr_assigns.add(target.attr)
+
+        if entrypoint_attr_assigns:
+            for child in ast.walk(node):
+                if not isinstance(child, ast.If):
+                    continue
+                if _body_has_calls(child.body):
+                    continue
+
+                test_names = _expr_names(child.test)
+                if node.name not in test_names:
+                    continue
+                if test_names & param_names:
+                    continue
+
+                returns_saved_attr = False
+                for stmt in child.body:
+                    if not isinstance(stmt, ast.Return) or stmt.value is None:
+                        continue
+                    if not (
+                        isinstance(stmt.value, ast.Attribute)
+                        and isinstance(stmt.value.value, ast.Name)
+                        and stmt.value.value.id == node.name
+                        and stmt.value.attr in entrypoint_attr_assigns
+                    ):
+                        continue
+                    returns_saved_attr = True
+                    break
+                if not returns_saved_attr:
+                    continue
+
+                return [{
+                    "pattern": "LAST_CALL_REPLAY",
+                    "severity": "critical",
+                    "evidence": (
+                        f"{entrypoint_name} returns saved output gated only by "
+                        "state stored on the entrypoint function object"
+                    ),
+                }]
+
     return []
 
 
