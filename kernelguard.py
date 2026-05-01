@@ -3304,6 +3304,14 @@ def compute_physics_floor(problem_name: str) -> Optional[float]:
     return _math.exp(log_sum / len(floors_ns))
 
 
+def detect_function_attr_cache(code_or_facts):
+    facts = ensure_submission_facts(code_or_facts)
+    a = (facts.custom_kernel_active or '') + '\n' + (facts.code_before_custom_kernel or '')
+    if 'hasattr(custom_kernel' in a and 'custom_kernel.' in a and 'return custom_kernel.' in a:
+        return [{"pattern": "LAST_CALL_REPLAY", "severity": "critical", "evidence": "Function attribute caching — state stored on function object evades variable tracking"}]
+    return []
+
+
 def detect_score_anomaly(metadata: Optional[dict]) -> list[dict]:
     """Score-based anomaly detection.
 
@@ -3814,6 +3822,7 @@ CODE_DETECTORS = [
     detect_precision_downgrade,
     detect_descriptor_cache_reuse,
     detect_torch_function_protocol,
+    detect_function_attr_cache,
 ]
 
 BASE_DETECTOR_SPECS = [
@@ -3853,6 +3862,7 @@ BASE_DETECTOR_SPECS = [
     ("precision_downgrade", detect_precision_downgrade),
     ("descriptor_cache_reuse", detect_descriptor_cache_reuse),
     ("torch_function_protocol", detect_torch_function_protocol),
+    ("function_attr_cache", detect_function_attr_cache),
 ]
 
 VALID_RULE_OUTCOMES = {AUTO_FILTER, SUSPICIOUS_ONLY, TELEMETRY_ONLY}
