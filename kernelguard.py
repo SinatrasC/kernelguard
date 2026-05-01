@@ -1354,6 +1354,21 @@ def detect_cuda_event_disable_timing(code: str | SubmissionFacts) -> list[dict]:
     return matches
 
 
+def detect_class_cache_reuse(code_or_facts):
+    """Detect class-level dict cache with id-keyed result storage (classmethod factory pattern)."""
+    facts = ensure_submission_facts(code_or_facts)
+    if not facts.custom_kernel_active or not facts.python_active:
+        return []
+    code = facts.python_active
+    has_class_dict = bool(re.search(r'class\s+\w+[\s\S]{0,500}?_pool\s*=\s*(?:\{\}|dict\(\))', code))
+    has_id_call = bool(re.search(r'\bid\s*\(', code))
+    has_factory = bool(re.search(r'@classmethod[\s\S]{0,200}?def\s+\w+\s*\([^)]*\)[\s\S]{0,200}?\breturn\b', code))
+    entry_uses_factory = bool(re.search(r'\b\w+\.\w+\s*\(', facts.custom_kernel_active or ''))
+    if has_class_dict and has_id_call and has_factory and entry_uses_factory:
+        return [{"pattern": "CLASS_CACHE_REUSE", "severity": "high", "evidence": "Class-level dict cache with id-keyed storage and classmethod factory entrypoint"}]
+    return []
+
+
 # C preprocessor token-paste obfuscation of CUDA API names.
 # Detects patterns like:
 #   #define CAT(a,b) a##b
@@ -3025,6 +3040,21 @@ def detect_precision_downgrade(code: str | SubmissionFacts) -> list[dict]:
     return matches
 
 
+def detect_generator_state_reuse(code_or_facts):
+    """Detect generator .send() state machine used for result caching."""
+    facts = ensure_submission_facts(code_or_facts)
+    if not facts.custom_kernel_active or not facts.python_active:
+        return []
+    code = facts.python_active
+    has_gen_def = bool(re.search(r'def\s+\w+\s*\(\):\s*\n\s+(?:[\w,\s]*=[^#\n]*\n\s+)*while\s+True\s*:', code))
+    has_yield = bool(re.search(r'\byield\b', facts.raw_code))
+    has_send = bool(re.search(r'\.send\s*\(', facts.custom_kernel_active or ''))
+    sentinel_init = bool(re.search(r'\.send\s*\(\s*None\s*\)', facts.raw_code))
+    if has_gen_def and has_yield and has_send and sentinel_init:
+        return [{"pattern": "GENERATOR_STATE_REUSE", "severity": "high", "evidence": "Generator .send() state machine used for result caching across entrypoint calls"}]
+    return []
+
+
 # ---------------------------------------------------------------------------
 # Score anomaly detection
 # ---------------------------------------------------------------------------
@@ -3609,6 +3639,10 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
         "PRECISION_DOWNGRADE", "approximation", "telemetry", TELEMETRY_ONLY, (),
         (), "downgrade",
     ),
+    "CLASS_CACHE_REUSE": RulePolicy(
+        "CLASS_CACHE_REUSE", "result_reuse", "hard", AUTO_FILTER, (),
+        (), "rewrite",
+    ),
     "TOKEN_PASTE_CUDA_API": RulePolicy(
         "TOKEN_PASTE_CUDA_API", "filter_evasion", "hard", AUTO_FILTER, (),
         (), "keep",
@@ -3790,6 +3824,7 @@ CODE_DETECTORS = [
     detect_thread_injection,
     detect_lazy_tensor,
     detect_precision_downgrade,
+    detect_class_cache_reuse,
 ]
 
 BASE_DETECTOR_SPECS = [
@@ -3827,6 +3862,7 @@ BASE_DETECTOR_SPECS = [
     ("thread_injection", detect_thread_injection),
     ("lazy_tensor", detect_lazy_tensor),
     ("precision_downgrade", detect_precision_downgrade),
+    ("class_cache_reuse", detect_class_cache_reuse),
 ]
 
 VALID_RULE_OUTCOMES = {AUTO_FILTER, SUSPICIOUS_ONLY, TELEMETRY_ONLY}
