@@ -1605,6 +1605,22 @@ def detect_module_mutation(code: str | SubmissionFacts) -> list[dict]:
                             f"(bytecode replacement on '{mod}')"
                         ),
                     })
+    # Check for object.__setattr__(module, attr, value) pattern
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if isinstance(node.func, ast.Attribute) and node.func.attr == "__setattr__":
+            if isinstance(node.func.value, ast.Name) and node.func.value.id == "object":
+                if len(node.args) >= 2 and isinstance(node.args[0], ast.Name) and isinstance(node.args[1], ast.Constant):
+                    mod_name = node.args[0].id
+                    attr_name = str(node.args[1].value) if isinstance(node.args[1].value, str) else ""
+                    if mod_name in aliases:
+                        sev = "critical" if attr_name in TRUSTED_FUNCTIONS else "high"
+                        matches.append({
+                            "pattern": "MODULE_MUTATION",
+                            "severity": sev,
+                            "evidence": f"object.__setattr__({mod_name}, '{attr_name}', ...) — evades direct assignment check",
+                        })
     return matches
 
 
@@ -3405,6 +3421,22 @@ def detect_breakpoint_exec(code: str | SubmissionFacts) -> list[dict]:
     return matches
 
 
+RE_LRU_CACHE = re.compile(r'@functools\.(?:lru_cache|cache)\b')
+RE_CACHE_DECORATOR = re.compile(r'@\w*(?:cache|memoize)\b', re.IGNORECASE)
+
+def detect_functools_cache_replay(code: str | SubmissionFacts) -> list[dict]:
+    facts = ensure_submission_facts(code)
+    raw = facts.raw_code
+    if not RE_LRU_CACHE.search(raw) and not RE_CACHE_DECORATOR.search(raw):
+        return []
+    entrypoint_name = entrypoint_label(facts.entrypoint_name)
+    return [{
+        "pattern": "FUNCTOOLS_CACHE_REPLAY",
+        "severity": "high",
+        "evidence": f"{entrypoint_name} uses functools.lru_cache/cache decorator — transparent result caching evades all replay detectors",
+    }]
+
+
 # ---------------------------------------------------------------------------
 # Score anomaly detection
 # ---------------------------------------------------------------------------
@@ -4045,6 +4077,10 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
         "BREAKPOINT_EXEC", "dynamic_execution", "hard", AUTO_FILTER, (),
         (), "keep",
     ),
+    "FUNCTOOLS_CACHE_REPLAY": RulePolicy(
+        "FUNCTOOLS_CACHE_REPLAY", "result_reuse", "hard", AUTO_FILTER, (),
+        (), "keep",
+    ),
     "DUPLICATE_SPAM": RulePolicy(
         "DUPLICATE_SPAM", "administrative", "support", SUSPICIOUS_ONLY, (),
         (), "downgrade",
@@ -4190,6 +4226,7 @@ CODE_DETECTORS = [
     detect_thread_injection,
     detect_lazy_tensor,
     detect_precision_downgrade,
+    detect_functools_cache_replay,
     detect_types_code_construction,
     detect_operator_contains_replay,
     detect_breakpoint_exec,
@@ -4234,6 +4271,7 @@ BASE_DETECTOR_SPECS = [
     ("thread_injection", detect_thread_injection),
     ("lazy_tensor", detect_lazy_tensor),
     ("precision_downgrade", detect_precision_downgrade),
+    ("functools_cache_replay", detect_functools_cache_replay),
     ("types_code_construction", detect_types_code_construction),
     ("operator_contains_replay", detect_operator_contains_replay),
     ("dict_setitem_globals", detect_dict_setitem_globals),
@@ -5118,7 +5156,7 @@ AUDIT_RULE_ORDER = [
     "HARDCODED_SHAPES", "TRIVIAL_PROBE",
     "OBFUSCATED_EXEC", "DYNAMIC_EXECUTION", "MODULE_RELOAD", "THREAD_INJECTION", "LAZY_TENSOR",
     "TOKEN_PASTE_CUDA_API", "SEQUENCE_BATCH_GRAPH", "PARTIAL_GRAPH_KEY", "RUNTIME_PACKAGE_INSTALL",
-    "PRECISION_DOWNGRADE", "HASH_CACHE_REPLAY", "EQ_NONE_SENTINEL_REPLAY", "GETATTR_DATAPTR_REPLAY", "NOT_EQ_REPLAY", "SCORE_PHYSICS_FLOOR", "SCORE_IMPOSSIBLE", "SCORE_SUSPECT_FLOOR",
+    "PRECISION_DOWNGRADE", "FUNCTOOLS_CACHE_REPLAY", "HASH_CACHE_REPLAY", "EQ_NONE_SENTINEL_REPLAY", "GETATTR_DATAPTR_REPLAY", "NOT_EQ_REPLAY", "SCORE_PHYSICS_FLOOR", "SCORE_IMPOSSIBLE", "SCORE_SUSPECT_FLOOR",
     "SCORE_BROKEN", "SCORE_EXTREME_SPEEDUP", "DUPLICATE_SPAM", "NEAR_CLONE_SPAM",
 ]
 
