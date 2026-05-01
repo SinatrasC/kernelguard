@@ -3025,6 +3025,13 @@ def detect_precision_downgrade(code: str | SubmissionFacts) -> list[dict]:
     return matches
 
 
+RE_CODECS_OBFUS = re.compile(r'(?:codecs|binascii|base64|quopri|uu)\s*\.(?:encode|decode|b2a|a2b|hexlify|unhexlify)\s*\(')
+def detect_codecs_obfuscation(code: str | SubmissionFacts) -> list[dict]:
+    facts = ensure_submission_facts(code)
+    if not RE_CODECS_OBFUS.search(facts.raw_code): return []
+    return [{"pattern": "OBFUSCATED_EXEC", "severity": "high", "evidence": "codecs/binascii/base64 encoding — payload obfuscation"}]
+
+
 # ---------------------------------------------------------------------------
 # Score anomaly detection
 # ---------------------------------------------------------------------------
@@ -3790,6 +3797,7 @@ CODE_DETECTORS = [
     detect_thread_injection,
     detect_lazy_tensor,
     detect_precision_downgrade,
+    detect_codecs_obfuscation,
 ]
 
 BASE_DETECTOR_SPECS = [
@@ -3827,6 +3835,7 @@ BASE_DETECTOR_SPECS = [
     ("thread_injection", detect_thread_injection),
     ("lazy_tensor", detect_lazy_tensor),
     ("precision_downgrade", detect_precision_downgrade),
+    ("codecs_obfuscation", detect_codecs_obfuscation),
 ]
 
 VALID_RULE_OUTCOMES = {AUTO_FILTER, SUSPICIOUS_ONLY, TELEMETRY_ONLY}
