@@ -1699,8 +1699,8 @@ def detect_introspection_exploit(code: str | SubmissionFacts) -> list[dict]:
                     seen_patterns.add(key)
                     saw_frame_access = True
 
-        # f_back, f_globals, f_locals attribute access
-        if isinstance(node, ast.Attribute) and node.attr in ("f_back", "f_globals", "f_locals"):
+        # f_back, f_globals, f_locals, gi_frame, gi_code, tb_frame, tb_next, f_builtins attribute access
+        if isinstance(node, ast.Attribute) and node.attr in ("f_back", "f_globals", "f_locals", "gi_frame", "gi_code", "tb_frame", "tb_next", "f_builtins"):
             key = f".{node.attr}"
             if key not in seen_patterns:
                 seen_patterns.add(key)
@@ -3113,11 +3113,17 @@ def detect_getattr_data_ptr_replay(code: str | SubmissionFacts) -> list[dict]:
         if not is_entrypoint_name(node.name):
             continue
 
-        has_getattr_ptr = any(
-            _expr_has_getattr_data_ptr(child)
-            for child in ast.walk(node)
-        )
-        if not has_getattr_ptr:
+        # Collect variable names assigned from getattr(data, 'data_ptr')()
+        getattr_ptr_aliases: set[str] = set()
+        for child in ast.walk(node):
+            if not isinstance(child, ast.Assign):
+                continue
+            if len(child.targets) != 1 or not isinstance(child.targets[0], ast.Name):
+                continue
+            if _expr_has_getattr_data_ptr(child.value):
+                getattr_ptr_aliases.add(child.targets[0].id)
+
+        if not getattr_ptr_aliases:
             continue
 
         for child in ast.walk(node):
@@ -3129,7 +3135,7 @@ def detect_getattr_data_ptr_replay(code: str | SubmissionFacts) -> list[dict]:
                 continue
 
             has_is_none = False
-            has_getattr_compare = False
+            has_ptr_compare = False
 
             for operand in child.test.values:
                 if isinstance(operand, ast.Compare):
@@ -3143,13 +3149,11 @@ def detect_getattr_data_ptr_replay(code: str | SubmissionFacts) -> list[dict]:
                                     has_is_none = True
                             break
 
-                if isinstance(operand, ast.Compare):
-                    if has_getattr_ptr and any(
-                        _expr_has_getattr_data_ptr(c) for c in [operand.left] + operand.comparators
-                    ):
-                        has_getattr_compare = True
+                    names_in_compare = _expr_names(operand)
+                    if names_in_compare & getattr_ptr_aliases:
+                        has_ptr_compare = True
 
-            if not (has_is_none and has_getattr_compare):
+            if not (has_is_none and has_ptr_compare):
                 continue
 
             returned = {
@@ -3168,6 +3172,84 @@ def detect_getattr_data_ptr_replay(code: str | SubmissionFacts) -> list[dict]:
                 "evidence": (
                     f"{entrypoint_name} uses getattr(data, 'data_ptr')() "
                     f"to evade AST data_ptr tracking"
+                ),
+            }]
+    return []
+
+
+def detect_eq_none_sentinel_replay(code: str | SubmissionFacts) -> list[dict]:
+    """Pattern: == None sentinel guard + data_ptr compare output replay.
+
+    Like IS_NONE_SENTINEL_REPLAY but catches == None (Eq/NotEq None)
+    instead of is None (Is/IsNot None).
+    """
+    facts = ensure_submission_facts(code)
+    tree = facts.ast_tree
+    if tree is None:
+        return []
+    entrypoint_name = entrypoint_label(facts.entrypoint_name)
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not is_entrypoint_name(node.name):
+            continue
+
+        for child in ast.walk(node):
+            if not isinstance(child, ast.If):
+                continue
+
+            if not isinstance(child.test, ast.Compare):
+                continue
+            if not any(isinstance(op, (ast.Eq, ast.NotEq)) for op in child.test.ops):
+                continue
+            if _body_has_calls(child.body):
+                continue
+
+            left = child.test.left
+            has_none_eq = False
+            for right in child.test.comparators:
+                if isinstance(left, ast.Constant) and left.value is None and isinstance(right, ast.Name):
+                    has_none_eq = True
+                elif isinstance(right, ast.Constant) and right.value is None and isinstance(left, ast.Name):
+                    has_none_eq = True
+
+            if not has_none_eq:
+                continue
+
+            if not child.orelse or not isinstance(child.orelse[0], ast.If):
+                continue
+            elif_node = child.orelse[0]
+
+            if not isinstance(elif_node.test, ast.Compare):
+                continue
+            if not any(isinstance(op, ast.Eq) for op in elif_node.test.ops):
+                continue
+
+            has_data_ptr = (
+                _expr_has_data_ptr_fast(elif_node.test.left, facts._nodes_with_data_ptr)
+                and elif_node.test.comparators
+                and _expr_has_data_ptr_fast(elif_node.test.comparators[0], facts._nodes_with_data_ptr)
+            )
+            if not has_data_ptr:
+                continue
+
+            returned = {
+                _ast_root_name(stmt.value)
+                for stmt in elif_node.body
+                if isinstance(stmt, ast.Return) and stmt.value is not None
+            } - {None}
+            if not returned:
+                continue
+            if not any(r in facts._none_inited for r in returned):
+                continue
+
+            return [{
+                "pattern": "EQ_NONE_SENTINEL_REPLAY",
+                "severity": "critical",
+                "evidence": (
+                    f"{entrypoint_name} returns saved output on == None sentinel "
+                    f"guard + data_ptr comparison"
                 ),
             }]
     return []
@@ -3801,6 +3883,10 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
         "NOT_EQ_REPLAY", "result_reuse", "hard", AUTO_FILTER, (),
         (), "keep",
     ),
+    "EQ_NONE_SENTINEL_REPLAY": RulePolicy(
+        "EQ_NONE_SENTINEL_REPLAY", "result_reuse", "hard", AUTO_FILTER, (),
+        (), "keep",
+    ),
     "DUPLICATE_SPAM": RulePolicy(
         "DUPLICATE_SPAM", "administrative", "support", SUSPICIOUS_ONLY, (),
         (), "downgrade",
@@ -3947,6 +4033,7 @@ CODE_DETECTORS = [
     detect_lazy_tensor,
     detect_precision_downgrade,
     detect_hash_cache_replay,
+    detect_eq_none_sentinel_replay,
 ]
 
 BASE_DETECTOR_SPECS = [
@@ -3985,6 +4072,7 @@ BASE_DETECTOR_SPECS = [
     ("lazy_tensor", detect_lazy_tensor),
     ("precision_downgrade", detect_precision_downgrade),
     ("hash_cache_replay", detect_hash_cache_replay),
+    ("eq_none_sentinel_replay", detect_eq_none_sentinel_replay),
 ]
 
 VALID_RULE_OUTCOMES = {AUTO_FILTER, SUSPICIOUS_ONLY, TELEMETRY_ONLY}
@@ -4861,7 +4949,7 @@ AUDIT_RULE_ORDER = [
     "HARDCODED_SHAPES", "TRIVIAL_PROBE",
     "OBFUSCATED_EXEC", "DYNAMIC_EXECUTION", "MODULE_RELOAD", "THREAD_INJECTION", "LAZY_TENSOR",
     "TOKEN_PASTE_CUDA_API", "SEQUENCE_BATCH_GRAPH", "PARTIAL_GRAPH_KEY", "RUNTIME_PACKAGE_INSTALL",
-    "PRECISION_DOWNGRADE", "HASH_CACHE_REPLAY", "SCORE_PHYSICS_FLOOR", "SCORE_IMPOSSIBLE", "SCORE_SUSPECT_FLOOR",
+    "PRECISION_DOWNGRADE", "HASH_CACHE_REPLAY", "EQ_NONE_SENTINEL_REPLAY", "SCORE_PHYSICS_FLOOR", "SCORE_IMPOSSIBLE", "SCORE_SUSPECT_FLOOR",
     "SCORE_BROKEN", "SCORE_EXTREME_SPEEDUP", "DUPLICATE_SPAM", "NEAR_CLONE_SPAM",
 ]
 
