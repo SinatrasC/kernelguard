@@ -3035,40 +3035,39 @@ def detect_global_sentinel_reuse(code_or_facts):
 def detect_closure_state_reuse(code_or_facts):
     facts = ensure_submission_facts(code_or_facts)
     if not facts.custom_kernel_active: return []
-    import re as _re
-    for m in _re.finditer(r'\bnonlocal\s+(\w+)', facts.custom_kernel_active):
+    for m in re.finditer(r'\bnonlocal\s+(\w+)', facts.custom_kernel_active):
         var = m.group(1)
-        if not _re.search(r'\bif\s+\b' + _re.escape(var) + r'\b\s+is\s+None\b', facts.custom_kernel_active): continue
-        if not _re.search(r'\breturn\s+\b' + _re.escape(var) + r'\b', facts.custom_kernel_active): continue
+        if not re.search(r'\bif\s+\b' + re.escape(var) + r'\b\s+is\s+None\b', facts.custom_kernel_active): continue
+        if not re.search(r'\breturn\s+\b' + re.escape(var) + r'\b', facts.custom_kernel_active): continue
         return [{"pattern": "CLOSURE_STATE_REUSE", "severity": "high", "evidence": f"Nonlocal {var} used as sentinel cache"}]
     return []
 def detect_class_cache_reuse(code_or_facts):
     facts = ensure_submission_facts(code_or_facts)
     if not facts.custom_kernel_active or not facts.python_active: return []
-    p1 = bool(__import__('re').search(r'class\s+\w+[\s\S]{0,500}?_pool\s*=\s*(?:\{\}|dict\(\))', facts.python_active))
-    p2 = bool(__import__('re').search(r'\bid\s*\(', facts.python_active))
-    p3 = bool(__import__('re').search(r'@classmethod[\s\S]{0,200}?def\s+\w+\s*\([^)]*\)[\s\S]{0,200}?\breturn\b', facts.python_active))
+    p1 = bool(re.search(r'class\s+\w+[\s\S]{0,500}?_pool\s*=\s*(?:\{\}|dict\(\))', facts.python_active))
+    p2 = bool(re.search(r'\bid\s*\(', facts.python_active))
+    p3 = bool(re.search(r'@classmethod[\s\S]{0,200}?def\s+\w+\s*\([^)]*\)[\s\S]{0,200}?\breturn\b', facts.python_active))
     if p1 and p2 and p3: return [{"pattern": "CLASS_CACHE_REUSE", "severity": "high", "evidence": "Class-level dict cache"}]
     return []
 def detect_generator_state_reuse(code_or_facts):
     facts = ensure_submission_facts(code_or_facts)
     if not facts.custom_kernel_active or not facts.python_active: return []
-    g1 = bool(__import__('re').search(r'def\s+\w+\s*\(\s*\)\s*:\s*\n\s+(?:[\w,\s]*=[^#\n]*\n\s+)*while\s+True\s*:', facts.python_active))
-    g2 = bool(__import__('re').search(r'\byield\b', facts.raw_code))
-    g3 = bool(__import__('re').search(r'\.send\s*\(', facts.custom_kernel_active))
-    g4 = bool(__import__('re').search(r'\.send\s*\(\s*None\s*\)', facts.raw_code))
+    g1 = bool(re.search(r'def\s+\w+\s*\(\s*\)\s*:\s*\n\s+(?:[\w,\s]*=[^#\n]*\n\s+)*while\s+True\s*:', facts.python_active))
+    g2 = bool(re.search(r'\byield\b', facts.raw_code))
+    g3 = bool(re.search(r'\.send\s*\(', facts.custom_kernel_active))
+    g4 = bool(re.search(r'\.send\s*\(\s*None\s*\)', facts.raw_code))
     if g1 and g2 and g3 and g4: return [{"pattern": "GENERATOR_STATE_REUSE", "severity": "high", "evidence": "Generator send()"}]
     return []
 def detect_descriptor_cache_reuse(code_or_facts):
     facts = ensure_submission_facts(code_or_facts)
     if not facts.python_active: return []
-    if bool(__import__('re').search(r'def\s+__get__\s*\([^)]*\)', facts.raw_code)) and bool(__import__('re').search(r'\bglobal\s+\w+', facts.custom_kernel_active or '')):
+    if bool(re.search(r'def\s+__get__\s*\([^)]*\)', facts.raw_code)) and bool(re.search(r'\bglobal\s+\w+', facts.custom_kernel_active or '')):
         return [{"pattern": "DESCRIPTOR_CACHE_REUSE", "severity": "high", "evidence": "Descriptor __get__"}]
     return []
 def detect_metaclass_call_intercept(code_or_facts):
     facts = ensure_submission_facts(code_or_facts)
     if not facts.python_active: return []
-    if bool(__import__('re').search(r'class\s+\w+\(type\)[\s\S]{0,500}?def\s+__call__\s*\(', facts.raw_code)) and bool(__import__('re').search(r'metaclass=', facts.raw_code)):
+    if bool(re.search(r'class\s+\w+\(type\)[\s\S]{0,500}?def\s+__call__\s*\(', facts.raw_code)) and bool(re.search(r'metaclass=', facts.raw_code)):
         return [{"pattern": "METACALL_INTERCEPT", "severity": "high", "evidence": "Metaclass __call__"}]
     return []
 def detect_function_attr_cache(code_or_facts):
@@ -3081,13 +3080,13 @@ def detect_function_attr_cache(code_or_facts):
 def detect_dict_missing_cache(code_or_facts):
     facts = ensure_submission_facts(code_or_facts)
     if not facts.python_active: return []
-    if bool(__import__('re').search(r'def\s+__missing__', facts.raw_code)) and bool(__import__('re').search(r'\bid\s*\(', facts.raw_code)) and bool(__import__('re').search(r'class\s+\w+\(dict\)', facts.raw_code)):
+    if bool(re.search(r'def\s+__missing__', facts.raw_code)) and bool(re.search(r'\bid\s*\(', facts.raw_code)) and bool(re.search(r'class\s+\w+\(dict\)', facts.raw_code)):
         return [{"pattern": "DICT_MISSING_CACHE", "severity": "high", "evidence": "Dict __missing__"}]
     return []
 def detect_partial_entrypoint(code_or_facts):
     facts = ensure_submission_facts(code_or_facts)
     if not facts.python_active: return []
-    if bool(__import__('re').search(r'custom_kernel\s*=\s*functools\.partial', facts.python_active)):
+    if bool(re.search(r'custom_kernel\s*=\s*functools\.partial', facts.python_active)):
         return [{"pattern": "PARTIAL_ENTRYPOINT", "severity": "high", "evidence": "functools.partial entrypoint"}]
     return []
 # Score anomaly detection
