@@ -180,6 +180,9 @@ RE_CUDA_EVENT_DISABLE_TIMING = re.compile(r'cudaEventDisableTiming|disable_timin
 RE_CPP_MARKERS = re.compile(r'#include|__global__|__device__|__host__|extern\s+"C"|asm\s+volatile')
 RE_TRIPLE_QUOTED = re.compile(r'(?:r)?(?:"""|\'\'\')(.*?)(?:"""|\'\'\')', re.DOTALL)
 
+# Pattern 16: Generator-based replay attack
+RE_GEN_REPLAY = re.compile(r'def\s+\w+\s*\([^)]*\)\s*:[^}]*yield[^}]*next\s*\([^)]*\)\s*[^=]*=\s*\w+\.send')
+
 
 # ---------------------------------------------------------------------------
 # Utility: strip C++/CUDA inline source from Python code
@@ -1395,6 +1398,26 @@ def detect_token_paste_cuda_api(code: str | SubmissionFacts) -> list[dict]:
             "(explicit filter evasion)"
         ),
     }]
+
+
+def detect_generator_replay(code: str | SubmissionFacts) -> list[dict]:
+    """Pattern 16: Generator-based replay attack.
+
+    Detects generators whose .send() method is exposed as custom_kernel.
+    The attack: create generator, prime with next(), assign g.send to custom_kernel.
+    """
+    facts = ensure_submission_facts(code)
+    raw = facts.raw_code
+    matches = []
+
+    if RE_GEN_REPLAY.search(raw):
+        matches.append({
+            "pattern": "GENERATOR_REPLAY",
+            "severity": "high",
+            "evidence": "Generator-based replay attack: generator.send() exposed as callable",
+        })
+
+    return matches
 
 
 # Sequence-aware batch graph exploit: learns repeated call sequences
@@ -3773,6 +3796,7 @@ CODE_DETECTORS = [
     detect_unsync_multistream,
     detect_cuda_event_disable_timing,
     detect_token_paste_cuda_api,
+    detect_generator_replay,
     detect_sequence_batch_graph,
     detect_runtime_package_install,
     # AST-based detectors (Layer 2)
@@ -3811,6 +3835,7 @@ BASE_DETECTOR_SPECS = [
     ("unsync_multistream", detect_unsync_multistream),
     ("cuda_event_disable_timing", detect_cuda_event_disable_timing),
     ("token_paste_cuda_api", detect_token_paste_cuda_api),
+    ("generator_replay", detect_generator_replay),
     ("sequence_batch_graph", detect_sequence_batch_graph),
     ("runtime_package_install", detect_runtime_package_install),
     ("trusted_module_import", detect_trusted_module_import),
