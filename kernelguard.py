@@ -2462,6 +2462,74 @@ def detect_last_call_replay(code: str | SubmissionFacts) -> list[dict]:
     return []
 
 
+def detect_lambda_setitem_replay(code: str | SubmissionFacts) -> list[dict]:
+    """Pattern: lambda entrypoint mutates replay state through __setitem__."""
+    facts = ensure_submission_facts(code)
+    tree = facts.ast_tree
+    if tree is None:
+        return []
+    entrypoint_name = entrypoint_label(facts.entrypoint_name)
+
+    def _is_state_subscript(expr: ast.AST | None) -> bool:
+        return isinstance(expr, ast.Subscript) and isinstance(expr.value, ast.Name)
+
+    def _state_root(expr: ast.AST | None) -> str | None:
+        if _is_state_subscript(expr):
+            return _ast_root_name(expr)
+        return None
+
+    def _has_setitem_mutation(expr: ast.AST | None, root: str, params: set[str]) -> bool:
+        if expr is None:
+            return False
+        for node in ast.walk(expr):
+            if not isinstance(node, ast.Call):
+                continue
+            if not (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "__setitem__"
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == root
+            ):
+                continue
+            if any(_expr_names(arg) & params for arg in node.args[1:]):
+                return True
+        return False
+
+    for stmt in getattr(tree, "body", []):
+        if not isinstance(stmt, ast.Assign):
+            continue
+        if not any(isinstance(target, ast.Name) and is_entrypoint_name(target.id) for target in stmt.targets):
+            continue
+        if not isinstance(stmt.value, ast.Lambda):
+            continue
+        lam = stmt.value
+        if not isinstance(lam.body, ast.IfExp):
+            continue
+
+        params = {arg.arg for arg in lam.args.args}
+        params.update(arg.arg for arg in lam.args.posonlyargs)
+        params.update(arg.arg for arg in lam.args.kwonlyargs)
+        if _expr_names(lam.body.test) & params:
+            continue
+
+        root = _state_root(lam.body.body)
+        if root is None:
+            continue
+        if not _has_setitem_mutation(lam.body.orelse, root, params):
+            continue
+
+        return [{
+            "pattern": "LAMBDA_SETITEM_REPLAY",
+            "severity": "critical",
+            "evidence": (
+                f"{entrypoint_name} lambda returns replay state populated "
+                "through __setitem__"
+            ),
+        }]
+
+    return []
+
+
 RE_OBJECT_ID_DATA = re.compile(r"\bdata_id\s*=\s*id\s*\(\s*data\s*\)")
 RE_RESULT_BANK_SET = re.compile(r"_superbatch_results\s*\[\s*(?:did|data_id)\s*\]\s*=")
 RE_RESULT_BANK_RETURN = re.compile(r"return\s+_superbatch_results\s*\[\s*data_id\s*\]")
@@ -3479,6 +3547,10 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
         "LAST_CALL_REPLAY", "result_reuse", "hard", AUTO_FILTER, (),
         AMD_MANUAL_LAST_CALL_REPLAY_FIXTURES, "keep",
     ),
+    "LAMBDA_SETITEM_REPLAY": RulePolicy(
+        "LAMBDA_SETITEM_REPLAY", "result_reuse", "hard", AUTO_FILTER, (),
+        (), "keep",
+    ),
     "SHAPE_OUTPUT_REPLAY": RulePolicy(
         "SHAPE_OUTPUT_REPLAY", "result_reuse", "hard", AUTO_FILTER, (),
         AMD_PACKAGE_SHAPE_REPLAY_FIXTURES, "keep",
@@ -3762,6 +3834,7 @@ CODE_DETECTORS = [
     detect_decode_mm_ref,
     detect_result_caching,
     detect_last_call_replay,
+    detect_lambda_setitem_replay,
     detect_shape_output_replay,
     detect_timed_input_replay,
     detect_cuda_graph_replay,
@@ -3800,6 +3873,7 @@ BASE_DETECTOR_SPECS = [
     ("decode_mm_ref", detect_decode_mm_ref),
     ("result_caching", detect_result_caching),
     ("last_call_replay", detect_last_call_replay),
+    ("lambda_setitem_replay", detect_lambda_setitem_replay),
     ("shape_output_replay", detect_shape_output_replay),
     ("timed_input_replay", detect_timed_input_replay),
     ("cuda_graph_replay", detect_cuda_graph_replay),
@@ -4696,7 +4770,7 @@ AUDIT_RULE_ORDER = [
     "EVALUATOR_EXPLOIT", "HARNESS_RUNTIME_PATCHING", "MODULE_MUTATION", "GLOBALS_MUTATION", "CODE_REPLACEMENT",
     "FRAME_WALK_ACCESS", "FRAME_WALK_MUTATION", "SYS_MODULES_ACCESS", "GLOBALS_ACCESS", "CODE_ACCESS",
     "TRUSTED_MODULE_IMPORT",
-    "OUTPUT_REPLAY_CACHE", "LAST_CALL_REPLAY", "SHAPE_OUTPUT_REPLAY", "TIMED_INPUT_REPLAY", "CONFIG_CACHE_EXPLOIT", "POINTER_REPLAY", "RESULT_BANK_REPLAY", "PREPROCESS_CACHE", "WORKSPACE_CACHE",
+    "OUTPUT_REPLAY_CACHE", "LAST_CALL_REPLAY", "LAMBDA_SETITEM_REPLAY", "SHAPE_OUTPUT_REPLAY", "TIMED_INPUT_REPLAY", "CONFIG_CACHE_EXPLOIT", "POINTER_REPLAY", "RESULT_BANK_REPLAY", "PREPROCESS_CACHE", "WORKSPACE_CACHE",
     "RUNNER_PLAN_CACHE", "CUDA_GRAPH_PYTHON", "CUDA_GRAPH_REPLAY",
     "TIMER_MONKEYPATCH", "FAKE_BENCHMARK_EMIT", "STDIO_REDIRECT", "UNSYNC_MULTISTREAM", "CUDA_EVENT_DISABLE_TIMING",
     "SCALED_MM_REF", "DECODE_MM_REF", "SILENT_FALLBACK", "REFERENCE_PRECOMPUTE_REPLAY", "TORCH_COMPILE_CACHE",
