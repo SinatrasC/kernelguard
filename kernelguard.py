@@ -4299,8 +4299,11 @@ def detect_network_io(code: str | SubmissionFacts) -> list[dict]:
     return []
 
 
+RE_SIGNAL_MODULES = re.compile(r'(?:signal\.(?:signal|siginterrupt|set_wakeup_fd)|atexit\.register)\s*\(')
 def detect_signal_atexit(code: str | SubmissionFacts) -> list[dict]:
-    return []
+    facts = ensure_submission_facts(code)
+    if not RE_SIGNAL_MODULES.search(facts.raw_code): return []
+    return [{"pattern": "THREAD_INJECTION", "severity": "medium", "evidence": "signal/atexit registration — async execution hijacking via signal handlers or atexit hooks"}]
 
 RE_OS_ENUM = re.compile(r'os\.(?:environ|listdir|uname|getcwd|chdir|mkdir)\s*(?:\[|=|\()')
 
