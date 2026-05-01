@@ -640,6 +640,54 @@ def detect_print_injection(code: str | SubmissionFacts) -> list[dict]:
         else:
             add("STDIO_REDIRECT", "medium", "sys.stderr reassigned")
 
+    # Generic stdout/print emission *inside the entrypoint*. Real compute
+    # kernels do not call ``print`` / ``sys.stdout.write`` / ``os.write(1, ...)``
+    # at runtime — every such call inside ``custom_kernel`` is suspicious
+    # because it lets the kernel inject text into the benchmark harness's
+    # output stream.
+    tree = facts.ast_tree
+    if tree is not None:
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if not is_entrypoint_name(node.name):
+                continue
+            for child in ast.walk(node):
+                if not isinstance(child, ast.Call):
+                    continue
+                # ``print(...)``
+                if isinstance(child.func, ast.Name) and child.func.id == "print":
+                    add("FAKE_BENCHMARK_EMIT", "critical",
+                        f"print() call inside {node.name} — kernel-side stdout emission")
+                    break
+                # ``sys.stdout.write(...)`` / ``sys.stderr.write(...)``
+                if (
+                    isinstance(child.func, ast.Attribute)
+                    and child.func.attr == "write"
+                    and isinstance(child.func.value, ast.Attribute)
+                    and child.func.value.attr in ("stdout", "stderr")
+                    and isinstance(child.func.value.value, ast.Name)
+                    and child.func.value.value.id == "sys"
+                ):
+                    add("FAKE_BENCHMARK_EMIT", "critical",
+                        f"sys.{child.func.value.attr}.write() call inside {node.name} "
+                        f"— kernel-side stdio emission")
+                    break
+                # ``os.write(1, ...)`` / ``os.write(2, ...)`` — bypass-via-fd
+                if (
+                    isinstance(child.func, ast.Attribute)
+                    and child.func.attr == "write"
+                    and isinstance(child.func.value, ast.Name)
+                    and child.func.value.id == "os"
+                    and child.args
+                    and isinstance(child.args[0], ast.Constant)
+                    and child.args[0].value in (1, 2)
+                ):
+                    add("FAKE_BENCHMARK_EMIT", "critical",
+                        f"os.write(fd={child.args[0].value}, ...) inside {node.name} "
+                        f"— direct write to stdout/stderr file descriptor")
+                    break
+
     # Do not keep the old broad PRINT_INJECTION marker; the split rules carry
     # the action semantics now.
     return matches
