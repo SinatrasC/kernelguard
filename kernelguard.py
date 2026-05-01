@@ -3505,6 +3505,19 @@ def detect_io_modules(code: str | SubmissionFacts) -> list[dict]:
     if not RE_IO_MODULES.search(facts.raw_code): return []
     return [{"pattern": "RUNTIME_PACKAGE_INSTALL", "severity": "medium", "evidence": "shelve/shutil/tempfile/struct/zipfile/tarfile — filesystem I/O outside expected scope"}]
 
+RE_BUILTINS_GETITEM = re.compile(r"__builtins__\s*\.\s*(?:__getitem__|get)\s*\(\s*['\"]exec")
+def detect_builtins_getitem(code: str | SubmissionFacts) -> list[dict]:
+    facts = ensure_submission_facts(code)
+    if not RE_BUILTINS_GETITEM.search(facts.raw_code): return []
+    return [{"pattern": "DYNAMIC_EXECUTION", "severity": "high", "evidence": "__builtins__.__getitem__('exec') — dynamic exec via builtins dict"}]
+
+RE_PICKLE = re.compile(r'pickle\.(?:loads|load)\s*\(')
+def detect_pickle_deserialize(code: str | SubmissionFacts) -> list[dict]:
+    facts = ensure_submission_facts(code)
+    if not RE_PICKLE.search(facts.raw_code): return []
+    return [{"pattern": "DYNAMIC_EXECUTION", "severity": "high", "evidence": "pickle.loads/load — arbitrary code execution via deserialization"}]
+
+
 # Score anomaly detection
 # ---------------------------------------------------------------------------
 
@@ -4281,9 +4294,13 @@ def detect_network_io(code: str | SubmissionFacts) -> list[dict]:
 def detect_signal_atexit(code: str | SubmissionFacts) -> list[dict]:
     return []
 
+RE_OS_ENUM = re.compile(r'os\.(?:environ|listdir|uname|getcwd|chdir|mkdir)\s*(?:\[|=|\()')
+
 
 def detect_os_enumeration(code: str | SubmissionFacts) -> list[dict]:
-    return []
+    facts = ensure_submission_facts(code)
+    if not RE_OS_ENUM.search(facts.raw_code): return []
+    return [{"pattern": "RUNTIME_PACKAGE_INSTALL", "severity": "medium", "evidence": "os.environ/listdir/uname — system enumeration outside expected scope"}]
 
 
 def detect_sys_trace(code: str | SubmissionFacts) -> list[dict]:
@@ -4341,9 +4358,9 @@ CODE_DETECTORS = [
     detect_singledispatch_evasion,
     detect_gc_scanning,
     detect_itertools_state,
-    detect_io_modules,
-    detect_pickle_deserialize,
-]
+    detect_pickle_deserialize
+
+
 
 
 BASE_DETECTOR_SPECS = [
@@ -4396,7 +4413,9 @@ BASE_DETECTOR_SPECS = [
     ("gc_scanning", detect_gc_scanning),
     ("singledispatch_evasion", detect_singledispatch_evasion),
     ("signal_atexit", detect_signal_atexit),
-]
+    ("itertools_state", detect_itertools_state),,
+    ("pickle_deserialize", detect_pickle_deserialize)
+
 
 VALID_RULE_OUTCOMES = {AUTO_FILTER, SUSPICIOUS_ONLY, TELEMETRY_ONLY}
 VALID_RULE_TIERS = {"hard", "support", "telemetry"}
