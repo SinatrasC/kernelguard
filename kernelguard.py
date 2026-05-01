@@ -1688,7 +1688,7 @@ def detect_introspection_exploit(code: str | SubmissionFacts) -> list[dict]:
                 ):
                     frame_namespace_aliases.add(target.id)
 
-        # inspect.currentframe() / inspect.stack()
+        # inspect.currentframe() / inspect.stack() / sys._getframe()
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
             if (isinstance(node.func.value, ast.Name)
                     and node.func.value.id == "inspect"
@@ -1697,6 +1697,17 @@ def detect_introspection_exploit(code: str | SubmissionFacts) -> list[dict]:
                 if key not in seen_patterns:
                     seen_patterns.add(key)
                     saw_frame_access = True
+            elif (isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "sys"
+                    and node.func.attr == "_getframe"):
+                key = "sys._getframe"
+                if key not in seen_patterns:
+                    seen_patterns.add(key)
+                    matches.append({
+                        "pattern": "SYS_GETFRAME",
+                        "severity": "high",
+                        "evidence": "sys._getframe() called (frame walk access)",
+                    })
 
         # f_back, f_globals, f_locals attribute access
         if isinstance(node, ast.Attribute) and node.attr in ("f_back", "f_globals", "f_locals"):
@@ -3645,6 +3656,10 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
         "SCORE_EXTREME_SPEEDUP", "score_anomaly", "support", SUSPICIOUS_ONLY, (),
         (), "downgrade",
     ),
+    "SYS_GETFRAME": RulePolicy(
+        "SYS_GETFRAME", "evaluator_state_support", "hard", AUTO_FILTER, (),
+        (), "keep",
+    ),
     "DUPLICATE_SPAM": RulePolicy(
         "DUPLICATE_SPAM", "administrative", "support", SUSPICIOUS_ONLY, (),
         (), "downgrade",
@@ -4694,7 +4709,7 @@ DEFAULT_AUDIT_RESULT_FILES = (
 
 AUDIT_RULE_ORDER = [
     "EVALUATOR_EXPLOIT", "HARNESS_RUNTIME_PATCHING", "MODULE_MUTATION", "GLOBALS_MUTATION", "CODE_REPLACEMENT",
-    "FRAME_WALK_ACCESS", "FRAME_WALK_MUTATION", "SYS_MODULES_ACCESS", "GLOBALS_ACCESS", "CODE_ACCESS",
+    "FRAME_WALK_ACCESS", "FRAME_WALK_MUTATION", "SYS_GETFRAME", "SYS_MODULES_ACCESS", "GLOBALS_ACCESS", "CODE_ACCESS",
     "TRUSTED_MODULE_IMPORT",
     "OUTPUT_REPLAY_CACHE", "LAST_CALL_REPLAY", "SHAPE_OUTPUT_REPLAY", "TIMED_INPUT_REPLAY", "CONFIG_CACHE_EXPLOIT", "POINTER_REPLAY", "RESULT_BANK_REPLAY", "PREPROCESS_CACHE", "WORKSPACE_CACHE",
     "RUNNER_PLAN_CACHE", "CUDA_GRAPH_PYTHON", "CUDA_GRAPH_REPLAY",
