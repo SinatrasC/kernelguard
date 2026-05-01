@@ -3624,8 +3624,8 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
         (), "downgrade",
     ),
     "LAZY_TENSOR": RulePolicy(
-        "LAZY_TENSOR", "timing_manipulation", "telemetry", TELEMETRY_ONLY, (),
-        (), "downgrade",
+        "LAZY_TENSOR", "timing_manipulation", "hard", AUTO_FILTER, (),
+        (), "keep",
     ),
     "PRECISION_DOWNGRADE": RulePolicy(
         "PRECISION_DOWNGRADE", "approximation", "telemetry", TELEMETRY_ONLY, (),
