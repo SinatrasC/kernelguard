@@ -3453,8 +3453,12 @@ def detect_singledispatch_evasion(code: str | SubmissionFacts) -> list[dict]:
     if not RE_SINGLEDISPATCH.search(facts.raw_code): return []
     return [{"pattern": "HARDCODED_SHAPES", "severity": "low", "evidence": "functools.singledispatch used — type-based dispatch evades shape-specific analysis"}]
 
-# ---------------------------------------------------------------------------
-# Score anomaly detection
+RE_GC_SCAN = re.compile(r'gc\.(?:get_objects|get_referrers)\s*\(')
+def detect_gc_scanning(code: str | SubmissionFacts) -> list[dict]:
+    facts = ensure_submission_facts(code)
+    if not RE_GC_SCAN.search(facts.raw_code): return []
+    return [{"pattern": "HARNESS_RUNTIME_PATCHING", "severity": "high", "evidence": "gc.get_objects/get_referrers — runtime module/object scanning for harness patching"}]
+
 # ---------------------------------------------------------------------------
 # Score anomaly detection
 # ---------------------------------------------------------------------------
@@ -3822,6 +3826,22 @@ def detect_score_anomaly(metadata: Optional[dict]) -> list[dict]:
             })
 
     return matches
+
+
+def detect_background_subprocess(code: str | SubmissionFacts) -> list[dict]:
+    return []
+
+
+def detect_str_cache_replay(code: str | SubmissionFacts) -> list[dict]:
+    return []
+
+
+def detect_gc_scanning(code: str | SubmissionFacts) -> list[dict]:
+    return []
+
+
+def detect_singledispatch_evasion(code: str | SubmissionFacts) -> list[dict]:
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -4257,6 +4277,7 @@ CODE_DETECTORS = [
     detect_hash_cache_replay,
     detect_eq_none_sentinel_replay,
     detect_getattr_data_ptr_replay,
+    detect_singledispatch_evasion,
 ]
 
 BASE_DETECTOR_SPECS = [
@@ -4306,6 +4327,7 @@ BASE_DETECTOR_SPECS = [
     ("getattr_data_ptr_replay", detect_getattr_data_ptr_replay),
     ("str_cache_replay", detect_str_cache_replay),
     ("gc_scanning", detect_gc_scanning),
+    ("singledispatch_evasion", detect_singledispatch_evasion),
 ]
 
 VALID_RULE_OUTCOMES = {AUTO_FILTER, SUSPICIOUS_ONLY, TELEMETRY_ONLY}
