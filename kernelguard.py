@@ -2754,6 +2754,31 @@ def detect_dynamic_execution(code: str | SubmissionFacts) -> list[dict]:
         elif isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name):
             func_name = f"{node.func.value.id}.{node.func.attr}"
 
+        # Check for __builtins__ extraction of dangerous functions
+        builtins_extracted = set()
+        for bn in list(ast.walk(tree)):
+            if isinstance(bn, ast.Assign):
+                for target in bn.targets:
+                    if not isinstance(target, ast.Name): continue
+                    val = bn.value
+                    if isinstance(val, ast.Subscript) and isinstance(val.value, ast.Name) and val.value.id == "__builtins__":
+                        if isinstance(val.slice, ast.Constant) and isinstance(val.slice.value, str):
+                            builtins_extracted.add(target.id)
+                    if isinstance(val, ast.Attribute) and isinstance(val.value, ast.Name) and val.value.id == "__builtins__":
+                        builtins_extracted.add(target.id)
+
+        for bn in ast.walk(tree):
+            if isinstance(bn, ast.Call) and isinstance(bn.func, ast.Name) and bn.func.id in builtins_extracted:
+                key = f"builtins_{bn.func.id}"
+                if key not in seen:
+                    seen.add(key)
+                    matches.append({
+                        "pattern": "DYNAMIC_EXECUTION",
+                        "severity": "high",
+                        "evidence": f"__builtins__ extracted exec/eval called via alias '{bn.func.id}'",
+                    })
+                break
+
         if func_name in ("exec", "eval") and func_name not in seen:
             is_obfuscated = _is_obfuscated_exec(node)
             # Also check if this exec lives in a scope that has decode/decompress
@@ -3840,14 +3865,6 @@ def detect_str_cache_replay(code: str | SubmissionFacts) -> list[dict]:
     if not RE_STR_CACHE.search(active): return []
     if not re.search(r'\b_cache\s*\[', active) and not re.search(r'\b_cache\.get\b', active): return []
     return [{"pattern": "OUTPUT_REPLAY_CACHE", "severity": "high", "evidence": f"{entrypoint_name} uses str()/repr() of data as cache key"}]
-
-
-def detect_gc_scanning(code: str | SubmissionFacts) -> list[dict]:
-    return []
-
-
-def detect_singledispatch_evasion(code: str | SubmissionFacts) -> list[dict]:
-    return []
 
 
 # ---------------------------------------------------------------------------
