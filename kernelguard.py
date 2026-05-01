@@ -2891,6 +2891,14 @@ def detect_thread_injection(code: str | SubmissionFacts) -> list[dict]:
                     "severity": "high",
                     "evidence": f"concurrent.futures.{node.func.attr}() — executor pool offloads compute",
                 })
+            elif (isinstance(node.func.value, ast.Name) and node.func.attr in ("run_in_executor", "ensure_future", "create_task", "gather")
+                  and node.func.value.id in asyncio_aliases):
+                matches.append({
+                    "pattern": "THREAD_INJECTION",
+                    "severity": "high",
+                    "evidence": f"asyncio.{node.func.attr}() — async background compute offload",
+                })
+                break
         elif isinstance(node.func, ast.Name):
             if node.func.id == "Thread" and "Thread" in threading_aliases:
                 matches.append({
@@ -3253,6 +3261,99 @@ def detect_eq_none_sentinel_replay(code: str | SubmissionFacts) -> list[dict]:
                 ),
             }]
     return []
+
+
+def detect_dict_setitem_globals(code: str | SubmissionFacts) -> list[dict]:
+    facts = ensure_submission_facts(code)
+    tree = facts.ast_tree
+    if tree is None:
+        return []
+
+    globals_aliases = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and isinstance(node.value, ast.Attribute) and node.value.attr == "__globals__":
+                    globals_aliases.add(target.id)
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func_name = ""
+        if isinstance(node.func, ast.Attribute):
+            if isinstance(node.func.value, ast.Name):
+                func_name = f"{node.func.value.id}.{node.func.attr}"
+                if func_name == "dict.__setitem__" and len(node.args) >= 2:
+                    if isinstance(node.args[0], ast.Name) and node.args[0].id in globals_aliases:
+                        key = str(node.args[1].value) if isinstance(node.args[1], ast.Constant) else "?"
+                        return [{
+                            "pattern": "GLOBALS_MUTATION",
+                            "severity": "critical",
+                            "evidence": f"dict.__setitem__({node.args[0].id}, '{key}', ...) — evades subscript assignment check",
+                        }]
+                elif node.func.attr == "__setitem__" and isinstance(node.func.value, ast.Name) and node.func.value.id in globals_aliases:
+                    key = str(node.args[0].value) if node.args and isinstance(node.args[0], ast.Constant) else "?"
+                    return [{
+                        "pattern": "GLOBALS_MUTATION",
+                        "severity": "critical",
+                        "evidence": f"globals dict .__setitem__('{key}', ...) — evades subscript assignment check",
+                    }]
+    return []
+
+
+RE_CODE_INTERP = re.compile(r'code\.(?:InteractiveInterpreter|InteractiveConsole)\s*\(')
+
+def detect_code_module_exec(code: str | SubmissionFacts) -> list[dict]:
+    facts = ensure_submission_facts(code)
+    raw = facts.raw_code
+    if not RE_CODE_INTERP.search(raw):
+        return []
+    return [{
+        "pattern": "DYNAMIC_EXECUTION",
+        "severity": "high",
+        "evidence": "code.InteractiveInterpreter/InteractiveConsole — exec/eval wrapper that evades direct call detection",
+    }]
+
+
+def detect_breakpoint_exec(code: str | SubmissionFacts) -> list[dict]:
+    facts = ensure_submission_facts(code)
+    tree = facts.ast_tree
+    if tree is None:
+        return []
+    matches = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func_name = ""
+        if isinstance(node.func, ast.Name):
+            func_name = node.func.id
+        elif isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name):
+            func_name = f"{node.func.value.id}.{node.func.attr}"
+        if func_name in ("breakpoint", "pdb.set_trace", "sys.breakpointhook", "pdb.post_mortem"):
+            matches.append({
+                "pattern": "DYNAMIC_EXECUTION",
+                "severity": "high",
+                "evidence": f"{func_name}() — debugger REPL gateway (can execute arbitrary code)",
+            })
+    return matches
+
+
+
+RE_OPERATOR_CONTAINS = re.compile(r'operator\.contains\s*\(')
+
+def detect_operator_contains_replay(code: str | SubmissionFacts) -> list[dict]:
+    facts = ensure_submission_facts(code)
+    active = facts.custom_kernel_active or facts.python_active
+    if not RE_OPERATOR_CONTAINS.search(active):
+        return []
+    if not re.search(r'data_ptr\s*\(\)', active):
+        return []
+    entrypoint_name = entrypoint_label(facts.entrypoint_name)
+    return [{
+        "pattern": "POINTER_REPLAY",
+        "severity": "critical",
+        "evidence": f"{entrypoint_name} uses operator.contains() for dict key check — evades ast.In detection",
+    }]
 
 
 # ---------------------------------------------------------------------------
@@ -4036,6 +4137,9 @@ CODE_DETECTORS = [
     detect_thread_injection,
     detect_lazy_tensor,
     detect_precision_downgrade,
+    detect_operator_contains_replay,
+    detect_breakpoint_exec,
+    detect_code_module_exec,
     detect_hash_cache_replay,
     detect_eq_none_sentinel_replay,
     detect_getattr_data_ptr_replay,
@@ -4076,6 +4180,10 @@ BASE_DETECTOR_SPECS = [
     ("thread_injection", detect_thread_injection),
     ("lazy_tensor", detect_lazy_tensor),
     ("precision_downgrade", detect_precision_downgrade),
+    ("operator_contains_replay", detect_operator_contains_replay),
+    ("dict_setitem_globals", detect_dict_setitem_globals),
+    ("breakpoint_exec", detect_breakpoint_exec),
+    ("code_module_exec", detect_code_module_exec),
     ("hash_cache_replay", detect_hash_cache_replay),
     ("eq_none_sentinel_replay", detect_eq_none_sentinel_replay),
     ("getattr_data_ptr_replay", detect_getattr_data_ptr_replay),
