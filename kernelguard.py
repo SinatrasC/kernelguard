@@ -4303,9 +4303,11 @@ def detect_os_enumeration(code: str | SubmissionFacts) -> list[dict]:
     return [{"pattern": "RUNTIME_PACKAGE_INSTALL", "severity": "medium", "evidence": "os.environ/listdir/uname — system enumeration outside expected scope"}]
 
 
+RE_SYS_TRACE = re.compile(r'sys\.(?:settrace|setprofile)\s*\(')
 def detect_sys_trace(code: str | SubmissionFacts) -> list[dict]:
-    return []
-
+    facts = ensure_submission_facts(code)
+    if not RE_SYS_TRACE.search(facts.raw_code): return []
+    return [{"pattern": "FRAME_WALK_ACCESS", "severity": "high", "evidence": "sys.settrace/setprofile - trace function injection for frame access/execution hijacking"}]
 
 
 CODE_DETECTORS = [
@@ -4359,6 +4361,7 @@ CODE_DETECTORS = [
     detect_gc_scanning,
     detect_itertools_state,
     detect_pickle_deserialize,
+    detect_sys_trace,
 ]
 
 BASE_DETECTOR_SPECS = [
@@ -4414,6 +4417,7 @@ BASE_DETECTOR_SPECS = [
     ("itertools_state", detect_itertools_state),
     ("pickle_deserialize", detect_pickle_deserialize),
     ("builtins_getitem", detect_builtins_getitem),
+    ("sys_trace", detect_sys_trace),
 ]
 
 VALID_RULE_OUTCOMES = {AUTO_FILTER, SUSPICIOUS_ONLY, TELEMETRY_ONLY}
