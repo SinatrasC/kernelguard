@@ -3532,6 +3532,12 @@ def detect_functools_wraps_replay(code: str | SubmissionFacts) -> list[dict]:
     return [{"pattern": "OUTPUT_REPLAY_CACHE", "severity": "high", "evidence": "functools.wraps/cached_property — transparent caching/entrypoint aliasing"}]
 
 
+RE_SYS_TRACE = re.compile(r'sys\.(?:settrace|setprofile)\s*\(')
+def detect_sys_trace(code: str | SubmissionFacts) -> list[dict]:
+    facts = ensure_submission_facts(code)
+    if not RE_SYS_TRACE.search(facts.raw_code): return []
+    return [{"pattern": "FRAME_WALK_ACCESS", "severity": "high", "evidence": "sys.settrace/setprofile - trace function injection for frame access/execution hijacking"}]
+
 # Score anomaly detection
 # ---------------------------------------------------------------------------
 
@@ -4378,6 +4384,7 @@ CODE_DETECTORS = [
     detect_operator_cmp_replay,
     detect_pickle_deserialize,
     detect_signal_atexit,
+    detect_sys_trace,
     detect_functools_wraps_replay,
 ]
 
@@ -4435,6 +4442,7 @@ BASE_DETECTOR_SPECS = [
     ("pickle_deserialize", detect_pickle_deserialize),
     ("builtins_getitem", detect_builtins_getitem),
     ("operator_cmp_replay", detect_operator_cmp_replay),
+    ("sys_trace", detect_sys_trace),
     ("functools_wraps_replay", detect_functools_wraps_replay),
 ]
 
