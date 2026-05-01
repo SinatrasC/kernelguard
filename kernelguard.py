@@ -3832,8 +3832,14 @@ def detect_background_subprocess(code: str | SubmissionFacts) -> list[dict]:
     return []
 
 
+RE_STR_CACHE = re.compile(r'\b(?:str|repr)\s*\([^)]*\)')
 def detect_str_cache_replay(code: str | SubmissionFacts) -> list[dict]:
-    return []
+    facts = ensure_submission_facts(code)
+    active = facts.custom_kernel_active or facts.python_active
+    entrypoint_name = entrypoint_label(facts.entrypoint_name)
+    if not RE_STR_CACHE.search(active): return []
+    if not re.search(r'\b_cache\s*\[', active) and not re.search(r'\b_cache\.get\b', active): return []
+    return [{"pattern": "OUTPUT_REPLAY_CACHE", "severity": "high", "evidence": f"{entrypoint_name} uses str()/repr() of data as cache key"}]
 
 
 def detect_gc_scanning(code: str | SubmissionFacts) -> list[dict]:
@@ -4278,6 +4284,7 @@ CODE_DETECTORS = [
     detect_eq_none_sentinel_replay,
     detect_getattr_data_ptr_replay,
     detect_singledispatch_evasion,
+    detect_gc_scanning,
 ]
 
 BASE_DETECTOR_SPECS = [
