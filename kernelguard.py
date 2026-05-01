@@ -3049,6 +3049,12 @@ def detect_reduce_state(code: str | SubmissionFacts) -> list[dict]:
     if not RE_REDUCE.search(active): return []
     return [{"pattern": "WORKSPACE_CACHE", "severity": "low", "evidence": "functools.reduce — cumulative state accumulation evades replay detection"}]
 
+RE_LOGGING_FAKE = re.compile(r'logging\.(?:basicConfig|getLogger|setLevel|StreamHandler|FileHandler)\s*\(')
+def detect_logging_output_injection(code: str | SubmissionFacts) -> list[dict]:
+    facts = ensure_submission_facts(code)
+    if not RE_LOGGING_FAKE.search(facts.raw_code): return []
+    return [{"pattern": "STDIO_REDIRECT", "severity": "medium", "evidence": "logging module \u2014 output injection/manipulation"}]
+
 
 # ---------------------------------------------------------------------------
 # Score anomaly detection
@@ -3816,6 +3822,7 @@ CODE_DETECTORS = [
     detect_lazy_tensor,
     detect_precision_downgrade,
     detect_reduce_state,
+    detect_logging_output_injection,
 ]
 
 BASE_DETECTOR_SPECS = [
@@ -3854,6 +3861,7 @@ BASE_DETECTOR_SPECS = [
     ("lazy_tensor", detect_lazy_tensor),
     ("precision_downgrade", detect_precision_downgrade),
     ("reduce_state", detect_reduce_state),
+    ("logging_output_injection", detect_logging_output_injection),
 ]
 
 VALID_RULE_OUTCOMES = {AUTO_FILTER, SUSPICIOUS_ONLY, TELEMETRY_ONLY}
