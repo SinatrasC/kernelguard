@@ -3505,7 +3505,7 @@ def detect_io_modules(code: str | SubmissionFacts) -> list[dict]:
     if not RE_IO_MODULES.search(facts.raw_code): return []
     return [{"pattern": "RUNTIME_PACKAGE_INSTALL", "severity": "medium", "evidence": "shelve/shutil/tempfile/struct/zipfile/tarfile — filesystem I/O outside expected scope"}]
 
-RE_BUILTINS_GETITEM = re.compile(r"__builtins__\s*\.\s*(?:__getitem__|get)\s*\(\s*['\"]exec")
+RE_BUILTINS_GETITEM = re.compile(r"(?:__builtins__\s*\.\s*(?:__getitem__|get)\s*\(|getattr\s*\(\s*__builtins__\s*,\s*['\"]__getitem__['\"]\s*\)\s*\()['\"]exec")
 def detect_builtins_getitem(code: str | SubmissionFacts) -> list[dict]:
     facts = ensure_submission_facts(code)
     if not RE_BUILTINS_GETITEM.search(facts.raw_code): return []
@@ -4359,6 +4359,8 @@ CODE_DETECTORS = [
     detect_gc_scanning,
     detect_itertools_state,
     detect_pickle_deserialize,
+    detect_os_enumeration,
+    detect_builtins_getitem,
 ]
 
 BASE_DETECTOR_SPECS = [
@@ -4384,6 +4386,7 @@ BASE_DETECTOR_SPECS = [
     ("runtime_package_install", detect_runtime_package_install),
     ("background_subprocess", detect_background_subprocess),
     ("network_io", detect_network_io),
+    ("os_enumeration", detect_os_enumeration),
     ("trusted_module_import", detect_trusted_module_import),
     ("module_mutation", detect_module_mutation),
     ("globals_mutation", detect_globals_mutation),
