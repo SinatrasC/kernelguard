@@ -3023,9 +3023,73 @@ def detect_precision_downgrade(code: str | SubmissionFacts) -> list[dict]:
             })
 
     return matches
-
-
-# ---------------------------------------------------------------------------
+def detect_global_sentinel_reuse(code_or_facts):
+    facts = ensure_submission_facts(code_or_facts)
+    if not facts.custom_kernel_active or not facts.ast_tree: return []
+    import re
+    for var in facts._none_inited:
+        if not re.search(r'\bglobal\s+\b' + re.escape(var) + r'\b', facts.custom_kernel_active): continue
+        if not re.search(r'\bif\s+\b' + re.escape(var) + r'\b\s+is\s+None\b', facts.custom_kernel_active): continue
+        return [{"pattern": "GLOBAL_SENTINEL_REUSE", "severity": "high", "evidence": f"Module-level {var}=None sentinel cache with global guard"}]
+    return []
+def detect_closure_state_reuse(code_or_facts):
+    facts = ensure_submission_facts(code_or_facts)
+    if not facts.custom_kernel_active: return []
+    import re as _re
+    for m in _re.finditer(r'\bnonlocal\s+(\w+)', facts.custom_kernel_active):
+        var = m.group(1)
+        if not _re.search(r'\bif\s+\b' + _re.escape(var) + r'\b\s+is\s+None\b', facts.custom_kernel_active): continue
+        if not _re.search(r'\breturn\s+\b' + _re.escape(var) + r'\b', facts.custom_kernel_active): continue
+        return [{"pattern": "CLOSURE_STATE_REUSE", "severity": "high", "evidence": f"Nonlocal {var} used as sentinel cache"}]
+    return []
+def detect_class_cache_reuse(code_or_facts):
+    facts = ensure_submission_facts(code_or_facts)
+    if not facts.custom_kernel_active or not facts.python_active: return []
+    p1 = bool(__import__('re').search(r'class\s+\w+[\s\S]{0,500}?_pool\s*=\s*(?:\{\}|dict\(\))', facts.python_active))
+    p2 = bool(__import__('re').search(r'\bid\s*\(', facts.python_active))
+    p3 = bool(__import__('re').search(r'@classmethod[\s\S]{0,200}?def\s+\w+\s*\([^)]*\)[\s\S]{0,200}?\breturn\b', facts.python_active))
+    if p1 and p2 and p3: return [{"pattern": "CLASS_CACHE_REUSE", "severity": "high", "evidence": "Class-level dict cache"}]
+    return []
+def detect_generator_state_reuse(code_or_facts):
+    facts = ensure_submission_facts(code_or_facts)
+    if not facts.custom_kernel_active or not facts.python_active: return []
+    g1 = bool(__import__('re').search(r'def\s+\w+\s*\(\s*\)\s*:\s*\n\s+(?:[\w,\s]*=[^#\n]*\n\s+)*while\s+True\s*:', facts.python_active))
+    g2 = bool(__import__('re').search(r'\byield\b', facts.raw_code))
+    g3 = bool(__import__('re').search(r'\.send\s*\(', facts.custom_kernel_active))
+    g4 = bool(__import__('re').search(r'\.send\s*\(\s*None\s*\)', facts.raw_code))
+    if g1 and g2 and g3 and g4: return [{"pattern": "GENERATOR_STATE_REUSE", "severity": "high", "evidence": "Generator send()"}]
+    return []
+def detect_descriptor_cache_reuse(code_or_facts):
+    facts = ensure_submission_facts(code_or_facts)
+    if not facts.python_active: return []
+    if bool(__import__('re').search(r'def\s+__get__\s*\([^)]*\)', facts.raw_code)) and bool(__import__('re').search(r'\bglobal\s+\w+', facts.custom_kernel_active or '')):
+        return [{"pattern": "DESCRIPTOR_CACHE_REUSE", "severity": "high", "evidence": "Descriptor __get__"}]
+    return []
+def detect_metaclass_call_intercept(code_or_facts):
+    facts = ensure_submission_facts(code_or_facts)
+    if not facts.python_active: return []
+    if bool(__import__('re').search(r'class\s+\w+\(type\)[\s\S]{0,500}?def\s+__call__\s*\(', facts.raw_code)) and bool(__import__('re').search(r'metaclass=', facts.raw_code)):
+        return [{"pattern": "METACALL_INTERCEPT", "severity": "high", "evidence": "Metaclass __call__"}]
+    return []
+def detect_function_attr_cache(code_or_facts):
+    facts = ensure_submission_facts(code_or_facts)
+    if not facts.custom_kernel_active: return []
+    a = facts.custom_kernel_active
+    if 'hasattr(custom_kernel' in a and 'custom_kernel.' in a and 'return custom_kernel.' in a:
+        return [{"pattern": "FUNCTION_ATTR_CACHE", "severity": "high", "evidence": "Function attr cache"}]
+    return []
+def detect_dict_missing_cache(code_or_facts):
+    facts = ensure_submission_facts(code_or_facts)
+    if not facts.python_active: return []
+    if bool(__import__('re').search(r'def\s+__missing__', facts.raw_code)) and bool(__import__('re').search(r'\bid\s*\(', facts.raw_code)) and bool(__import__('re').search(r'class\s+\w+\(dict\)', facts.raw_code)):
+        return [{"pattern": "DICT_MISSING_CACHE", "severity": "high", "evidence": "Dict __missing__"}]
+    return []
+def detect_partial_entrypoint(code_or_facts):
+    facts = ensure_submission_facts(code_or_facts)
+    if not facts.python_active: return []
+    if bool(__import__('re').search(r'custom_kernel\s*=\s*functools\.partial', facts.python_active)):
+        return [{"pattern": "PARTIAL_ENTRYPOINT", "severity": "high", "evidence": "functools.partial entrypoint"}]
+    return []
 # Score anomaly detection
 # ---------------------------------------------------------------------------
 
@@ -3653,6 +3717,15 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
         "NEAR_CLONE_SPAM", "administrative", "support", SUSPICIOUS_ONLY, (),
         (), "downgrade",
     ),
+    "GLOBAL_SENTINEL_REUSE": RulePolicy("GLOBAL_SENTINEL_REUSE", "result_reuse", "hard", AUTO_FILTER, (), (), "rewrite"),
+    "CLOSURE_STATE_REUSE": RulePolicy("CLOSURE_STATE_REUSE", "result_reuse", "hard", AUTO_FILTER, (), (), "rewrite"),
+    "CLASS_CACHE_REUSE": RulePolicy("CLASS_CACHE_REUSE", "result_reuse", "hard", AUTO_FILTER, (), (), "rewrite"),
+    "GENERATOR_STATE_REUSE": RulePolicy("GENERATOR_STATE_REUSE", "result_reuse", "hard", AUTO_FILTER, (), (), "rewrite"),
+    "DESCRIPTOR_CACHE_REUSE": RulePolicy("DESCRIPTOR_CACHE_REUSE", "result_reuse", "hard", AUTO_FILTER, (), (), "rewrite"),
+    "METACALL_INTERCEPT": RulePolicy("METACALL_INTERCEPT", "result_reuse", "hard", AUTO_FILTER, (), (), "rewrite"),
+    "FUNCTION_ATTR_CACHE": RulePolicy("FUNCTION_ATTR_CACHE", "result_reuse", "hard", AUTO_FILTER, (), (), "rewrite"),
+    "DICT_MISSING_CACHE": RulePolicy("DICT_MISSING_CACHE", "result_reuse", "hard", AUTO_FILTER, (), (), "rewrite"),
+    "PARTIAL_ENTRYPOINT": RulePolicy("PARTIAL_ENTRYPOINT", "result_reuse", "hard", AUTO_FILTER, (), (), "rewrite"),
 }
 
 BASE_SCORE_CONFIG = {
@@ -3790,6 +3863,15 @@ CODE_DETECTORS = [
     detect_thread_injection,
     detect_lazy_tensor,
     detect_precision_downgrade,
+    detect_global_sentinel_reuse,
+    detect_closure_state_reuse,
+    detect_class_cache_reuse,
+    detect_generator_state_reuse,
+    detect_descriptor_cache_reuse,
+    detect_metaclass_call_intercept,
+    detect_function_attr_cache,
+    detect_dict_missing_cache,
+    detect_partial_entrypoint,
 ]
 
 BASE_DETECTOR_SPECS = [
@@ -3827,6 +3909,15 @@ BASE_DETECTOR_SPECS = [
     ("thread_injection", detect_thread_injection),
     ("lazy_tensor", detect_lazy_tensor),
     ("precision_downgrade", detect_precision_downgrade),
+    ("global_sentinel_reuse", detect_global_sentinel_reuse),
+    ("closure_state_reuse", detect_closure_state_reuse),
+    ("class_cache_reuse", detect_class_cache_reuse),
+    ("generator_state_reuse", detect_generator_state_reuse),
+    ("descriptor_cache_reuse", detect_descriptor_cache_reuse),
+    ("metaclass_call_intercept", detect_metaclass_call_intercept),
+    ("function_attr_cache", detect_function_attr_cache),
+    ("dict_missing_cache", detect_dict_missing_cache),
+    ("partial_entrypoint", detect_partial_entrypoint),
 ]
 
 VALID_RULE_OUTCOMES = {AUTO_FILTER, SUSPICIOUS_ONLY, TELEMETRY_ONLY}
