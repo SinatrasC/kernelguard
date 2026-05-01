@@ -3331,7 +3331,7 @@ def detect_code_module_exec(code: str | SubmissionFacts) -> list[dict]:
     if not RE_CODE_INTERP.search(raw):
         return []
     return [{
-        "pattern": "DYNAMIC_EXECUTION",
+        "pattern": "CODE_MODULE_EXEC",
         "severity": "high",
         "evidence": "code.InteractiveInterpreter/InteractiveConsole — exec/eval wrapper that evades direct call detection",
     }]
@@ -4075,6 +4075,10 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
     ),
     "BREAKPOINT_EXEC": RulePolicy(
         "BREAKPOINT_EXEC", "dynamic_execution", "hard", AUTO_FILTER, (),
+        (), "keep",
+    ),
+    "CODE_MODULE_EXEC": RulePolicy(
+        "CODE_MODULE_EXEC", "dynamic_execution", "hard", AUTO_FILTER, (),
         (), "keep",
     ),
     "FUNCTOOLS_CACHE_REPLAY": RulePolicy(
