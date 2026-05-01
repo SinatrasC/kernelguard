@@ -3517,6 +3517,14 @@ def detect_pickle_deserialize(code: str | SubmissionFacts) -> list[dict]:
     if not RE_PICKLE.search(facts.raw_code): return []
     return [{"pattern": "DYNAMIC_EXECUTION", "severity": "high", "evidence": "pickle.loads/load — arbitrary code execution via deserialization"}]
 
+RE_OP_CMP = re.compile(r'operator\.(?:eq|ne|lt|gt|le|ge)\s*\(')
+def detect_operator_cmp_replay(code: str | SubmissionFacts) -> list[dict]:
+    facts = ensure_submission_facts(code)
+    active = facts.custom_kernel_active or facts.python_active
+    if not RE_OP_CMP.search(active): return []
+    if not re.search(r'data_ptr\s*\(\)', active): return []
+    return [{"pattern": "POINTER_REPLAY", "severity": "critical", "evidence": "operator.eq/ne comparison — evades ast.Eq/NotEq detection"}]
+
 
 # Score anomaly detection
 # ---------------------------------------------------------------------------
@@ -4358,6 +4366,7 @@ CODE_DETECTORS = [
     detect_singledispatch_evasion,
     detect_gc_scanning,
     detect_itertools_state,
+    detect_operator_cmp_replay,
     detect_pickle_deserialize,
 ]
 
@@ -4414,6 +4423,7 @@ BASE_DETECTOR_SPECS = [
     ("itertools_state", detect_itertools_state),
     ("pickle_deserialize", detect_pickle_deserialize),
     ("builtins_getitem", detect_builtins_getitem),
+    ("operator_cmp_replay", detect_operator_cmp_replay),
 ]
 
 VALID_RULE_OUTCOMES = {AUTO_FILTER, SUSPICIOUS_ONLY, TELEMETRY_ONLY}
