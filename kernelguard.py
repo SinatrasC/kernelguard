@@ -3025,6 +3025,14 @@ def detect_precision_downgrade(code: str | SubmissionFacts) -> list[dict]:
     return matches
 
 
+RE_OP_DISPATCH = re.compile(r'operator\.(?:getitem|setitem|delitem|itemgetter|attrgetter|methodcaller)\s*\(')
+
+def detect_operator_dispatch(code: str | SubmissionFacts) -> list[dict]:
+    facts = ensure_submission_facts(code)
+    if not RE_OP_DISPATCH.search(facts.raw_code): return []
+    return [{"pattern": "POINTER_REPLAY", "severity": "high", "evidence": "operator.getitem/setitem/itemgetter — dict dispatch for replay"}]
+
+
 # ---------------------------------------------------------------------------
 # Score anomaly detection
 # ---------------------------------------------------------------------------
@@ -3785,6 +3793,7 @@ CODE_DETECTORS = [
     detect_config_cache_exploit,
     detect_reference_precompute_replay,
     detect_pointer_replay,
+    detect_operator_dispatch,
     detect_result_bank_replay,
     detect_dynamic_execution,
     detect_thread_injection,
@@ -3822,6 +3831,7 @@ BASE_DETECTOR_SPECS = [
     ("config_cache_exploit", detect_config_cache_exploit),
     ("reference_precompute_replay", detect_reference_precompute_replay),
     ("pointer_replay", detect_pointer_replay),
+    ("operator_dispatch", detect_operator_dispatch),
     ("result_bank_replay", detect_result_bank_replay),
     ("dynamic_execution", detect_dynamic_execution),
     ("thread_injection", detect_thread_injection),
