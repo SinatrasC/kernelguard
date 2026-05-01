@@ -3028,11 +3028,15 @@ def detect_global_sentinel_reuse(code_or_facts):
     if not facts.custom_kernel_active or not facts.ast_tree: return []
     for var in facts._none_inited:
         if not re.search(r'\bglobal\s+\b' + re.escape(var) + r'\b', facts.custom_kernel_active): continue
-        if not re.search(r'\bif\s+\b' + re.escape(var) + r'\b\s+is\s+None\b', facts.custom_kernel_active): continue
-        return [{"pattern": "GLOBAL_SENTINEL_REUSE", "severity": "high", "evidence": f"Module-level {var}=None sentinel cache"}]
+        # Pattern 1: if X is None: X = ... / return X
+        if re.search(r'\bif\s+\b' + re.escape(var) + r'\b\s+is\s+None\b', facts.custom_kernel_active):
+            return [{"pattern": "GLOBAL_SENTINEL_REUSE", "severity": "high", "evidence": f"Module-level {var}=None sentinel cache (is None guard)"}]
+        # Pattern 2: if X is not None and X.data_ptr() == ... : return ...
+        if re.search(r'\bif\s+\b' + re.escape(var) + r'\b\s+is\s+not\s+None\b', facts.custom_kernel_active):
+            return [{"pattern": "GLOBAL_SENTINEL_REUSE", "severity": "high", "evidence": f"Module-level {var}=None sentinel cache (is not None + data_ptr guard)"}]
     return []
 
-# Score anomaly detection
+
 # ---------------------------------------------------------------------------
 
 def _collect_scores(metadata: Optional[dict]) -> tuple[list[float], Optional[float], Optional[float]]:
