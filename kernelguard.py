@@ -3356,6 +3356,25 @@ def detect_operator_contains_replay(code: str | SubmissionFacts) -> list[dict]:
     }]
 
 
+def detect_types_code_construction(code: str | SubmissionFacts) -> list[dict]:
+    facts = ensure_submission_facts(code)
+    tree = facts.ast_tree
+    if tree is None:
+        return []
+    matches = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name) and node.func.value.id == "types":
+            if node.func.attr in ("CodeType", "FunctionType", "MethodType", "LambdaType"):
+                matches.append({
+                    "pattern": "CODE_REPLACEMENT",
+                    "severity": "critical",
+                    "evidence": f"types.{node.func.attr}(...) — direct code/function object construction",
+                })
+    return matches
+
+
 # ---------------------------------------------------------------------------
 # Score anomaly detection
 # ---------------------------------------------------------------------------
