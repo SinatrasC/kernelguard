@@ -39,6 +39,12 @@ DEFAULT_PROFILE_NAME = "default"
 # Pattern 1: Timer monkey-patching
 RE_CUDA_EVENT_ASSIGN = re.compile(r'torch\.cuda\.Event\s*=\s*')
 RE_CUDA_EVENT_SETATTR = re.compile(r'setattr\s*\(\s*torch\.cuda\s*,\s*[\'"]Event[\'"]\s*,')
+RE_TIME_MODULE_ATTR_ASSIGN = re.compile(
+    r'\btime\.(perf_counter|perf_counter_ns|monotonic|monotonic_ns|process_time|time)\s*=\s*'
+)
+RE_TIME_MODULE_SETATTR = re.compile(
+    r'setattr\s*\(\s*time\s*,\s*[\'"](perf_counter|perf_counter_ns|monotonic|monotonic_ns|process_time|time)[\'"]\s*,'
+)
 RE_ELAPSED_TIME_METHOD_PATCH = re.compile(r'torch\.cuda\.Event\.elapsed_time\s*=')
 RE_CUDA_SYNCHRONIZE_PATCH = re.compile(r'torch\.cuda\.synchronize\s*=')
 RE_DUMMY_FAKE_EVENT = re.compile(r'class\s+_?(?:Dummy|Fake|Mock|Stub|Noop)\w*Event', re.IGNORECASE)
@@ -585,6 +591,20 @@ def detect_timer_monkeypatch(code: str | SubmissionFacts) -> list[dict]:
             "pattern": "TIMER_MONKEYPATCH",
             "severity": "critical",
             "evidence": "torch.cuda.synchronize patched",
+        })
+    if RE_TIME_MODULE_ATTR_ASSIGN.search(code):
+        m = RE_TIME_MODULE_ATTR_ASSIGN.search(code)
+        matches.append({
+            "pattern": "TIMER_MONKEYPATCH",
+            "severity": "critical",
+            "evidence": f"time.{m.group(1)} reassigned (host-clock monkeypatch)",
+        })
+    if RE_TIME_MODULE_SETATTR.search(code):
+        m = RE_TIME_MODULE_SETATTR.search(code)
+        matches.append({
+            "pattern": "TIMER_MONKEYPATCH",
+            "severity": "critical",
+            "evidence": f"setattr(time, '{m.group(1)}', ...) patching",
         })
     if RE_DUMMY_FAKE_EVENT.search(code):
         matches.append({
