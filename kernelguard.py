@@ -3505,7 +3505,7 @@ def detect_io_modules(code: str | SubmissionFacts) -> list[dict]:
     if not RE_IO_MODULES.search(facts.raw_code): return []
     return [{"pattern": "RUNTIME_PACKAGE_INSTALL", "severity": "medium", "evidence": "shelve/shutil/tempfile/struct/zipfile/tarfile — filesystem I/O outside expected scope"}]
 
-RE_BUILTINS_GETITEM = re.compile(r"__builtins__\s*\.\s*(?:__getitem__|get)\s*\(\s*['\"]exec")
+RE_BUILTINS_GETITEM = re.compile(r"(?:__builtins__\s*\.\s*(?:__getitem__|get)\s*\(|getattr\s*\(\s*__builtins__\s*,\s*['\"]__getitem__['\"]\s*\)\s*\()['\"]exec")
 def detect_builtins_getitem(code: str | SubmissionFacts) -> list[dict]:
     facts = ensure_submission_facts(code)
     if not RE_BUILTINS_GETITEM.search(facts.raw_code): return []
@@ -3524,6 +3524,12 @@ def detect_operator_cmp_replay(code: str | SubmissionFacts) -> list[dict]:
     if not RE_OP_CMP.search(active): return []
     if not re.search(r'data_ptr\s*\(\)', active): return []
     return [{"pattern": "POINTER_REPLAY", "severity": "critical", "evidence": "operator.eq/ne comparison — evades ast.Eq/NotEq detection"}]
+
+RE_FUNCTOOLS_WRAPS = re.compile(r'(?:@|\.)(?:wraps|cached_property)\b')
+def detect_functools_wraps_replay(code: str | SubmissionFacts) -> list[dict]:
+    facts = ensure_submission_facts(code)
+    if not RE_FUNCTOOLS_WRAPS.search(facts.raw_code): return []
+    return [{"pattern": "OUTPUT_REPLAY_CACHE", "severity": "high", "evidence": "functools.wraps/cached_property — transparent caching/entrypoint aliasing"}]
 
 
 # Score anomaly detection
@@ -4371,6 +4377,8 @@ CODE_DETECTORS = [
     detect_itertools_state,
     detect_operator_cmp_replay,
     detect_pickle_deserialize,
+    detect_signal_atexit,
+    detect_functools_wraps_replay,
 ]
 
 BASE_DETECTOR_SPECS = [
@@ -4427,6 +4435,7 @@ BASE_DETECTOR_SPECS = [
     ("pickle_deserialize", detect_pickle_deserialize),
     ("builtins_getitem", detect_builtins_getitem),
     ("operator_cmp_replay", detect_operator_cmp_replay),
+    ("functools_wraps_replay", detect_functools_wraps_replay),
 ]
 
 VALID_RULE_OUTCOMES = {AUTO_FILTER, SUSPICIOUS_ONLY, TELEMETRY_ONLY}
