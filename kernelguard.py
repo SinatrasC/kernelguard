@@ -3722,6 +3722,14 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
         "TORCH_FUNCTION_PROTOCOL", "result_reuse", "hard", AUTO_FILTER, (),
         (), "rewrite",
     ),
+    "AUTOGRAD_FUNCTION_FORWARD": RulePolicy(
+        "AUTOGRAD_FUNCTION_FORWARD", "result_reuse", "hard", AUTO_FILTER, (),
+        (), "rewrite",
+    ),
+    "METHODTYPE_DISPATCH": RulePolicy(
+        "METHODTYPE_DISPATCH", "result_reuse", "hard", AUTO_FILTER, (),
+        (), "rewrite",
+    ),
 }
 
 BASE_SCORE_CONFIG = {
@@ -3901,6 +3909,8 @@ BASE_DETECTOR_SPECS = [
     ("init_subclass_hook", detect_init_subclass_hook),
     ("class_getitem_dispatch", detect_class_getitem_dispatch),
     ("torch_function_protocol", detect_torch_function_protocol),
+    ("autograd_function_forward", detect_autograd_function_forward),
+    ("methodtype_dispatch", detect_methodtype_dispatch),
 ]
 
 VALID_RULE_OUTCOMES = {AUTO_FILTER, SUSPICIOUS_ONLY, TELEMETRY_ONLY}
