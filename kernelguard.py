@@ -3687,6 +3687,10 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
         "NEAR_CLONE_SPAM", "administrative", "support", SUSPICIOUS_ONLY, (),
         (), "downgrade",
     ),
+    "GENERATOR_STATE_REUSE": RulePolicy(
+        "GENERATOR_STATE_REUSE", "result_reuse", "hard", AUTO_FILTER, (),
+        (), "rewrite",
+    ),
 }
 
 BASE_SCORE_CONFIG = {
@@ -3825,6 +3829,7 @@ CODE_DETECTORS = [
     detect_lazy_tensor,
     detect_precision_downgrade,
     detect_class_cache_reuse,
+    detect_generator_state_reuse,
 ]
 
 BASE_DETECTOR_SPECS = [
@@ -3863,6 +3868,7 @@ BASE_DETECTOR_SPECS = [
     ("lazy_tensor", detect_lazy_tensor),
     ("precision_downgrade", detect_precision_downgrade),
     ("class_cache_reuse", detect_class_cache_reuse),
+    ("generator_state_reuse", detect_generator_state_reuse),
 ]
 
 VALID_RULE_OUTCOMES = {AUTO_FILTER, SUSPICIOUS_ONLY, TELEMETRY_ONLY}
