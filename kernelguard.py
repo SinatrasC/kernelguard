@@ -3025,6 +3025,63 @@ def detect_precision_downgrade(code: str | SubmissionFacts) -> list[dict]:
     return matches
 
 
+def detect_init_subclass_hook(code_or_facts):
+    facts = ensure_submission_facts(code_or_facts)
+    if not facts.ast_tree: return []
+    import re
+    has_init_subclass = bool(re.search(r'def\s+__init_subclass__\s*\([^)]*\)', facts.raw_code))
+    has_lambda_entry = bool(re.search(r'__init_subclass__[\s\S]{0,300}?custom_kernel\s*=\s*lambda', facts.raw_code))
+    if has_init_subclass and has_lambda_entry:
+        return [{"pattern": "INIT_SUBCLASS_HOOK", "severity": "high", "evidence": "__init_subclass__ used to inject custom_kernel lambda entrypoint dynamically"}]
+    return []
+
+
+def detect_class_getitem_dispatch(code_or_facts):
+    facts = ensure_submission_facts(code_or_facts)
+    if not facts.python_active: return []
+    import re
+    has_getitem = bool(re.search(r'def\s+__class_getitem__\s*\([^)]*\)', facts.raw_code))
+    has_bracket_call = bool(re.search(r'\w+\[data\]', facts.custom_kernel_active or ''))
+    if has_getitem and has_bracket_call:
+        return [{"pattern": "CLASS_GETITEM_DISPATCH", "severity": "high", "evidence": "__class_getitem__ used as dispatch mechanism for tensor computation bypass"}]
+    return []
+
+
+def detect_torch_function_protocol(code_or_facts):
+    facts = ensure_submission_facts(code_or_facts)
+    if not facts.python_active: return []
+    import re
+    has_torch_fn = bool(re.search(r'__torch_function__\s*\(', facts.raw_code))
+    if has_torch_fn:
+        return [{"pattern": "TORCH_FUNCTION_PROTOCOL", "severity": "high", "evidence": "__torch_function__ protocol used for computation dispatch (potential eval bypass)"}]
+    return []
+
+
+def detect_autograd_function_forward(code_or_facts):
+    facts = ensure_submission_facts(code_or_facts)
+    if not facts.python_active:
+        return []
+    import re
+    has_autograd_fn = bool(re.search(r'torch\.autograd\.Function', facts.raw_code))
+    has_forward = bool(re.search(r'def\s+forward\s*\([^)]*\)', facts.raw_code))
+    has_apply = bool(re.search(r'\.apply\s*\(', facts.custom_kernel_active or ''))
+    if has_autograd_fn and has_forward and has_apply:
+        return [{"pattern": "AUTOGRAD_FUNCTION_FORWARD", "severity": "high", "evidence": "torch.autograd.Function subclass with forward/apply used as computation entrypoint bypass"}]
+    return []
+
+
+def detect_methodtype_dispatch(code_or_facts):
+    facts = ensure_submission_facts(code_or_facts)
+    if not facts.python_active:
+        return []
+    import re
+    has_methodtype = bool(re.search(r'types\.MethodType\s*\(', facts.raw_code))
+    has_attr_assign = bool(re.search(r'\.custom_kernel\s*=\s*', facts.raw_code))
+    if has_methodtype and has_attr_assign:
+        return [{"pattern": "METHODTYPE_DISPATCH", "severity": "high", "evidence": "types.MethodType used to dynamically attach entrypoint to object"}]
+    return []
+
+
 # ---------------------------------------------------------------------------
 # Score anomaly detection
 # ---------------------------------------------------------------------------
@@ -3653,6 +3710,18 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
         "NEAR_CLONE_SPAM", "administrative", "support", SUSPICIOUS_ONLY, (),
         (), "downgrade",
     ),
+    "INIT_SUBCLASS_HOOK": RulePolicy(
+        "INIT_SUBCLASS_HOOK", "result_reuse", "hard", AUTO_FILTER, (),
+        (), "rewrite",
+    ),
+    "CLASS_GETITEM_DISPATCH": RulePolicy(
+        "CLASS_GETITEM_DISPATCH", "result_reuse", "hard", AUTO_FILTER, (),
+        (), "rewrite",
+    ),
+    "TORCH_FUNCTION_PROTOCOL": RulePolicy(
+        "TORCH_FUNCTION_PROTOCOL", "result_reuse", "hard", AUTO_FILTER, (),
+        (), "rewrite",
+    ),
 }
 
 BASE_SCORE_CONFIG = {
@@ -3790,6 +3859,8 @@ CODE_DETECTORS = [
     detect_thread_injection,
     detect_lazy_tensor,
     detect_precision_downgrade,
+    detect_autograd_function_forward,
+    detect_methodtype_dispatch,
 ]
 
 BASE_DETECTOR_SPECS = [
@@ -3827,6 +3898,9 @@ BASE_DETECTOR_SPECS = [
     ("thread_injection", detect_thread_injection),
     ("lazy_tensor", detect_lazy_tensor),
     ("precision_downgrade", detect_precision_downgrade),
+    ("init_subclass_hook", detect_init_subclass_hook),
+    ("class_getitem_dispatch", detect_class_getitem_dispatch),
+    ("torch_function_protocol", detect_torch_function_protocol),
 ]
 
 VALID_RULE_OUTCOMES = {AUTO_FILTER, SUSPICIOUS_ONLY, TELEMETRY_ONLY}
