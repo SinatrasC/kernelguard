@@ -524,6 +524,163 @@ def _expr_has_tensor_version(expr: ast.AST | None) -> bool:
     )
 
 
+def _walk_without_nested_defs(node: ast.AST):
+    yield node
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+        return
+    for child in ast.iter_child_nodes(node):
+        yield from _walk_without_nested_defs(child)
+
+
+def _function_nodes(fn: ast.FunctionDef | ast.AsyncFunctionDef):
+    for stmt in fn.body:
+        yield from _walk_without_nested_defs(stmt)
+
+
+def _collect_name_targets(target: ast.AST | None) -> set[str]:
+    if target is None:
+        return set()
+    if isinstance(target, ast.Name):
+        return {target.id}
+    if isinstance(target, (ast.Tuple, ast.List)):
+        names = set()
+        for elt in target.elts:
+            names.update(_collect_name_targets(elt))
+        return names
+    return set()
+
+
+def _function_param_names(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> tuple[str, ...]:
+    names = [arg.arg for arg in fn.args.posonlyargs]
+    names.extend(arg.arg for arg in fn.args.args)
+    names.extend(arg.arg for arg in fn.args.kwonlyargs)
+    if fn.args.vararg is not None:
+        names.append(fn.args.vararg.arg)
+    if fn.args.kwarg is not None:
+        names.append(fn.args.kwarg.arg)
+    return tuple(names)
+
+
+def _function_captures(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
+    params = set(_function_param_names(fn))
+    globals_declared: set[str] = set()
+    nonlocals_declared: set[str] = set()
+    local_targets: set[str] = set()
+    referenced: set[str] = set()
+
+    for node in _function_nodes(fn):
+        if isinstance(node, ast.Global):
+            globals_declared.update(node.names)
+        elif isinstance(node, ast.Nonlocal):
+            nonlocals_declared.update(node.names)
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+            referenced.add(node.id)
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                local_targets.update(_collect_name_targets(target))
+        elif isinstance(node, ast.AnnAssign):
+            local_targets.update(_collect_name_targets(node.target))
+        elif isinstance(node, ast.AugAssign):
+            local_targets.update(_collect_name_targets(node.target))
+        elif isinstance(node, ast.For):
+            local_targets.update(_collect_name_targets(node.target))
+
+    local_only = local_targets - globals_declared - nonlocals_declared
+    return referenced - params - local_only
+
+
+def _depends_on_names(expr: ast.AST | None, names: set[str]) -> bool:
+    if expr is None or not names:
+        return False
+    return bool(_expr_names(expr) & names)
+
+
+def _state_read_root(expr: ast.AST | None, state_names: set[str], aliases: dict[str, str]) -> Optional[str]:
+    if expr is None:
+        return None
+    if isinstance(expr, ast.Name):
+        if expr.id in state_names:
+            return expr.id
+        return aliases.get(expr.id)
+    if isinstance(expr, (ast.Subscript, ast.Attribute)):
+        root = _ast_root_name(expr)
+        if root in state_names:
+            return root
+    if (
+        isinstance(expr, ast.Call)
+        and isinstance(expr.func, ast.Attribute)
+        and expr.func.attr == "get"
+    ):
+        root = _ast_root_name(expr.func.value)
+        if root in state_names:
+            return root
+    return None
+
+
+def _has_state_shortcut_replay(
+    fn: ast.FunctionDef | ast.AsyncFunctionDef,
+    state_names: set[str],
+    input_names: set[str],
+) -> Optional[str]:
+    input_derived = set(input_names)
+    aliases: dict[str, str] = {}
+
+    changed = True
+    while changed:
+        changed = False
+        for child in _function_nodes(fn):
+            if not isinstance(child, ast.Assign):
+                continue
+            if len(child.targets) != 1 or not isinstance(child.targets[0], ast.Name):
+                continue
+            target_name = child.targets[0].id
+            if _depends_on_names(child.value, input_derived) and target_name not in input_derived:
+                input_derived.add(target_name)
+                changed = True
+            state_root = _state_read_root(child.value, state_names, aliases)
+            if state_root is not None and aliases.get(target_name) != state_root:
+                aliases[target_name] = state_root
+                changed = True
+
+    state_from_input: set[str] = set()
+    for child in _function_nodes(fn):
+        if isinstance(child, ast.Assign):
+            for target in child.targets:
+                root = _ast_root_name(target)
+                if root in state_names and _depends_on_names(child.value, input_derived):
+                    state_from_input.add(root)
+        elif isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute):
+            root = _ast_root_name(child.func.value)
+            if root not in state_names or child.func.attr not in {"append", "extend", "set", "update"}:
+                continue
+            if any(_depends_on_names(arg, input_derived) for arg in child.args):
+                state_from_input.add(root)
+
+    if not state_from_input:
+        return None
+
+    for child in _function_nodes(fn):
+        if not isinstance(child, ast.If):
+            continue
+        if _body_has_calls(child.body):
+            continue
+        if _expr_names(child.test) & input_names:
+            continue
+        test_names = _expr_names(child.test)
+        for stmt in child.body:
+            if not isinstance(stmt, ast.Return) or stmt.value is None:
+                continue
+            state_root = _state_read_root(stmt.value, state_names, aliases)
+            if state_root not in state_from_input:
+                continue
+            if state_root in test_names or any(
+                alias in test_names and alias_root == state_root
+                for alias, alias_root in aliases.items()
+            ):
+                return state_root
+    return None
+
+
 _TRIVIAL_GPU_OPS = frozenset({
     "fill_", "zero_", "copy_", "fill", "zero", "record",
 })
@@ -2462,6 +2619,82 @@ def detect_last_call_replay(code: str | SubmissionFacts) -> list[dict]:
     return []
 
 
+def detect_type_callable_factory_replay(code: str | SubmissionFacts) -> list[dict]:
+    """Pattern: custom_kernel is a type()-built callable with captured replay state."""
+    facts = ensure_submission_facts(code)
+    tree = facts.ast_tree
+    if tree is None or not isinstance(tree, ast.Module):
+        return []
+
+    functions = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+
+    for stmt in tree.body:
+        if not isinstance(stmt, ast.Assign):
+            continue
+        if not any(isinstance(target, ast.Name) and target.id == "custom_kernel" for target in stmt.targets):
+            continue
+        if not isinstance(stmt.value, ast.Call) or not isinstance(stmt.value.func, ast.Name):
+            continue
+        factory = functions.get(stmt.value.func.id)
+        if factory is None:
+            continue
+
+        inner_functions = {
+            child.name: child
+            for child in factory.body
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        type_callables: dict[str, str] = {}
+        for child in factory.body:
+            if not isinstance(child, ast.Assign):
+                continue
+            if len(child.targets) != 1 or not isinstance(child.targets[0], ast.Name):
+                continue
+            if not isinstance(child.value, ast.Call):
+                continue
+            if not isinstance(child.value.func, ast.Name) or child.value.func.id != "type":
+                continue
+            if len(child.value.args) < 3 or not isinstance(child.value.args[2], ast.Dict):
+                continue
+            for key, value in zip(child.value.args[2].keys, child.value.args[2].values):
+                if not isinstance(key, ast.Constant) or key.value != "__call__":
+                    continue
+                if isinstance(value, ast.Name) and value.id in inner_functions:
+                    type_callables[child.targets[0].id] = value.id
+
+        for child in factory.body:
+            if not isinstance(child, ast.Return):
+                continue
+            if not isinstance(child.value, ast.Call) or not isinstance(child.value.func, ast.Name):
+                continue
+            method_name = type_callables.get(child.value.func.id)
+            if method_name is None:
+                continue
+            method = inner_functions[method_name]
+            params = _function_param_names(method)
+            if len(params) < 2:
+                continue
+            state_names = _function_captures(method) | {params[0]}
+            input_names = set(params[1:])
+            state_root = _has_state_shortcut_replay(method, state_names, input_names)
+            if state_root is None:
+                continue
+            return [{
+                "pattern": "TYPE_CALLABLE_FACTORY_REPLAY",
+                "severity": "critical",
+                "evidence": (
+                    f"custom_kernel factory {factory.name} builds a type() callable whose "
+                    f"__call__ returns captured replay state {state_root}"
+                ),
+            }]
+
+    return []
+
+
 RE_OBJECT_ID_DATA = re.compile(r"\bdata_id\s*=\s*id\s*\(\s*data\s*\)")
 RE_RESULT_BANK_SET = re.compile(r"_superbatch_results\s*\[\s*(?:did|data_id)\s*\]\s*=")
 RE_RESULT_BANK_RETURN = re.compile(r"return\s+_superbatch_results\s*\[\s*data_id\s*\]")
@@ -3479,6 +3712,10 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
         "LAST_CALL_REPLAY", "result_reuse", "hard", AUTO_FILTER, (),
         AMD_MANUAL_LAST_CALL_REPLAY_FIXTURES, "keep",
     ),
+    "TYPE_CALLABLE_FACTORY_REPLAY": RulePolicy(
+        "TYPE_CALLABLE_FACTORY_REPLAY", "result_reuse", "hard", AUTO_FILTER, (),
+        (), "keep",
+    ),
     "SHAPE_OUTPUT_REPLAY": RulePolicy(
         "SHAPE_OUTPUT_REPLAY", "result_reuse", "hard", AUTO_FILTER, (),
         AMD_PACKAGE_SHAPE_REPLAY_FIXTURES, "keep",
@@ -3762,6 +3999,7 @@ CODE_DETECTORS = [
     detect_decode_mm_ref,
     detect_result_caching,
     detect_last_call_replay,
+    detect_type_callable_factory_replay,
     detect_shape_output_replay,
     detect_timed_input_replay,
     detect_cuda_graph_replay,
@@ -3800,6 +4038,7 @@ BASE_DETECTOR_SPECS = [
     ("decode_mm_ref", detect_decode_mm_ref),
     ("result_caching", detect_result_caching),
     ("last_call_replay", detect_last_call_replay),
+    ("type_callable_factory_replay", detect_type_callable_factory_replay),
     ("shape_output_replay", detect_shape_output_replay),
     ("timed_input_replay", detect_timed_input_replay),
     ("cuda_graph_replay", detect_cuda_graph_replay),
