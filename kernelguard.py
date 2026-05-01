@@ -3887,6 +3887,10 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
         "EQ_NONE_SENTINEL_REPLAY", "result_reuse", "hard", AUTO_FILTER, (),
         (), "keep",
     ),
+    "GETATTR_DATAPTR_REPLAY": RulePolicy(
+        "GETATTR_DATAPTR_REPLAY", "result_reuse", "hard", AUTO_FILTER, (),
+        (), "keep",
+    ),
     "DUPLICATE_SPAM": RulePolicy(
         "DUPLICATE_SPAM", "administrative", "support", SUSPICIOUS_ONLY, (),
         (), "downgrade",
@@ -4034,6 +4038,7 @@ CODE_DETECTORS = [
     detect_precision_downgrade,
     detect_hash_cache_replay,
     detect_eq_none_sentinel_replay,
+    detect_getattr_data_ptr_replay,
 ]
 
 BASE_DETECTOR_SPECS = [
@@ -4073,6 +4078,7 @@ BASE_DETECTOR_SPECS = [
     ("precision_downgrade", detect_precision_downgrade),
     ("hash_cache_replay", detect_hash_cache_replay),
     ("eq_none_sentinel_replay", detect_eq_none_sentinel_replay),
+    ("getattr_data_ptr_replay", detect_getattr_data_ptr_replay),
 ]
 
 VALID_RULE_OUTCOMES = {AUTO_FILTER, SUSPICIOUS_ONLY, TELEMETRY_ONLY}
@@ -4949,7 +4955,7 @@ AUDIT_RULE_ORDER = [
     "HARDCODED_SHAPES", "TRIVIAL_PROBE",
     "OBFUSCATED_EXEC", "DYNAMIC_EXECUTION", "MODULE_RELOAD", "THREAD_INJECTION", "LAZY_TENSOR",
     "TOKEN_PASTE_CUDA_API", "SEQUENCE_BATCH_GRAPH", "PARTIAL_GRAPH_KEY", "RUNTIME_PACKAGE_INSTALL",
-    "PRECISION_DOWNGRADE", "HASH_CACHE_REPLAY", "EQ_NONE_SENTINEL_REPLAY", "SCORE_PHYSICS_FLOOR", "SCORE_IMPOSSIBLE", "SCORE_SUSPECT_FLOOR",
+    "PRECISION_DOWNGRADE", "HASH_CACHE_REPLAY", "EQ_NONE_SENTINEL_REPLAY", "GETATTR_DATAPTR_REPLAY", "NOT_EQ_REPLAY", "SCORE_PHYSICS_FLOOR", "SCORE_IMPOSSIBLE", "SCORE_SUSPECT_FLOOR",
     "SCORE_BROKEN", "SCORE_EXTREME_SPEEDUP", "DUPLICATE_SPAM", "NEAR_CLONE_SPAM",
 ]
 
