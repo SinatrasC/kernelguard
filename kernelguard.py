@@ -1929,6 +1929,11 @@ def detect_reference_precompute_replay(code: str | SubmissionFacts) -> list[dict
     }]
 
 
+_TORCH_CONSTANT_TENSOR_BUILDERS = frozenset({
+    "zeros_like", "zeros", "empty_like", "empty", "ones_like", "ones",
+})
+
+
 def detect_shape_output_replay(code: str | SubmissionFacts) -> list[dict]:
     """Pattern: output replay keyed only by config / shape state."""
     facts = ensure_submission_facts(code)
@@ -1936,6 +1941,69 @@ def detect_shape_output_replay(code: str | SubmissionFacts) -> list[dict]:
     if tree is None:
         return []
     entrypoint_name = entrypoint_label(facts.entrypoint_name)
+
+    # Score-anomaly variant: kernel "remembers" shapes in a captured set/dict
+    # and returns a constant zero / empty tensor on the fast path. Looks
+    # legitimate at a glance but the early-return path produces output
+    # impossible at the physics floor (no real compute happened).
+    #
+    #     _seen = set()
+    #     def custom_kernel(data):
+    #         k = tuple(data.shape)
+    #         if k in _seen:
+    #             return torch.zeros_like(data)
+    #         _seen.add(k)
+    #         return data.clone()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) or not is_entrypoint_name(node.name):
+            continue
+        # Captured names mutated via attribute method call (.add, .append,
+        # .update, etc.). These are the shape registries.
+        mutated_collections: set[str] = set()
+        for child in ast.walk(node):
+            if (
+                isinstance(child, ast.Call)
+                and isinstance(child.func, ast.Attribute)
+                and isinstance(child.func.value, ast.Name)
+                and child.func.attr in ("add", "append", "update", "extend")
+            ):
+                mutated_collections.add(child.func.value.id)
+        if not mutated_collections:
+            continue
+
+        for child in ast.walk(node):
+            if not isinstance(child, ast.If):
+                continue
+            test = child.test
+            if not (
+                isinstance(test, ast.Compare)
+                and len(test.ops) == 1
+                and isinstance(test.ops[0], ast.In)
+                and len(test.comparators) == 1
+                and isinstance(test.comparators[0], ast.Name)
+                and test.comparators[0].id in mutated_collections
+            ):
+                continue
+            for stmt in child.body:
+                if not isinstance(stmt, ast.Return) or stmt.value is None:
+                    continue
+                rv = stmt.value
+                if (
+                    isinstance(rv, ast.Call)
+                    and isinstance(rv.func, ast.Attribute)
+                    and isinstance(rv.func.value, ast.Name)
+                    and rv.func.value.id == "torch"
+                    and rv.func.attr in _TORCH_CONSTANT_TENSOR_BUILDERS
+                ):
+                    return [{
+                        "pattern": "SHAPE_OUTPUT_REPLAY",
+                        "severity": "critical",
+                        "evidence": (
+                            f"{entrypoint_name} fast-paths to torch.{rv.func.attr}() "
+                            f"on already-seen shape (captured-set membership) — "
+                            f"physics-floor abuse via zero-compute return"
+                        ),
+                    }]
 
     active = facts.python_active
     if re.search(r'torch\.zeros', active) and re.search(r'return\s+_Z\s*\[\s*key\s*\]', active):
