@@ -3083,6 +3083,16 @@ def detect_methodtype_dispatch(code_or_facts):
 
 
 # ---------------------------------------------------------------------------
+def detect_global_sentinel_reuse(code_or_facts):
+    facts = ensure_submission_facts(code_or_facts)
+    if not facts.custom_kernel_active or not facts.ast_tree: return []
+    for var in facts._none_inited:
+        if not re.search(r'\bglobal\s+\b' + re.escape(var) + r'\b', facts.custom_kernel_active): continue
+        if not re.search(r'\bif\s+\b' + re.escape(var) + r'\b\s+is\s+None\b', facts.custom_kernel_active): continue
+        return [{"pattern": "GLOBAL_SENTINEL_REUSE", "severity": "high", "evidence": f"Module-level {var}=None sentinel cache"}]
+    return []
+
+
 # Score anomaly detection
 # ---------------------------------------------------------------------------
 
@@ -3869,8 +3879,8 @@ CODE_DETECTORS = [
     detect_precision_downgrade,
     detect_autograd_function_forward,
     detect_methodtype_dispatch,
+    detect_global_sentinel_reuse,
 ]
-
 BASE_DETECTOR_SPECS = [
     ("timer_monkeypatch", detect_timer_monkeypatch),
     ("print_injection", detect_print_injection),
@@ -3911,8 +3921,8 @@ BASE_DETECTOR_SPECS = [
     ("torch_function_protocol", detect_torch_function_protocol),
     ("autograd_function_forward", detect_autograd_function_forward),
     ("methodtype_dispatch", detect_methodtype_dispatch),
+    ("global_sentinel_reuse", detect_global_sentinel_reuse),
 ]
-
 VALID_RULE_OUTCOMES = {AUTO_FILTER, SUSPICIOUS_ONLY, TELEMETRY_ONLY}
 VALID_RULE_TIERS = {"hard", "support", "telemetry"}
 VALID_NONFILTER_CLASSES = {"valid", "low_confidence", "suspicious"}
