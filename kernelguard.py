@@ -3023,9 +3023,15 @@ def detect_precision_downgrade(code: str | SubmissionFacts) -> list[dict]:
             })
 
     return matches
+def detect_global_sentinel_reuse(code_or_facts):
+    facts = ensure_submission_facts(code_or_facts)
+    if not facts.custom_kernel_active or not facts.ast_tree: return []
+    for var in facts._none_inited:
+        if not re.search(r'\bglobal\s+\b' + re.escape(var) + r'\b', facts.custom_kernel_active): continue
+        if not re.search(r'\bif\s+\b' + re.escape(var) + r'\b\s+is\s+None\b', facts.custom_kernel_active): continue
+        return [{"pattern": "GLOBAL_SENTINEL_REUSE", "severity": "high", "evidence": f"Module-level {var}=None sentinel cache"}]
+    return []
 
-
-# ---------------------------------------------------------------------------
 # Score anomaly detection
 # ---------------------------------------------------------------------------
 
@@ -3653,6 +3659,7 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
         "NEAR_CLONE_SPAM", "administrative", "support", SUSPICIOUS_ONLY, (),
         (), "downgrade",
     ),
+    "GLOBAL_SENTINEL_REUSE": RulePolicy("GLOBAL_SENTINEL_REUSE", "result_reuse", "hard", AUTO_FILTER, (), (), "rewrite"),
 }
 
 BASE_SCORE_CONFIG = {
@@ -3790,6 +3797,7 @@ CODE_DETECTORS = [
     detect_thread_injection,
     detect_lazy_tensor,
     detect_precision_downgrade,
+    detect_global_sentinel_reuse,
 ]
 
 BASE_DETECTOR_SPECS = [
@@ -3827,6 +3835,7 @@ BASE_DETECTOR_SPECS = [
     ("thread_injection", detect_thread_injection),
     ("lazy_tensor", detect_lazy_tensor),
     ("precision_downgrade", detect_precision_downgrade),
+    ("global_sentinel_reuse", detect_global_sentinel_reuse),
 ]
 
 VALID_RULE_OUTCOMES = {AUTO_FILTER, SUSPICIOUS_ONLY, TELEMETRY_ONLY}
