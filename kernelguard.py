@@ -4358,10 +4358,8 @@ CODE_DETECTORS = [
     detect_singledispatch_evasion,
     detect_gc_scanning,
     detect_itertools_state,
-    detect_pickle_deserialize
-
-
-
+    detect_pickle_deserialize,
+]
 
 BASE_DETECTOR_SPECS = [
     ("timer_monkeypatch", detect_timer_monkeypatch),
@@ -4413,9 +4411,10 @@ BASE_DETECTOR_SPECS = [
     ("gc_scanning", detect_gc_scanning),
     ("singledispatch_evasion", detect_singledispatch_evasion),
     ("signal_atexit", detect_signal_atexit),
-    ("itertools_state", detect_itertools_state),,
-    ("pickle_deserialize", detect_pickle_deserialize)
-
+    ("itertools_state", detect_itertools_state),
+    ("pickle_deserialize", detect_pickle_deserialize),
+    ("builtins_getitem", detect_builtins_getitem),
+]
 
 VALID_RULE_OUTCOMES = {AUTO_FILTER, SUSPICIOUS_ONLY, TELEMETRY_ONLY}
 VALID_RULE_TIERS = {"hard", "support", "telemetry"}
