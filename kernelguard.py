@@ -2786,6 +2786,56 @@ def detect_dynamic_execution(code: str | SubmissionFacts) -> list[dict]:
                 "evidence": "importlib.reload() (module state reset/manipulation)",
             })
 
+    # chr()-concatenation obfuscation: building strings character-by-character
+    # via chr() calls chained with + is essentially never legitimate in a
+    # compute kernel; it shows up when an attacker is hiding a literal name
+    # ("clone", "exec", "open", an import path) from grep-based filters and
+    # then handing the constructed string to getattr / __import__ / exec / eval.
+    if "CHR_CONCAT_OBFUSCATION" not in seen:
+        def _count_chr_leaves(expr: ast.AST) -> int:
+            """Count chr() call leaves in an Add-chain BinOp tree.
+
+            ``chr(99) + chr(108) + ... + chr(101)`` shows up as a left-leaning
+            BinOp tree of Add ops; this walks it and counts how many leaves
+            are bare chr(int) calls. Any non-chr leaf or non-Add op makes the
+            chain disqualifying.
+            """
+            if isinstance(expr, ast.BinOp) and isinstance(expr.op, ast.Add):
+                left = _count_chr_leaves(expr.left)
+                if left < 0:
+                    return -1
+                right = _count_chr_leaves(expr.right)
+                if right < 0:
+                    return -1
+                return left + right
+            if (
+                isinstance(expr, ast.Call)
+                and isinstance(expr.func, ast.Name)
+                and expr.func.id == "chr"
+            ):
+                return 1
+            return -1
+
+        for expr in ast.walk(tree):
+            if not isinstance(expr, ast.BinOp) or not isinstance(expr.op, ast.Add):
+                continue
+            # Only look at the outermost Add chain — skip when this BinOp is
+            # itself a child of an Add BinOp (we'll see the parent first).
+            count = _count_chr_leaves(expr)
+            if count < 3:
+                continue
+            seen.add("CHR_CONCAT_OBFUSCATION")
+            matches.append({
+                "pattern": "OBFUSCATED_EXEC",
+                "severity": "critical",
+                "evidence": (
+                    f"string built character-by-character via chr() concatenation "
+                    f"({count} chr() leaves) — used to hide a literal name from "
+                    f"grep-based filters before dynamic dispatch"
+                ),
+            })
+            break
+
     return matches
 
 
