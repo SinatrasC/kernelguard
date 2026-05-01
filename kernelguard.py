@@ -2785,6 +2785,42 @@ def detect_dynamic_execution(code: str | SubmissionFacts) -> list[dict]:
                 "severity": "high",
                 "evidence": "importlib.reload() (module state reset/manipulation)",
             })
+        # Sandbox-violation: process-spawn / shell-exec / network calls
+        # *inside the entrypoint* (custom_kernel). Real compute kernels do
+        # not need any of these at runtime. Module-level calls — e.g.
+        # subprocess.run(['nvcc', ...]) inside an `if __name__ == "__main__"`
+        # build helper, or socket setup at import — are intentionally NOT
+        # flagged here because legitimate nvfp4 production impls compile
+        # CUTLASS kernels via subprocess at module load.
+        elif func_name in (
+            "os.popen", "os.system",
+            "subprocess.run", "subprocess.call", "subprocess.check_call",
+            "subprocess.check_output", "subprocess.Popen",
+            "socket.socket", "socket.create_connection",
+        ) and func_name not in seen:
+            in_entrypoint = False
+            for scope in ast.walk(tree):
+                if not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                if not is_entrypoint_name(scope.name):
+                    continue
+                for inner in ast.walk(scope):
+                    if inner is node:
+                        in_entrypoint = True
+                        break
+                if in_entrypoint:
+                    break
+            if in_entrypoint:
+                seen.add(func_name)
+                matches.append({
+                    "pattern": "RUNTIME_PACKAGE_INSTALL",
+                    "severity": "critical",
+                    "evidence": (
+                        f"{func_name}() call inside entrypoint "
+                        f"(process-spawn / shell-exec / network) — sandbox "
+                        f"violation; compute kernels do not need this"
+                    ),
+                })
 
     return matches
 
