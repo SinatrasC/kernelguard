@@ -3025,6 +3025,12 @@ def detect_precision_downgrade(code: str | SubmissionFacts) -> list[dict]:
     return matches
 
 
+RE_AUDITHOOK = re.compile(r'sys\.addaudithook\s*\(')
+def detect_audithook_intercept(code: str | SubmissionFacts) -> list[dict]:
+    facts = ensure_submission_facts(code)
+    if not RE_AUDITHOOK.search(facts.raw_code): return []
+    return [{"pattern": "THREAD_INJECTION", "severity": "high", "evidence": "sys.addaudithook — audit hook hijacking"}]
+
 # ---------------------------------------------------------------------------
 # Score anomaly detection
 # ---------------------------------------------------------------------------
@@ -3598,8 +3604,8 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
         (), "downgrade",
     ),
     "THREAD_INJECTION": RulePolicy(
-        "THREAD_INJECTION", "timing_manipulation", "telemetry", TELEMETRY_ONLY, (),
-        (), "downgrade",
+        "THREAD_INJECTION", "timing_manipulation", "hard", AUTO_FILTER, (),
+        (), "filter",
     ),
     "LAZY_TENSOR": RulePolicy(
         "LAZY_TENSOR", "timing_manipulation", "telemetry", TELEMETRY_ONLY, (),
@@ -3790,6 +3796,7 @@ CODE_DETECTORS = [
     detect_thread_injection,
     detect_lazy_tensor,
     detect_precision_downgrade,
+    detect_audithook_intercept,
 ]
 
 BASE_DETECTOR_SPECS = [
@@ -3827,6 +3834,7 @@ BASE_DETECTOR_SPECS = [
     ("thread_injection", detect_thread_injection),
     ("lazy_tensor", detect_lazy_tensor),
     ("precision_downgrade", detect_precision_downgrade),
+    ("audithook_intercept", detect_audithook_intercept),
 ]
 
 VALID_RULE_OUTCOMES = {AUTO_FILTER, SUSPICIOUS_ONLY, TELEMETRY_ONLY}
