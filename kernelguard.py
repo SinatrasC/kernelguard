@@ -1697,6 +1697,24 @@ def detect_introspection_exploit(code: str | SubmissionFacts) -> list[dict]:
                 if key not in seen_patterns:
                     seen_patterns.add(key)
                     saw_frame_access = True
+            elif (isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "sys"
+                    and node.func.attr == "_getframe"):
+                key = "sys._getframe"
+                if key not in seen_patterns:
+                    seen_patterns.add(key)
+                    saw_frame_access = True
+            elif (isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "sys"
+                    and node.func.attr == "_current_frames"):
+                key = "sys._current_frames"
+                if key not in seen_patterns:
+                    seen_patterns.add(key)
+                    matches.append({
+                        "pattern": "SYS_GETFRAME",
+                        "severity": "high",
+                        "evidence": "sys._current_frames() — multi-threaded frame walk access",
+                    })
 
         # f_back, f_globals, f_locals attribute access
         if isinstance(node, ast.Attribute) and node.attr in ("f_back", "f_globals", "f_locals"):
