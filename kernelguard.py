@@ -1452,6 +1452,10 @@ RE_RUNTIME_PIP_INSTALL = re.compile(
     re.DOTALL,
 )
 
+RE_SUBPROCESS_BG = re.compile(
+    r'(?:subprocess\.(?:Popen|run|call|check_call|check_output)|os\.system|os\.popen)\s*\('
+)
+
 
 def detect_runtime_package_install(code: str | SubmissionFacts) -> list[dict]:
     """Detect runtime package installation (sandbox violation).
@@ -3437,6 +3441,21 @@ def detect_functools_cache_replay(code: str | SubmissionFacts) -> list[dict]:
     }]
 
 
+RE_MARSHAL_LOADS = re.compile(r'marshal\.(?:loads|load)\s*\(')
+def detect_marshal_deserialize(code: str | SubmissionFacts) -> list[dict]:
+    facts = ensure_submission_facts(code)
+    if not RE_MARSHAL_LOADS.search(facts.raw_code): return []
+    return [{"pattern": "DYNAMIC_EXECUTION", "severity": "high", "evidence": "marshal.loads/load() — deserializes code objects"    }]
+
+
+def detect_background_subprocess(code: str | SubmissionFacts) -> list[dict]:
+    facts = ensure_submission_facts(code)
+    raw = facts.raw_code
+    if not RE_SUBPROCESS_BG.search(raw):
+        return []
+    return [{"pattern": "RUNTIME_PACKAGE_INSTALL", "severity": "critical", "evidence": "subprocess/os.system background process execution"}]
+
+
 # ---------------------------------------------------------------------------
 # Score anomaly detection
 # ---------------------------------------------------------------------------
@@ -4215,6 +4234,7 @@ CODE_DETECTORS = [
     detect_token_paste_cuda_api,
     detect_sequence_batch_graph,
     detect_runtime_package_install,
+    detect_background_subprocess,
     # AST-based detectors (Layer 2)
     detect_trusted_module_import,
     detect_module_mutation,
@@ -4261,6 +4281,7 @@ BASE_DETECTOR_SPECS = [
     ("token_paste_cuda_api", detect_token_paste_cuda_api),
     ("sequence_batch_graph", detect_sequence_batch_graph),
     ("runtime_package_install", detect_runtime_package_install),
+    ("background_subprocess", detect_background_subprocess),
     ("trusted_module_import", detect_trusted_module_import),
     ("module_mutation", detect_module_mutation),
     ("globals_mutation", detect_globals_mutation),
@@ -4284,6 +4305,7 @@ BASE_DETECTOR_SPECS = [
     ("hash_cache_replay", detect_hash_cache_replay),
     ("eq_none_sentinel_replay", detect_eq_none_sentinel_replay),
     ("getattr_data_ptr_replay", detect_getattr_data_ptr_replay),
+    ("str_cache_replay", detect_str_cache_replay),
 ]
 
 VALID_RULE_OUTCOMES = {AUTO_FILTER, SUSPICIOUS_ONLY, TELEMETRY_ONLY}
