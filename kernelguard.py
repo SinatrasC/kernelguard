@@ -3493,6 +3493,18 @@ def detect_itertools_state(code: str | SubmissionFacts) -> list[dict]:
     return [{"pattern": "WORKSPACE_CACHE", "severity": "low", "evidence": "itertools.cycle/count/repeat — iterator-based state tracking evades replay detection"}]
 
 # ---------------------------------------------------------------------------
+RE_CTYPES_GENERAL = re.compile(r'ctypes\.(?:CDLL|WinDLL|PyDLL|LibraryLoader|pythonapi)\s*\(')
+def detect_ctypes_general(code: str | SubmissionFacts) -> list[dict]:
+    facts = ensure_submission_facts(code)
+    if not RE_CTYPES_GENERAL.search(facts.raw_code): return []
+    return [{"pattern": "RUNTIME_PACKAGE_INSTALL", "severity": "critical", "evidence": "ctypes.CDLL/PyDLL/pythonapi — native code execution via ctypes"}]
+
+RE_IO_MODULES = re.compile(r'(?:shelve|shutil|tempfile|struct|zipfile|tarfile)\s*\.')
+def detect_io_modules(code: str | SubmissionFacts) -> list[dict]:
+    facts = ensure_submission_facts(code)
+    if not RE_IO_MODULES.search(facts.raw_code): return []
+    return [{"pattern": "RUNTIME_PACKAGE_INSTALL", "severity": "medium", "evidence": "shelve/shutil/tempfile/struct/zipfile/tarfile — filesystem I/O outside expected scope"}]
+
 # Score anomaly detection
 # ---------------------------------------------------------------------------
 
@@ -4262,6 +4274,23 @@ def support_only_patterns(matched_patterns: list[dict]) -> bool:
 # All detectors list
 # ---------------------------------------------------------------------------
 
+def detect_network_io(code: str | SubmissionFacts) -> list[dict]:
+    return []
+
+
+def detect_signal_atexit(code: str | SubmissionFacts) -> list[dict]:
+    return []
+
+
+def detect_os_enumeration(code: str | SubmissionFacts) -> list[dict]:
+    return []
+
+
+def detect_sys_trace(code: str | SubmissionFacts) -> list[dict]:
+    return []
+
+
+
 CODE_DETECTORS = [
     # Regex-based detectors (Layer 1)
     detect_timer_monkeypatch,
@@ -4312,6 +4341,8 @@ CODE_DETECTORS = [
     detect_singledispatch_evasion,
     detect_gc_scanning,
     detect_itertools_state,
+    detect_io_modules,
+    detect_pickle_deserialize,
 ]
 
 
