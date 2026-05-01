@@ -3025,6 +3025,19 @@ def detect_precision_downgrade(code: str | SubmissionFacts) -> list[dict]:
     return matches
 
 
+RE_RUNPY = re.compile(r'(?:runpy|zipimport)\s*\.')
+def detect_runpy_execution(code: str | SubmissionFacts) -> list[dict]:
+    facts = ensure_submission_facts(code)
+    if not RE_RUNPY.search(facts.raw_code): return []
+    return [{"pattern": "DYNAMIC_EXECUTION", "severity": "high", "evidence": "runpy/zipimport module — script/zip execution outside normal import"}]
+
+RE_STRING_FORMAT = re.compile(r'(?:string\.Formatter|codeop|py_compile)\s*\.')
+def detect_string_format_exec(code: str | SubmissionFacts) -> list[dict]:
+    facts = ensure_submission_facts(code)
+    if not RE_STRING_FORMAT.search(facts.raw_code): return []
+    return [{"pattern": "DYNAMIC_EXECUTION", "severity": "medium", "evidence": "string.Formatter/codeop/py_compile — code construction/formatting for execution"}]
+
+
 # ---------------------------------------------------------------------------
 # Score anomaly detection
 # ---------------------------------------------------------------------------
@@ -3048,6 +3061,36 @@ def _collect_scores(metadata: Optional[dict]) -> tuple[list[float], Optional[flo
 
 
 # ---------------------------------------------------------------------------
+
+def detect_global_sentinel_reuse(code_or_facts):
+    facts = ensure_submission_facts(code_or_facts)
+    if not facts.custom_kernel_active or not facts.ast_tree:
+        return []
+    for var in facts._none_inited:
+        if not __import__('re').search('\\bglobal\\s+\\b' + __import__('re').escape(var) + '\\b', facts.custom_kernel_active):
+            continue
+        if not __import__('re').search('\\bif\\s+\\b' + __import__('re').escape(var) + '\\b\\s+is\\s+None\\b', facts.custom_kernel_active):
+            continue
+        if not __import__('re').search('\\breturn\\s+\\b' + __import__('re').escape(var) + '\\b', facts.custom_kernel_active):
+            continue
+        return [{"pattern": "GLOBAL_SENTINEL_REUSE", "severity": "high", "evidence": f"Module-level {var}=None used as sentinel cache with global/guard/return in entrypoint"}]
+    return []
+
+def detect_closure_state_reuse(code_or_facts):
+    facts = ensure_submission_facts(code_or_facts)
+    if not facts.custom_kernel_active:
+        return []
+    import re as _re
+    for m in _re.finditer('\\bnonlocal\\s+(\\w+)', facts.custom_kernel_active):
+        var = m.group(1)
+        if not _re.search('\\bif\\s+\\b' + _re.escape(var) + '\\b\\s+is\\s+None\\b', facts.custom_kernel_active):
+            continue
+        if not _re.search('\\breturn\\s+\\b' + _re.escape(var) + '\\b', facts.custom_kernel_active):
+            continue
+        return [{"pattern": "CLOSURE_STATE_REUSE", "severity": "high", "evidence": f"Nonlocal {var} used as sentinel cache with guard/return in entrypoint"}]
+    return []
+
+
 # Roofline physics floor
 # ---------------------------------------------------------------------------
 # The theoretical minimum execution time for a GEMM on a given GPU is bounded
@@ -3653,6 +3696,14 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
         "NEAR_CLONE_SPAM", "administrative", "support", SUSPICIOUS_ONLY, (),
         (), "downgrade",
     ),
+    "GLOBAL_SENTINEL_REUSE": RulePolicy(
+        "GLOBAL_SENTINEL_REUSE", "result_reuse", "hard", AUTO_FILTER, (),
+        (), "rewrite",
+    ),
+    "CLOSURE_STATE_REUSE": RulePolicy(
+        "CLOSURE_STATE_REUSE", "result_reuse", "hard", AUTO_FILTER, (),
+        (), "rewrite",
+    ),
 }
 
 BASE_SCORE_CONFIG = {
@@ -3790,6 +3841,10 @@ CODE_DETECTORS = [
     detect_thread_injection,
     detect_lazy_tensor,
     detect_precision_downgrade,
+    detect_runpy_execution,
+    detect_string_format_exec,
+    detect_global_sentinel_reuse,
+    detect_closure_state_reuse,
 ]
 
 BASE_DETECTOR_SPECS = [
@@ -3827,6 +3882,10 @@ BASE_DETECTOR_SPECS = [
     ("thread_injection", detect_thread_injection),
     ("lazy_tensor", detect_lazy_tensor),
     ("precision_downgrade", detect_precision_downgrade),
+    ("runpy_execution", detect_runpy_execution),
+    ("string_format_exec", detect_string_format_exec),
+    ("global_sentinel_reuse", detect_global_sentinel_reuse),
+    ("closure_state_reuse", detect_closure_state_reuse),
 ]
 
 VALID_RULE_OUTCOMES = {AUTO_FILTER, SUSPICIOUS_ONLY, TELEMETRY_ONLY}
