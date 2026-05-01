@@ -2864,6 +2864,9 @@ def detect_thread_injection(code: str | SubmissionFacts) -> list[dict]:
             elif node.module and node.module.startswith("concurrent"):
                 for alias in node.names:
                     futures_aliases.add(alias.asname or alias.name)
+            elif node.module and node.module.startswith("asyncio"):
+                for alias in node.names:
+                    asyncio_aliases.add(alias.asname or alias.name)
 
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
