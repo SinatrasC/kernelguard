@@ -1604,6 +1604,22 @@ def detect_module_mutation(code: str | SubmissionFacts) -> list[dict]:
                             f"(bytecode replacement on '{mod}')"
                         ),
                     })
+    # Check for object.__setattr__(module, attr, value) pattern
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if isinstance(node.func, ast.Attribute) and node.func.attr == "__setattr__":
+            if isinstance(node.func.value, ast.Name) and node.func.value.id == "object":
+                if len(node.args) >= 2 and isinstance(node.args[0], ast.Name) and isinstance(node.args[1], ast.Constant):
+                    mod_name = node.args[0].id
+                    attr_name = str(node.args[1].value) if isinstance(node.args[1].value, str) else ""
+                    if mod_name in aliases:
+                        sev = "critical" if attr_name in TRUSTED_FUNCTIONS else "high"
+                        matches.append({
+                            "pattern": "MODULE_MUTATION",
+                            "severity": sev,
+                            "evidence": f"object.__setattr__({mod_name}, '{attr_name}', ...) — evades direct assignment check",
+                        })
     return matches
 
 
