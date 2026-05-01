@@ -2786,6 +2786,73 @@ def detect_dynamic_execution(code: str | SubmissionFacts) -> list[dict]:
                 "evidence": "importlib.reload() (module state reset/manipulation)",
             })
 
+    # Filter-evasion: a string built from disconnected character pieces and
+    # then handed to a dynamic-dispatch site. ``"".join(["e","x","e","c"])``
+    # and ``"e"+"x"+"e"+"c"`` both shape the string ``"exec"`` without the
+    # literal name ever appearing in source — designed to dodge grep-based
+    # filters. ≥3 short string-literal leaves in either shape is the
+    # smoking gun.
+    if "SPLIT_STRING_OBFUSCATION" not in seen:
+        def _short_str_const(node: ast.AST) -> bool:
+            return (
+                isinstance(node, ast.Constant)
+                and isinstance(node.value, str)
+                and len(node.value) <= 3
+            )
+
+        def _count_short_const_concat(expr: ast.AST) -> int:
+            """Count short-string-Constant leaves in an Add-chain BinOp."""
+            if isinstance(expr, ast.BinOp) and isinstance(expr.op, ast.Add):
+                left = _count_short_const_concat(expr.left)
+                if left < 0:
+                    return -1
+                right = _count_short_const_concat(expr.right)
+                if right < 0:
+                    return -1
+                return left + right
+            return 1 if _short_str_const(expr) else -1
+
+        for n in ast.walk(tree):
+            # ``"".join([Constant, Constant, ...])`` shape
+            if (
+                isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Attribute)
+                and n.func.attr == "join"
+                and isinstance(n.func.value, ast.Constant)
+                and isinstance(n.func.value.value, str)
+                and len(n.args) == 1
+                and isinstance(n.args[0], (ast.List, ast.Tuple))
+            ):
+                elts = n.args[0].elts
+                if len(elts) >= 3 and all(_short_str_const(e) for e in elts):
+                    seen.add("SPLIT_STRING_OBFUSCATION")
+                    matches.append({
+                        "pattern": "OBFUSCATED_EXEC",
+                        "severity": "critical",
+                        "evidence": (
+                            f'string built piecewise via str.join({len(elts)} '
+                            f"short-literal pieces) — used to hide a literal name "
+                            f"from grep-based filters before dynamic dispatch"
+                        ),
+                    })
+                    break
+            # ``"e" + "x" + "e" + "c"`` shape — only the outermost Add chain.
+            if isinstance(n, ast.BinOp) and isinstance(n.op, ast.Add):
+                count = _count_short_const_concat(n)
+                if count >= 4:
+                    seen.add("SPLIT_STRING_OBFUSCATION")
+                    matches.append({
+                        "pattern": "OBFUSCATED_EXEC",
+                        "severity": "critical",
+                        "evidence": (
+                            f"string built piecewise via Add chain of "
+                            f"{count} short-literal pieces — used to hide a "
+                            f"literal name from grep-based filters before "
+                            f"dynamic dispatch"
+                        ),
+                    })
+                    break
+
     return matches
 
 
