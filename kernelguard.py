@@ -3255,6 +3255,85 @@ def detect_eq_none_sentinel_replay(code: str | SubmissionFacts) -> list[dict]:
     return []
 
 
+def detect_not_eq_data_ptr_replay(code: str | SubmissionFacts) -> list[dict]:
+    """Pattern: != inequality data_ptr comparison for output replay.
+    
+    Evades POINTER_REPLAY and sentinel detectors which only 
+    check ast.Eq (==), not ast.NotEq (!=).
+    """
+    facts = ensure_submission_facts(code)
+    tree = facts.ast_tree
+    if tree is None:
+        return []
+    entrypoint_name = entrypoint_label(facts.entrypoint_name)
+    
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not is_entrypoint_name(node.name):
+            continue
+        
+        for child in ast.walk(node):
+            if not isinstance(child, ast.If):
+                continue
+            if _body_has_calls(child.body):
+                continue
+            
+            test = child.test
+            is_else_pattern = False
+            has_data_ptr_not_eq = False
+            
+            # Pattern: if <expr1>: pass else: return <out>
+            # where expr1 contains x.data_ptr() != y.data_ptr()
+            if isinstance(test, ast.Compare):
+                for op in test.ops:
+                    if isinstance(op, ast.NotEq):
+                        if (
+                            _expr_has_data_ptr_fast(test.left, facts._nodes_with_data_ptr)
+                            and test.comparators
+                            and _expr_has_data_ptr_fast(test.comparators[0], facts._nodes_with_data_ptr)
+                        ):
+                            has_data_ptr_not_eq = True
+                            break
+            
+            # Also check nested if in else body or inner if body
+            # Pattern: if sentinel is not None: if ptr != other: pass else: return out
+            if not has_data_ptr_not_eq:
+                for inner in ast.walk(child):
+                    if not isinstance(inner, ast.If):
+                        continue
+                    if isinstance(inner.test, ast.Compare):
+                        for op in inner.test.ops:
+                            if isinstance(op, ast.NotEq):
+                                if (
+                                    _expr_has_data_ptr_fast(inner.test.left, facts._nodes_with_data_ptr)
+                                    and inner.test.comparators
+                                    and _expr_has_data_ptr_fast(inner.test.comparators[0], facts._nodes_with_data_ptr)
+                                ):
+                                    has_data_ptr_not_eq = True
+                                    break
+            
+            if not has_data_ptr_not_eq:
+                continue
+            
+            # Check for return in else branches or inner-if-else
+            for node_or_body in [child, child.body, child.orelse]:
+                if isinstance(node_or_body, list):
+                    for stmt in node_or_body:
+                        if isinstance(stmt, ast.Return) and stmt.value is not None:
+                            returned_root = _ast_root_name(stmt.value)
+                            if returned_root and (returned_root in facts._none_inited or returned_root.startswith('_') and any(returned_root.startswith(p) for p in ('_last', '_out', '_prev', '_saved', '_cached'))):
+                                return [{
+                                    "pattern": "NOT_EQ_REPLAY",
+                                    "severity": "critical",
+                                    "evidence": (
+                                        f"{entrypoint_name} uses != data_ptr comparison "
+                                        f"for output replay"
+                                    ),
+                                }]
+    return []
+
+
 # ---------------------------------------------------------------------------
 # Score anomaly detection
 # ---------------------------------------------------------------------------
@@ -4039,6 +4118,7 @@ CODE_DETECTORS = [
     detect_hash_cache_replay,
     detect_eq_none_sentinel_replay,
     detect_getattr_data_ptr_replay,
+    detect_not_eq_data_ptr_replay,
 ]
 
 BASE_DETECTOR_SPECS = [
@@ -4079,6 +4159,7 @@ BASE_DETECTOR_SPECS = [
     ("hash_cache_replay", detect_hash_cache_replay),
     ("eq_none_sentinel_replay", detect_eq_none_sentinel_replay),
     ("getattr_data_ptr_replay", detect_getattr_data_ptr_replay),
+    ("not_eq_data_ptr_replay", detect_not_eq_data_ptr_replay),
 ]
 
 VALID_RULE_OUTCOMES = {AUTO_FILTER, SUSPICIOUS_ONLY, TELEMETRY_ONLY}
