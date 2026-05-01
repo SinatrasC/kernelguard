@@ -2785,6 +2785,33 @@ def detect_dynamic_execution(code: str | SubmissionFacts) -> list[dict]:
                 "severity": "high",
                 "evidence": "importlib.reload() (module state reset/manipulation)",
             })
+        elif func_name == "operator.call" and func_name not in seen:
+            if node.args and isinstance(node.args[0], ast.Name):
+                called_name = node.args[0].id
+                if called_name in ("exec", "eval", "compile"):
+                    seen.add(func_name)
+                    matches.append({
+                        "pattern": "DYNAMIC_EXECUTION",
+                        "severity": "high",
+                        "evidence": f"operator.call({called_name}, ...) — dynamic execution via operator module",
+                    })
+        elif func_name == "functools.partial" and func_name not in seen:
+            if node.args and isinstance(node.args[0], ast.Name):
+                called_name = node.args[0].id
+                if called_name in ("exec", "eval", "compile", "__import__"):
+                    seen.add(func_name)
+                    matches.append({
+                        "pattern": "DYNAMIC_EXECUTION",
+                        "severity": "high",
+                        "evidence": f"functools.partial({called_name}, ...) — deferred dynamic execution",
+                    })
+        elif func_name in ("builtins.exec", "builtins.eval", "builtins.compile") and func_name not in seen:
+            seen.add(func_name)
+            matches.append({
+                "pattern": "DYNAMIC_EXECUTION",
+                "severity": "high",
+                "evidence": f"{func_name}() — dynamic execution via builtins module",
+            })
 
     return matches
 
