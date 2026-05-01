@@ -3025,6 +3025,13 @@ def detect_precision_downgrade(code: str | SubmissionFacts) -> list[dict]:
     return matches
 
 
+RE_IMPORTLIB_RES = re.compile(r'importlib\.(?:resources|util|machinery)\s*\.')
+def detect_importlib_resources(code: str | SubmissionFacts) -> list[dict]:
+    facts = ensure_submission_facts(code)
+    if not RE_IMPORTLIB_RES.search(facts.raw_code): return []
+    return [{"pattern": "DYNAMIC_EXECUTION", "severity": "high", "evidence": "importlib.resources/util/machinery — dynamic module loading bypass"}]
+
+
 # ---------------------------------------------------------------------------
 # Score anomaly detection
 # ---------------------------------------------------------------------------
@@ -3790,6 +3797,7 @@ CODE_DETECTORS = [
     detect_thread_injection,
     detect_lazy_tensor,
     detect_precision_downgrade,
+    detect_importlib_resources,
 ]
 
 BASE_DETECTOR_SPECS = [
@@ -3827,6 +3835,7 @@ BASE_DETECTOR_SPECS = [
     ("thread_injection", detect_thread_injection),
     ("lazy_tensor", detect_lazy_tensor),
     ("precision_downgrade", detect_precision_downgrade),
+    ("importlib_resources", detect_importlib_resources),
 ]
 
 VALID_RULE_OUTCOMES = {AUTO_FILTER, SUSPICIOUS_ONLY, TELEMETRY_ONLY}
