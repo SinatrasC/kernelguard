@@ -2708,6 +2708,85 @@ def detect_dynamic_execution(code: str | SubmissionFacts) -> list[dict]:
     matches = []
     seen: set[str] = set()
 
+    operator_aliases = {"operator"}
+    partial_aliases = {"partial"}
+    functools_aliases = {"functools"}
+    builtins_aliases = {"builtins"}
+    code_aliases = {"code"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                name = alias.asname or alias.name
+                if alias.name == "operator":
+                    operator_aliases.add(name)
+                elif alias.name == "functools":
+                    functools_aliases.add(name)
+                elif alias.name == "builtins":
+                    builtins_aliases.add(name)
+                elif alias.name == "code":
+                    code_aliases.add(name)
+        elif isinstance(node, ast.ImportFrom):
+            if node.module == "functools":
+                for alias in node.names:
+                    if alias.name == "partial":
+                        partial_aliases.add(alias.asname or alias.name)
+
+    def _const_str(expr: ast.AST | None) -> str | None:
+        if isinstance(expr, ast.Constant) and isinstance(expr.value, str):
+            return expr.value
+        return None
+
+    def _is_dynamic_builtin_name(expr: ast.AST | None) -> bool:
+        return isinstance(expr, ast.Name) and expr.id in {"exec", "eval", "compile", "__import__"}
+
+    def _is_builtins_namespace(expr: ast.AST | None) -> bool:
+        if isinstance(expr, ast.Name) and expr.id in builtins_aliases:
+            return True
+        if isinstance(expr, ast.Attribute) and expr.attr == "__dict__":
+            return isinstance(expr.value, ast.Name) and expr.value.id in builtins_aliases
+        if isinstance(expr, ast.Call) and isinstance(expr.func, ast.Name) and expr.func.id == "vars":
+            return len(expr.args) == 1 and _is_builtins_namespace(expr.args[0])
+        return False
+
+    def _is_dynamic_builtin_lookup(expr: ast.AST | None) -> bool:
+        if _is_dynamic_builtin_name(expr):
+            return True
+        if isinstance(expr, ast.Call) and isinstance(expr.func, ast.Name) and expr.func.id == "getattr":
+            return (
+                len(expr.args) >= 2
+                and _is_builtins_namespace(expr.args[0])
+                and _const_str(expr.args[1]) in {"exec", "eval", "compile", "__import__"}
+            )
+        if isinstance(expr, ast.Subscript) and _is_builtins_namespace(expr.value):
+            return _const_str(expr.slice) in {"exec", "eval", "compile", "__import__"}
+        if isinstance(expr, ast.Call) and isinstance(expr.func, ast.Attribute):
+            if not (
+                expr.func.attr == "getitem"
+                and isinstance(expr.func.value, ast.Name)
+                and expr.func.value.id in operator_aliases
+            ):
+                return False
+            return (
+                len(expr.args) >= 2
+                and _is_builtins_namespace(expr.args[0])
+                and _const_str(expr.args[1]) in {"exec", "eval", "compile", "__import__"}
+            )
+        return False
+
+    def _is_code_interpreter_method(expr: ast.AST | None) -> bool:
+        if not isinstance(expr, ast.Attribute) or expr.attr not in {"runsource", "push"}:
+            return False
+        value = expr.value
+        if not isinstance(value, ast.Call):
+            return False
+        func = value.func
+        return (
+            isinstance(func, ast.Attribute)
+            and func.attr in {"InteractiveInterpreter", "InteractiveConsole"}
+            and isinstance(func.value, ast.Name)
+            and func.value.id in code_aliases
+        )
+
     # Pre-scan: check if any function scope contains both exec/eval AND
     # decode/decompress calls (catches split-variable patterns like:
     #   b = unhexlify(hex_str); s = decompress(b); exec(compile(s, ...)))
@@ -2784,6 +2863,53 @@ def detect_dynamic_execution(code: str | SubmissionFacts) -> list[dict]:
                 "pattern": "MODULE_RELOAD",
                 "severity": "high",
                 "evidence": "importlib.reload() (module state reset/manipulation)",
+            })
+        elif (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr == "call"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id in operator_aliases
+            and "operator.call.dynamic" not in seen
+        ):
+            if node.args and _is_dynamic_builtin_lookup(node.args[0]):
+                seen.add("operator.call.dynamic")
+                matches.append({
+                    "pattern": "INDIRECT_DYNAMIC_EXECUTION",
+                    "severity": "critical",
+                    "evidence": "operator.call dispatches exec/eval/compile/__import__",
+                })
+        elif (
+            (
+                isinstance(node.func, ast.Name)
+                and node.func.id in partial_aliases
+            )
+            or (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "partial"
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in functools_aliases
+            )
+        ) and "partial.dynamic" not in seen:
+            if node.args and _is_dynamic_builtin_lookup(node.args[0]):
+                seen.add("partial.dynamic")
+                matches.append({
+                    "pattern": "INDIRECT_DYNAMIC_EXECUTION",
+                    "severity": "critical",
+                    "evidence": "functools.partial captures exec/eval/compile/__import__",
+                })
+        elif _is_dynamic_builtin_lookup(node.func) and "builtins.lookup.dynamic" not in seen:
+            seen.add("builtins.lookup.dynamic")
+            matches.append({
+                "pattern": "INDIRECT_DYNAMIC_EXECUTION",
+                "severity": "critical",
+                "evidence": "builtins lookup calls exec/eval/compile/__import__",
+            })
+        elif _is_code_interpreter_method(node.func) and "code.interpreter.dynamic" not in seen:
+            seen.add("code.interpreter.dynamic")
+            matches.append({
+                "pattern": "INDIRECT_DYNAMIC_EXECUTION",
+                "severity": "critical",
+                "evidence": "code.InteractiveInterpreter/Console executes dynamic source",
             })
 
     return matches
@@ -3587,6 +3713,10 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
     ),
     "OBFUSCATED_EXEC": RulePolicy(
         "OBFUSCATED_EXEC", "dynamic_execution", "hard", AUTO_FILTER, (),
+        (), "keep",
+    ),
+    "INDIRECT_DYNAMIC_EXECUTION": RulePolicy(
+        "INDIRECT_DYNAMIC_EXECUTION", "dynamic_execution", "hard", AUTO_FILTER, (),
         (), "keep",
     ),
     "DYNAMIC_EXECUTION": RulePolicy(
@@ -4701,7 +4831,7 @@ AUDIT_RULE_ORDER = [
     "TIMER_MONKEYPATCH", "FAKE_BENCHMARK_EMIT", "STDIO_REDIRECT", "UNSYNC_MULTISTREAM", "CUDA_EVENT_DISABLE_TIMING",
     "SCALED_MM_REF", "DECODE_MM_REF", "SILENT_FALLBACK", "REFERENCE_PRECOMPUTE_REPLAY", "TORCH_COMPILE_CACHE",
     "HARDCODED_SHAPES", "TRIVIAL_PROBE",
-    "OBFUSCATED_EXEC", "DYNAMIC_EXECUTION", "MODULE_RELOAD", "THREAD_INJECTION", "LAZY_TENSOR",
+    "OBFUSCATED_EXEC", "INDIRECT_DYNAMIC_EXECUTION", "DYNAMIC_EXECUTION", "MODULE_RELOAD", "THREAD_INJECTION", "LAZY_TENSOR",
     "TOKEN_PASTE_CUDA_API", "SEQUENCE_BATCH_GRAPH", "PARTIAL_GRAPH_KEY", "RUNTIME_PACKAGE_INSTALL",
     "PRECISION_DOWNGRADE", "SCORE_PHYSICS_FLOOR", "SCORE_IMPOSSIBLE", "SCORE_SUSPECT_FLOOR",
     "SCORE_BROKEN", "SCORE_EXTREME_SPEEDUP", "DUPLICATE_SPAM", "NEAR_CLONE_SPAM",
