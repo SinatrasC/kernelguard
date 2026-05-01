@@ -2836,6 +2836,7 @@ def detect_thread_injection(code: str | SubmissionFacts) -> list[dict]:
     threading_aliases: set[str] = {"threading"}
     mp_aliases: set[str] = {"multiprocessing"}
     futures_aliases: set[str] = set()
+    asyncio_aliases: set[str] = {"asyncio"}
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -2847,6 +2848,8 @@ def detect_thread_injection(code: str | SubmissionFacts) -> list[dict]:
                     mp_aliases.add(name)
                 elif alias.name == "concurrent.futures":
                     futures_aliases.add(name)
+                elif alias.name == "asyncio":
+                    asyncio_aliases.add(name)
         elif isinstance(node, ast.ImportFrom):
             if node.module == "threading":
                 for alias in node.names:
@@ -3372,6 +3375,30 @@ def detect_types_code_construction(code: str | SubmissionFacts) -> list[dict]:
                     "severity": "critical",
                     "evidence": f"types.{node.func.attr}(...) — direct code/function object construction",
                 })
+    return matches
+
+
+
+def detect_breakpoint_exec(code: str | SubmissionFacts) -> list[dict]:
+    facts = ensure_submission_facts(code)
+    tree = facts.ast_tree
+    if tree is None:
+        return []
+    matches = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func_name = ""
+        if isinstance(node.func, ast.Name):
+            func_name = node.func.id
+        elif isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name):
+            func_name = f"{node.func.value.id}.{node.func.attr}"
+        if func_name in ("breakpoint", "pdb.set_trace", "sys.breakpointhook", "pdb.post_mortem"):
+            matches.append({
+                "pattern": "BREAKPOINT_EXEC",
+                "severity": "high",
+                "evidence": f"{func_name}() — debugger REPL gateway (can execute arbitrary code)",
+            })
     return matches
 
 
@@ -4011,6 +4038,10 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
         "GETATTR_DATAPTR_REPLAY", "result_reuse", "hard", AUTO_FILTER, (),
         (), "keep",
     ),
+    "BREAKPOINT_EXEC": RulePolicy(
+        "BREAKPOINT_EXEC", "dynamic_execution", "hard", AUTO_FILTER, (),
+        (), "keep",
+    ),
     "DUPLICATE_SPAM": RulePolicy(
         "DUPLICATE_SPAM", "administrative", "support", SUSPICIOUS_ONLY, (),
         (), "downgrade",
@@ -4156,6 +4187,7 @@ CODE_DETECTORS = [
     detect_thread_injection,
     detect_lazy_tensor,
     detect_precision_downgrade,
+    detect_types_code_construction,
     detect_operator_contains_replay,
     detect_breakpoint_exec,
     detect_code_module_exec,
@@ -4199,6 +4231,7 @@ BASE_DETECTOR_SPECS = [
     ("thread_injection", detect_thread_injection),
     ("lazy_tensor", detect_lazy_tensor),
     ("precision_downgrade", detect_precision_downgrade),
+    ("types_code_construction", detect_types_code_construction),
     ("operator_contains_replay", detect_operator_contains_replay),
     ("dict_setitem_globals", detect_dict_setitem_globals),
     ("breakpoint_exec", detect_breakpoint_exec),
