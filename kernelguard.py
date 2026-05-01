@@ -2462,6 +2462,118 @@ def detect_last_call_replay(code: str | SubmissionFacts) -> list[dict]:
     return []
 
 
+def detect_function_attribute_replay(code: str | SubmissionFacts) -> list[dict]:
+    """Pattern: custom_kernel stores replay output on its own function object."""
+    facts = ensure_submission_facts(code)
+    tree = facts.ast_tree
+    if tree is None:
+        return []
+    entrypoint_name = entrypoint_label(facts.entrypoint_name)
+
+    def _function_attr(expr: ast.AST | None) -> str | None:
+        if (
+            isinstance(expr, ast.Attribute)
+            and isinstance(expr.value, ast.Name)
+            and is_entrypoint_name(expr.value.id)
+        ):
+            return expr.attr
+        if (
+            isinstance(expr, ast.Call)
+            and isinstance(expr.func, ast.Name)
+            and expr.func.id == "getattr"
+            and len(expr.args) >= 2
+            and isinstance(expr.args[0], ast.Name)
+            and is_entrypoint_name(expr.args[0].id)
+            and isinstance(expr.args[1], ast.Constant)
+            and isinstance(expr.args[1].value, str)
+        ):
+            return expr.args[1].value
+        return None
+
+    def _uses_state(expr: ast.AST | None, aliases: set[str]) -> bool:
+        if expr is None:
+            return False
+        for child in ast.walk(expr):
+            if _function_attr(child) is not None:
+                return True
+            if isinstance(child, ast.Name) and child.id in aliases:
+                return True
+        return False
+
+    def _input_derived(expr: ast.AST | None, params: set[str]) -> bool:
+        return bool(_expr_names(expr) & params)
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not is_entrypoint_name(node.name):
+            continue
+
+        params = {arg.arg for arg in node.args.args}
+        params.update(arg.arg for arg in node.args.posonlyargs)
+        params.update(arg.arg for arg in node.args.kwonlyargs)
+        aliases: set[str] = set()
+
+        for child in ast.walk(node):
+            if not isinstance(child, ast.Assign):
+                continue
+            if _function_attr(child.value) is None:
+                continue
+            for target in child.targets:
+                if isinstance(target, ast.Name):
+                    aliases.add(target.id)
+
+        has_state_return = False
+        for child in ast.walk(node):
+            if not isinstance(child, ast.If):
+                continue
+            if _body_has_calls(child.body):
+                continue
+            if _expr_names(child.test) & params:
+                continue
+            if any(
+                isinstance(stmt, ast.Return) and _uses_state(stmt.value, aliases)
+                for stmt in child.body
+            ):
+                has_state_return = True
+                break
+        if not has_state_return:
+            continue
+
+        stores_input = False
+        for child in ast.walk(node):
+            if isinstance(child, ast.Assign):
+                for target in child.targets:
+                    if _uses_state(target, aliases) and _input_derived(child.value, params):
+                        stores_input = True
+                        break
+            elif (
+                isinstance(child, ast.Expr)
+                and isinstance(child.value, ast.Call)
+                and isinstance(child.value.func, ast.Attribute)
+                and child.value.func.attr in {"append", "extend", "insert", "update", "setdefault"}
+                and _uses_state(child.value.func.value, aliases)
+                and any(_input_derived(arg, params) for arg in child.value.args)
+            ):
+                stores_input = True
+            if stores_input:
+                break
+
+        if not stores_input:
+            continue
+
+        return [{
+            "pattern": "FUNCTION_ATTRIBUTE_REPLAY",
+            "severity": "critical",
+            "evidence": (
+                f"{entrypoint_name} replays input-derived output stored on "
+                "the function object"
+            ),
+        }]
+
+    return []
+
+
 RE_OBJECT_ID_DATA = re.compile(r"\bdata_id\s*=\s*id\s*\(\s*data\s*\)")
 RE_RESULT_BANK_SET = re.compile(r"_superbatch_results\s*\[\s*(?:did|data_id)\s*\]\s*=")
 RE_RESULT_BANK_RETURN = re.compile(r"return\s+_superbatch_results\s*\[\s*data_id\s*\]")
@@ -3479,6 +3591,10 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
         "LAST_CALL_REPLAY", "result_reuse", "hard", AUTO_FILTER, (),
         AMD_MANUAL_LAST_CALL_REPLAY_FIXTURES, "keep",
     ),
+    "FUNCTION_ATTRIBUTE_REPLAY": RulePolicy(
+        "FUNCTION_ATTRIBUTE_REPLAY", "result_reuse", "hard", AUTO_FILTER, (),
+        (), "keep",
+    ),
     "SHAPE_OUTPUT_REPLAY": RulePolicy(
         "SHAPE_OUTPUT_REPLAY", "result_reuse", "hard", AUTO_FILTER, (),
         AMD_PACKAGE_SHAPE_REPLAY_FIXTURES, "keep",
@@ -3762,6 +3878,7 @@ CODE_DETECTORS = [
     detect_decode_mm_ref,
     detect_result_caching,
     detect_last_call_replay,
+    detect_function_attribute_replay,
     detect_shape_output_replay,
     detect_timed_input_replay,
     detect_cuda_graph_replay,
@@ -3800,6 +3917,7 @@ BASE_DETECTOR_SPECS = [
     ("decode_mm_ref", detect_decode_mm_ref),
     ("result_caching", detect_result_caching),
     ("last_call_replay", detect_last_call_replay),
+    ("function_attribute_replay", detect_function_attribute_replay),
     ("shape_output_replay", detect_shape_output_replay),
     ("timed_input_replay", detect_timed_input_replay),
     ("cuda_graph_replay", detect_cuda_graph_replay),
@@ -4696,7 +4814,7 @@ AUDIT_RULE_ORDER = [
     "EVALUATOR_EXPLOIT", "HARNESS_RUNTIME_PATCHING", "MODULE_MUTATION", "GLOBALS_MUTATION", "CODE_REPLACEMENT",
     "FRAME_WALK_ACCESS", "FRAME_WALK_MUTATION", "SYS_MODULES_ACCESS", "GLOBALS_ACCESS", "CODE_ACCESS",
     "TRUSTED_MODULE_IMPORT",
-    "OUTPUT_REPLAY_CACHE", "LAST_CALL_REPLAY", "SHAPE_OUTPUT_REPLAY", "TIMED_INPUT_REPLAY", "CONFIG_CACHE_EXPLOIT", "POINTER_REPLAY", "RESULT_BANK_REPLAY", "PREPROCESS_CACHE", "WORKSPACE_CACHE",
+    "OUTPUT_REPLAY_CACHE", "LAST_CALL_REPLAY", "FUNCTION_ATTRIBUTE_REPLAY", "SHAPE_OUTPUT_REPLAY", "TIMED_INPUT_REPLAY", "CONFIG_CACHE_EXPLOIT", "POINTER_REPLAY", "RESULT_BANK_REPLAY", "PREPROCESS_CACHE", "WORKSPACE_CACHE",
     "RUNNER_PLAN_CACHE", "CUDA_GRAPH_PYTHON", "CUDA_GRAPH_REPLAY",
     "TIMER_MONKEYPATCH", "FAKE_BENCHMARK_EMIT", "STDIO_REDIRECT", "UNSYNC_MULTISTREAM", "CUDA_EVENT_DISABLE_TIMING",
     "SCALED_MM_REF", "DECODE_MM_REF", "SILENT_FALLBACK", "REFERENCE_PRECOMPUTE_REPLAY", "TORCH_COMPILE_CACHE",
