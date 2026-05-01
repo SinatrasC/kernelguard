@@ -3025,6 +3025,19 @@ def detect_precision_downgrade(code: str | SubmissionFacts) -> list[dict]:
     return matches
 
 
+RE_RUNPY = re.compile(r'(?:runpy|zipimport)\s*\.')
+def detect_runpy_execution(code: str | SubmissionFacts) -> list[dict]:
+    facts = ensure_submission_facts(code)
+    if not RE_RUNPY.search(facts.raw_code): return []
+    return [{"pattern": "DYNAMIC_EXECUTION", "severity": "high", "evidence": "runpy/zipimport module — script/zip execution outside normal import"}]
+
+RE_STRING_FORMAT = re.compile(r'(?:string\.Formatter|codeop|py_compile)\s*\.')
+def detect_string_format_exec(code: str | SubmissionFacts) -> list[dict]:
+    facts = ensure_submission_facts(code)
+    if not RE_STRING_FORMAT.search(facts.raw_code): return []
+    return [{"pattern": "DYNAMIC_EXECUTION", "severity": "medium", "evidence": "string.Formatter/codeop/py_compile — code construction/formatting for execution"}]
+
+
 # ---------------------------------------------------------------------------
 # Score anomaly detection
 # ---------------------------------------------------------------------------
@@ -3790,6 +3803,7 @@ CODE_DETECTORS = [
     detect_thread_injection,
     detect_lazy_tensor,
     detect_precision_downgrade,
+    detect_runpy_execution,
 ]
 
 BASE_DETECTOR_SPECS = [
@@ -3827,6 +3841,7 @@ BASE_DETECTOR_SPECS = [
     ("thread_injection", detect_thread_injection),
     ("lazy_tensor", detect_lazy_tensor),
     ("precision_downgrade", detect_precision_downgrade),
+    ("runpy_execution", detect_runpy_execution),
 ]
 
 VALID_RULE_OUTCOMES = {AUTO_FILTER, SUSPICIOUS_ONLY, TELEMETRY_ONLY}
