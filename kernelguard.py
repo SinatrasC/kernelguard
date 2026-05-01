@@ -3025,6 +3025,13 @@ def detect_precision_downgrade(code: str | SubmissionFacts) -> list[dict]:
     return matches
 
 
+RE_AST_LITERAL = re.compile(r'ast\.literal_eval\s*\(')
+def detect_ast_literal_eval(code: str | SubmissionFacts) -> list[dict]:
+    facts = ensure_submission_facts(code)
+    if not RE_AST_LITERAL.search(facts.raw_code): return []
+    return [{"pattern": "OBFUSCATED_EXEC", "severity": "high", "evidence": "ast.literal_eval — limited eval for code parsing"}]
+
+
 # ---------------------------------------------------------------------------
 # Score anomaly detection
 # ---------------------------------------------------------------------------
@@ -3790,6 +3797,7 @@ CODE_DETECTORS = [
     detect_thread_injection,
     detect_lazy_tensor,
     detect_precision_downgrade,
+    detect_ast_literal_eval,
 ]
 
 BASE_DETECTOR_SPECS = [
@@ -3827,6 +3835,7 @@ BASE_DETECTOR_SPECS = [
     ("thread_injection", detect_thread_injection),
     ("lazy_tensor", detect_lazy_tensor),
     ("precision_downgrade", detect_precision_downgrade),
+    ("ast_literal_eval", detect_ast_literal_eval),
 ]
 
 VALID_RULE_OUTCOMES = {AUTO_FILTER, SUSPICIOUS_ONLY, TELEMETRY_ONLY}
