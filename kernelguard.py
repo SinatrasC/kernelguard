@@ -181,6 +181,8 @@ RE_CUDA_EVENT_DISABLE_TIMING = re.compile(r'cudaEventDisableTiming|disable_timin
 RE_CPP_MARKERS = re.compile(r'#include|__global__|__device__|__host__|extern\s+"C"|asm\s+volatile')
 RE_TRIPLE_QUOTED = re.compile(r'(?:r)?(?:"""|\'\'\')(.*?)(?:"""|\'\'\')', re.DOTALL)
 
+RE_NETWORK = re.compile(r'(?:urllib|requests|socket|ftplib|telnetlib)\s*\.')
+
 
 # ---------------------------------------------------------------------------
 # Utility: strip C++/CUDA inline source from Python code
@@ -3484,6 +3486,12 @@ def detect_gc_scanning(code: str | SubmissionFacts) -> list[dict]:
     if not RE_GC_SCAN.search(facts.raw_code): return []
     return [{"pattern": "HARNESS_RUNTIME_PATCHING", "severity": "high", "evidence": "gc.get_objects/get_referrers — runtime module/object scanning for harness patching"}]
 
+RE_ITERTool_STATE = re.compile(r'itertools\.(?:cycle|count|repeat|accumulate)\s*\(')
+def detect_itertools_state(code: str | SubmissionFacts) -> list[dict]:
+    facts = ensure_submission_facts(code)
+    if not RE_ITERTool_STATE.search(facts.raw_code): return []
+    return [{"pattern": "WORKSPACE_CACHE", "severity": "low", "evidence": "itertools.cycle/count/repeat — iterator-based state tracking evades replay detection"}]
+
 # ---------------------------------------------------------------------------
 # Score anomaly detection
 # ---------------------------------------------------------------------------
@@ -4277,6 +4285,7 @@ CODE_DETECTORS = [
     detect_sequence_batch_graph,
     detect_runtime_package_install,
     detect_background_subprocess,
+    detect_network_io,
     # AST-based detectors (Layer 2)
     detect_trusted_module_import,
     detect_module_mutation,
@@ -4302,7 +4311,9 @@ CODE_DETECTORS = [
     detect_getattr_data_ptr_replay,
     detect_singledispatch_evasion,
     detect_gc_scanning,
+    detect_itertools_state,
 ]
+
 
 BASE_DETECTOR_SPECS = [
     ("timer_monkeypatch", detect_timer_monkeypatch),
@@ -4326,6 +4337,7 @@ BASE_DETECTOR_SPECS = [
     ("sequence_batch_graph", detect_sequence_batch_graph),
     ("runtime_package_install", detect_runtime_package_install),
     ("background_subprocess", detect_background_subprocess),
+    ("network_io", detect_network_io),
     ("trusted_module_import", detect_trusted_module_import),
     ("module_mutation", detect_module_mutation),
     ("globals_mutation", detect_globals_mutation),
@@ -4352,6 +4364,7 @@ BASE_DETECTOR_SPECS = [
     ("str_cache_replay", detect_str_cache_replay),
     ("gc_scanning", detect_gc_scanning),
     ("singledispatch_evasion", detect_singledispatch_evasion),
+    ("signal_atexit", detect_signal_atexit),
 ]
 
 VALID_RULE_OUTCOMES = {AUTO_FILTER, SUSPICIOUS_ONLY, TELEMETRY_ONLY}
