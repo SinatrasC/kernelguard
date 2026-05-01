@@ -3089,6 +3089,11 @@ def detect_partial_entrypoint(code_or_facts):
     if bool(re.search(r'custom_kernel\s*=\s*functools\.partial', facts.python_active)):
         return [{"pattern": "PARTIAL_ENTRYPOINT", "severity": "high", "evidence": "functools.partial entrypoint"}]
     return []
+RE_CMD_REPL = re.compile(r'cmd\.Cmd\b')
+def detect_cmd_repl(code: str | SubmissionFacts) -> list[dict]:
+    facts = ensure_submission_facts(code)
+    if not RE_CMD_REPL.search(facts.raw_code): return []
+    return [{"pattern": "CMD_REPL", "severity": "high", "evidence": "cmd.Cmd — command REPL interpreter"}]
 # Score anomaly detection
 # ---------------------------------------------------------------------------
 
@@ -3652,6 +3657,10 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
         "OBFUSCATED_EXEC", "dynamic_execution", "hard", AUTO_FILTER, (),
         (), "keep",
     ),
+    "CMD_REPL": RulePolicy(
+        "CMD_REPL", "dynamic_execution", "hard", AUTO_FILTER, (),
+        (), "keep",
+    ),
     "DYNAMIC_EXECUTION": RulePolicy(
         "DYNAMIC_EXECUTION", "dynamic_execution", "telemetry", TELEMETRY_ONLY, (),
         (), "split",
@@ -3870,6 +3879,7 @@ CODE_DETECTORS = [
     detect_metaclass_call_intercept,
     detect_function_attr_cache,
     detect_dict_missing_cache,
+    detect_cmd_repl,
     detect_partial_entrypoint,
 ]
 
@@ -3916,6 +3926,7 @@ BASE_DETECTOR_SPECS = [
     ("metaclass_call_intercept", detect_metaclass_call_intercept),
     ("function_attr_cache", detect_function_attr_cache),
     ("dict_missing_cache", detect_dict_missing_cache),
+    ("cmd_repl", detect_cmd_repl),
     ("partial_entrypoint", detect_partial_entrypoint),
 ]
 
