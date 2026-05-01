@@ -2786,6 +2786,45 @@ def detect_dynamic_execution(code: str | SubmissionFacts) -> list[dict]:
                 "evidence": "importlib.reload() (module state reset/manipulation)",
             })
 
+    # Evaluator state mutation: any write to ``__builtins__`` is unambiguous
+    # adversarial activity in a compute kernel. Three shapes:
+    #   * ``setattr(__builtins__, name, value)``
+    #   * ``__builtins__.name = value``
+    #   * ``__builtins__[name] = value``
+    if "BUILTINS_MUTATION" not in seen:
+        for n in ast.walk(tree):
+            triggered = False
+            evidence = ""
+            if (
+                isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Name)
+                and n.func.id == "setattr"
+                and len(n.args) >= 1
+                and isinstance(n.args[0], ast.Name)
+                and n.args[0].id == "__builtins__"
+            ):
+                triggered = True
+                evidence = (
+                    "setattr(__builtins__, ...) — writes to the Python builtins namespace"
+                )
+            elif isinstance(n, ast.Assign):
+                for t in n.targets:
+                    root = _ast_root_name(t)
+                    if root == "__builtins__" and isinstance(t, (ast.Attribute, ast.Subscript)):
+                        triggered = True
+                        evidence = (
+                            "assignment to __builtins__ — writes to the Python builtins namespace"
+                        )
+                        break
+            if triggered:
+                seen.add("BUILTINS_MUTATION")
+                matches.append({
+                    "pattern": "HARNESS_RUNTIME_PATCHING",
+                    "severity": "critical",
+                    "evidence": evidence,
+                })
+                break
+
     return matches
 
 
