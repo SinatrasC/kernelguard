@@ -3447,15 +3447,14 @@ def detect_marshal_deserialize(code: str | SubmissionFacts) -> list[dict]:
     if not RE_MARSHAL_LOADS.search(facts.raw_code): return []
     return [{"pattern": "DYNAMIC_EXECUTION", "severity": "high", "evidence": "marshal.loads/load() — deserializes code objects"    }]
 
-
-def detect_background_subprocess(code: str | SubmissionFacts) -> list[dict]:
+RE_SINGLEDISPATCH = re.compile(r'@(?:functools\.)?singledispatch\b')
+def detect_singledispatch_evasion(code: str | SubmissionFacts) -> list[dict]:
     facts = ensure_submission_facts(code)
-    raw = facts.raw_code
-    if not RE_SUBPROCESS_BG.search(raw):
-        return []
-    return [{"pattern": "RUNTIME_PACKAGE_INSTALL", "severity": "critical", "evidence": "subprocess/os.system background process execution"}]
+    if not RE_SINGLEDISPATCH.search(facts.raw_code): return []
+    return [{"pattern": "HARDCODED_SHAPES", "severity": "low", "evidence": "functools.singledispatch used — type-based dispatch evades shape-specific analysis"}]
 
-
+# ---------------------------------------------------------------------------
+# Score anomaly detection
 # ---------------------------------------------------------------------------
 # Score anomaly detection
 # ---------------------------------------------------------------------------
@@ -4306,6 +4305,7 @@ BASE_DETECTOR_SPECS = [
     ("eq_none_sentinel_replay", detect_eq_none_sentinel_replay),
     ("getattr_data_ptr_replay", detect_getattr_data_ptr_replay),
     ("str_cache_replay", detect_str_cache_replay),
+    ("gc_scanning", detect_gc_scanning),
 ]
 
 VALID_RULE_OUTCOMES = {AUTO_FILTER, SUSPICIOUS_ONLY, TELEMETRY_ONLY}
