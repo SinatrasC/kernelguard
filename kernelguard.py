@@ -3656,6 +3656,9 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
         "RUNTIME_PACKAGE_INSTALL", "sandbox_violation", "hard", AUTO_FILTER, (),
         (), "keep",
     ),
+    "CLOSURE_DATAPTR_REPLAY": RulePolicy(
+        "CLOSURE_DATAPTR_REPLAY", "result_reuse", "hard", AUTO_FILTER, (), (), "rewrite",
+    ),
     "SCORE_PHYSICS_FLOOR": RulePolicy(
         "SCORE_PHYSICS_FLOOR", "score_anomaly", "hard", AUTO_FILTER, (),
         (), "keep",
@@ -3806,6 +3809,7 @@ CODE_DETECTORS = [
     detect_token_paste_cuda_api,
     detect_sequence_batch_graph,
     detect_runtime_package_install,
+    detect_closure_dataptr_replay,
     # AST-based detectors (Layer 2)
     detect_trusted_module_import,
     detect_module_mutation,
@@ -3845,6 +3849,7 @@ BASE_DETECTOR_SPECS = [
     ("token_paste_cuda_api", detect_token_paste_cuda_api),
     ("sequence_batch_graph", detect_sequence_batch_graph),
     ("runtime_package_install", detect_runtime_package_install),
+    ("closure_dataptr_replay", detect_closure_dataptr_replay),
     ("trusted_module_import", detect_trusted_module_import),
     ("module_mutation", detect_module_mutation),
     ("globals_mutation", detect_globals_mutation),
