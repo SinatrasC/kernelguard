@@ -1470,6 +1470,18 @@ def detect_runtime_package_install(code: str | SubmissionFacts) -> list[dict]:
     return []
 
 
+def detect_lambda_operator_dispatch(code_or_facts: str | SubmissionFacts) -> list[dict]:
+    facts = ensure_submission_facts(code_or_facts)
+    if not facts.python_active:
+        return []
+    has_lambda = bool(re.search(r'custom_kernel\s*=\s*lambda', facts.raw_code))
+    has_operator_setitem = bool(re.search(r'operator\.setitem', facts.raw_code))
+    has_dataptr = bool(re.search(r'data_ptr\s*\(', facts.raw_code))
+    if has_lambda and has_operator_setitem and has_dataptr:
+        return [{"pattern": "LAMBDA_OPERATOR_DISPATCH", "severity": "high", "evidence": "Lambda entrypoint with operator.setitem and data_ptr keyed dispatch"}]
+    return []
+
+
 # ---------------------------------------------------------------------------
 # AST-based detectors (Layer 2: structural analysis beyond regex)
 # ---------------------------------------------------------------------------
@@ -3653,6 +3665,9 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
         "NEAR_CLONE_SPAM", "administrative", "support", SUSPICIOUS_ONLY, (),
         (), "downgrade",
     ),
+    "LAMBDA_OPERATOR_DISPATCH": RulePolicy(
+        "LAMBDA_OPERATOR_DISPATCH", "result_reuse", "hard", AUTO_FILTER, (), (), "keep",
+    ),
 }
 
 BASE_SCORE_CONFIG = {
@@ -3775,6 +3790,7 @@ CODE_DETECTORS = [
     detect_token_paste_cuda_api,
     detect_sequence_batch_graph,
     detect_runtime_package_install,
+    detect_lambda_operator_dispatch,
     # AST-based detectors (Layer 2)
     detect_trusted_module_import,
     detect_module_mutation,
@@ -3813,6 +3829,7 @@ BASE_DETECTOR_SPECS = [
     ("token_paste_cuda_api", detect_token_paste_cuda_api),
     ("sequence_batch_graph", detect_sequence_batch_graph),
     ("runtime_package_install", detect_runtime_package_install),
+    ("lambda_operator_dispatch", detect_lambda_operator_dispatch),
     ("trusted_module_import", detect_trusted_module_import),
     ("module_mutation", detect_module_mutation),
     ("globals_mutation", detect_globals_mutation),
