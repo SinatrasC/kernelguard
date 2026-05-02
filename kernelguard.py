@@ -3025,6 +3025,111 @@ def detect_precision_downgrade(code: str | SubmissionFacts) -> list[dict]:
     return matches
 
 
+def _check_is_none_sentinel_data_ptr(
+    if_node: ast.If,
+    none_inited: set[str],
+    dp_index: set[int],
+) -> Optional[str]:
+    """Check if an If statement has the is-None sentinel + data_ptr compare pattern.
+
+    Returns the returned variable name if matched, None otherwise.
+    Pattern:
+        if _tok is not None and _tok.data_ptr() == data.data_ptr():
+            return _out
+    """
+    if not isinstance(if_node.test, ast.BoolOp):
+        return None
+    if _body_has_calls(if_node.body):
+        return None
+
+    has_is_none = False
+    has_data_ptr = False
+
+    for operand in if_node.test.values:
+        if isinstance(operand, ast.Compare):
+            for op in operand.ops:
+                if isinstance(op, (ast.Is, ast.IsNot)):
+                    left = operand.left
+                    for right in operand.comparators:
+                        none_side = None
+                        name_side = None
+                        if isinstance(left, ast.Constant) and left.value is None:
+                            none_side = left
+                            name_side = right
+                        elif isinstance(right, ast.Constant) and right.value is None:
+                            none_side = right
+                            name_side = left
+                        if none_side is not None and isinstance(name_side, ast.Name):
+                            has_is_none = True
+                            break
+                    break
+
+        if isinstance(operand, ast.Compare):
+            for op in operand.ops:
+                if isinstance(op, ast.Eq):
+                    if (
+                        _expr_has_data_ptr_fast(operand.left, dp_index)
+                        and operand.comparators
+                        and _expr_has_data_ptr_fast(operand.comparators[0], dp_index)
+                    ):
+                        has_data_ptr = True
+                        break
+
+    if not (has_is_none and has_data_ptr):
+        return None
+
+    returned = {
+        _ast_root_name(stmt.value)
+        for stmt in if_node.body
+        if isinstance(stmt, ast.Return) and stmt.value is not None
+    } - {None}
+    if not returned:
+        return None
+    if not any(r in none_inited for r in returned):
+        return None
+    return next(iter(returned))
+
+
+def detect_is_none_sentinel_replay(code: str | SubmissionFacts) -> list[dict]:
+    """Pattern: is-None sentinel guard + data_ptr compare output replay.
+
+    Catches RED #30:
+        if _tok is not None and _tok.data_ptr() == data.data_ptr():
+            return _out
+
+    Evades LAST_CALL_REPLAY because is None with Constant operand
+    filters out the pair, and POINTER_REPLAY because it only checks
+    Compare nodes (not BoolOp with two Compare operands).
+    """
+    facts = ensure_submission_facts(code)
+    tree = facts.ast_tree
+    if tree is None:
+        return []
+    entrypoint_name = entrypoint_label(facts.entrypoint_name)
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not is_entrypoint_name(node.name):
+            continue
+
+        for child in ast.walk(node):
+            if not isinstance(child, ast.If):
+                continue
+            if _check_is_none_sentinel_data_ptr(
+                child, facts._none_inited, facts._nodes_with_data_ptr
+            ):
+                return [{
+                    "pattern": "IS_NONE_SENTINEL_REPLAY",
+                    "severity": "critical",
+                    "evidence": (
+                        f"{entrypoint_name} returns saved output on is-None sentinel "
+                        f"guard + data_ptr comparison"
+                    ),
+                }]
+    return []
+
+
 # ---------------------------------------------------------------------------
 # Score anomaly detection
 # ---------------------------------------------------------------------------
@@ -3645,6 +3750,10 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
         "SCORE_EXTREME_SPEEDUP", "score_anomaly", "support", SUSPICIOUS_ONLY, (),
         (), "downgrade",
     ),
+    "IS_NONE_SENTINEL_REPLAY": RulePolicy(
+        "IS_NONE_SENTINEL_REPLAY", "result_reuse", "hard", AUTO_FILTER, (),
+        (), "keep",
+    ),
     "DUPLICATE_SPAM": RulePolicy(
         "DUPLICATE_SPAM", "administrative", "support", SUSPICIOUS_ONLY, (),
         (), "downgrade",
@@ -3790,6 +3899,7 @@ CODE_DETECTORS = [
     detect_thread_injection,
     detect_lazy_tensor,
     detect_precision_downgrade,
+    detect_is_none_sentinel_replay,
 ]
 
 BASE_DETECTOR_SPECS = [
@@ -3827,6 +3937,7 @@ BASE_DETECTOR_SPECS = [
     ("thread_injection", detect_thread_injection),
     ("lazy_tensor", detect_lazy_tensor),
     ("precision_downgrade", detect_precision_downgrade),
+    ("is_none_sentinel_replay", detect_is_none_sentinel_replay),
 ]
 
 VALID_RULE_OUTCOMES = {AUTO_FILTER, SUSPICIOUS_ONLY, TELEMETRY_ONLY}
@@ -4703,7 +4814,7 @@ AUDIT_RULE_ORDER = [
     "HARDCODED_SHAPES", "TRIVIAL_PROBE",
     "OBFUSCATED_EXEC", "DYNAMIC_EXECUTION", "MODULE_RELOAD", "THREAD_INJECTION", "LAZY_TENSOR",
     "TOKEN_PASTE_CUDA_API", "SEQUENCE_BATCH_GRAPH", "PARTIAL_GRAPH_KEY", "RUNTIME_PACKAGE_INSTALL",
-    "PRECISION_DOWNGRADE", "SCORE_PHYSICS_FLOOR", "SCORE_IMPOSSIBLE", "SCORE_SUSPECT_FLOOR",
+    "PRECISION_DOWNGRADE", "IS_NONE_SENTINEL_REPLAY", "SCORE_PHYSICS_FLOOR", "SCORE_IMPOSSIBLE", "SCORE_SUSPECT_FLOOR",
     "SCORE_BROKEN", "SCORE_EXTREME_SPEEDUP", "DUPLICATE_SPAM", "NEAR_CLONE_SPAM",
 ]
 
