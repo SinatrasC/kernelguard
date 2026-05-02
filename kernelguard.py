@@ -3025,6 +3025,28 @@ def detect_precision_downgrade(code: str | SubmissionFacts) -> list[dict]:
     return matches
 
 
+def detect_descriptor_cache_reuse(code_or_facts):
+    facts = ensure_submission_facts(code_or_facts)
+    if not facts.python_active: return []
+    has_get = bool(re.search(r'def\s+__get__\s*\([^)]*\)', facts.raw_code))
+    has_class_get = bool(re.search(r'class\s+\w+.*:\s*\n\s+def\s+__get__\s*\([^)]*\)', facts.raw_code, re.DOTALL))
+    has_global_state = bool(re.search(r'\bglobal\s+\w+', facts.custom_kernel_active or ''))
+    has_dict_state = bool(re.search(r'__dict__', facts.raw_code))
+    has_descriptor_instance = bool(re.search(r'\w+\s*=\s*\w+\(\)\s*$', facts.raw_code, re.MULTILINE))
+    has_state = has_global_state or has_dict_state or (has_class_get and has_descriptor_instance)
+    if has_get and has_state:
+        return [{"pattern": "LAST_CALL_REPLAY", "severity": "critical", "evidence": "Descriptor __get__ protocol — deferred compute via attribute access interposition"}]
+    return []
+
+
+def detect_torch_function_protocol(code_or_facts):
+    facts = ensure_submission_facts(code_or_facts)
+    if not facts.python_active: return []
+    has_torch_fn = bool(re.search(r'__torch_function__\s*\(', facts.raw_code))
+    if has_torch_fn:
+        return [{"pattern": "LAZY_TENSOR", "severity": "critical", "evidence": "__torch_function__ protocol on non-Tensor class — computation dispatch bypass"}]
+    return []
+
 # ---------------------------------------------------------------------------
 # Score anomaly detection
 # ---------------------------------------------------------------------------
@@ -3602,8 +3624,8 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
         (), "downgrade",
     ),
     "LAZY_TENSOR": RulePolicy(
-        "LAZY_TENSOR", "timing_manipulation", "telemetry", TELEMETRY_ONLY, (),
-        (), "downgrade",
+        "LAZY_TENSOR", "timing_manipulation", "hard", AUTO_FILTER, (),
+        (), "keep",
     ),
     "PRECISION_DOWNGRADE": RulePolicy(
         "PRECISION_DOWNGRADE", "approximation", "telemetry", TELEMETRY_ONLY, (),
@@ -3790,6 +3812,8 @@ CODE_DETECTORS = [
     detect_thread_injection,
     detect_lazy_tensor,
     detect_precision_downgrade,
+    detect_descriptor_cache_reuse,
+    detect_torch_function_protocol,
 ]
 
 BASE_DETECTOR_SPECS = [
@@ -3827,6 +3851,8 @@ BASE_DETECTOR_SPECS = [
     ("thread_injection", detect_thread_injection),
     ("lazy_tensor", detect_lazy_tensor),
     ("precision_downgrade", detect_precision_downgrade),
+    ("descriptor_cache_reuse", detect_descriptor_cache_reuse),
+    ("torch_function_protocol", detect_torch_function_protocol),
 ]
 
 VALID_RULE_OUTCOMES = {AUTO_FILTER, SUSPICIOUS_ONLY, TELEMETRY_ONLY}
