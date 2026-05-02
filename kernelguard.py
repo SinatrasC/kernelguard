@@ -2053,11 +2053,17 @@ def detect_pointer_replay(code: str | SubmissionFacts) -> list[dict]:
             and expr.func.attr == "data_ptr"
         )
 
+    def _data_ptr_receiver(expr: ast.AST | None) -> Optional[str]:
+        if not _is_data_ptr_call(expr):
+            return None
+        return _ast_root_name(expr.func.value)
+
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
         if not is_entrypoint_name(node.name):
             continue
+        params = {arg.arg for arg in node.args.args}
 
         pointer_aliases: set[str] = set()
         saved_ptr = None
@@ -2133,29 +2139,129 @@ def detect_pointer_replay(code: str | SubmissionFacts) -> list[dict]:
             saved_out = returns[0].value.id
             break
 
-        if not saved_ptr or not saved_out:
-            continue
-
-        stores_ptr = False
-        stores_out = False
-        for child in ast.walk(node):
-            if not isinstance(child, ast.Assign):
-                continue
-            for target in child.targets:
-                if not isinstance(target, ast.Name):
+        if saved_ptr and saved_out:
+            stores_ptr = False
+            stores_out = False
+            for child in ast.walk(node):
+                if not isinstance(child, ast.Assign):
                     continue
-                if target.id == saved_ptr:
-                    if (isinstance(child.value, ast.Name) and child.value.id in pointer_aliases) or _is_data_ptr_call(child.value):
-                        stores_ptr = True
-                elif target.id == saved_out:
-                    stores_out = True
+                for target in child.targets:
+                    if not isinstance(target, ast.Name):
+                        continue
+                    if target.id == saved_ptr:
+                        if (isinstance(child.value, ast.Name) and child.value.id in pointer_aliases) or _is_data_ptr_call(child.value):
+                            stores_ptr = True
+                    elif target.id == saved_out:
+                        stores_out = True
 
-        if stores_ptr and stores_out:
-            return [{
-                "pattern": "POINTER_REPLAY",
-                "severity": "critical",
-                "evidence": f"{entrypoint_name} returns saved output when input data_ptr matches previous pointer",
-            }]
+            if stores_ptr and stores_out:
+                return [{
+                    "pattern": "POINTER_REPLAY",
+                    "severity": "critical",
+                    "evidence": f"{entrypoint_name} returns saved output when input data_ptr matches previous pointer",
+                }]
+
+        dict_item_values: dict[str, tuple[str, str]] = {}
+        for child in ast.walk(node):
+            if not isinstance(child, ast.For):
+                continue
+            iter_call = child.iter
+            if (
+                isinstance(iter_call, ast.Call)
+                and isinstance(iter_call.func, ast.Name)
+                and iter_call.func.id == "list"
+                and iter_call.args
+            ):
+                iter_call = iter_call.args[0]
+            if not (
+                isinstance(iter_call, ast.Call)
+                and isinstance(iter_call.func, ast.Attribute)
+                and iter_call.func.attr == "items"
+            ):
+                continue
+            if not isinstance(child.target, ast.Tuple) or len(child.target.elts) != 2:
+                continue
+            key, value = child.target.elts
+            if not isinstance(key, ast.Name) or not isinstance(value, ast.Name):
+                continue
+            dict_name = _ast_root_name(iter_call.func.value)
+            if dict_name is None:
+                continue
+            dict_item_values[value.id] = (key.id, dict_name)
+
+        for child in ast.walk(node):
+            if not isinstance(child, ast.If):
+                continue
+            if _body_has_calls(child.body):
+                continue
+            returns = [
+                stmt.value
+                for stmt in child.body
+                if isinstance(stmt, ast.Return) and isinstance(stmt.value, ast.Name)
+            ]
+            if not returns:
+                continue
+
+            compared_names: set[str] = set()
+            compares_input_ptr = False
+            for compare in ast.walk(child.test):
+                if not isinstance(compare, ast.Compare):
+                    continue
+                operands = [compare.left] + list(compare.comparators)
+                for i, op in enumerate(compare.ops):
+                    if not isinstance(op, ast.Eq):
+                        continue
+                    left_name = _data_ptr_receiver(operands[i])
+                    right_name = _data_ptr_receiver(operands[i + 1])
+                    if left_name is None or right_name is None:
+                        continue
+                    if left_name in params and right_name not in params:
+                        compared_names.add(right_name)
+                        compares_input_ptr = True
+                    elif right_name in params and left_name not in params:
+                        compared_names.add(left_name)
+                        compares_input_ptr = True
+
+            if not compares_input_ptr:
+                continue
+
+            returned_name = returns[0].id
+            dict_item = dict_item_values.get(returned_name)
+            if dict_item is not None:
+                key_name, dict_name = dict_item
+                if key_name not in compared_names:
+                    continue
+                dict_written = any(
+                    isinstance(assign, ast.Assign)
+                    and any(_ast_root_name(target) == dict_name for target in assign.targets)
+                    and any(name in params for name in _expr_names(next(iter(assign.targets), None)))
+                    for assign in ast.walk(node)
+                )
+                if dict_written:
+                    return [{
+                        "pattern": "POINTER_REPLAY",
+                        "severity": "critical",
+                        "evidence": f"{entrypoint_name} returns dict item output when key data_ptr matches input",
+                    }]
+                continue
+
+            stores_returned = any(
+                isinstance(assign, ast.Assign)
+                and any(_ast_root_name(target) == returned_name for target in assign.targets)
+                for assign in ast.walk(node)
+            )
+            stores_compared = any(
+                isinstance(assign, ast.Assign)
+                and any(_ast_root_name(target) in compared_names for target in assign.targets)
+                and bool(_expr_names(assign.value) & params)
+                for assign in ast.walk(node)
+            )
+            if stores_returned and stores_compared:
+                return [{
+                    "pattern": "POINTER_REPLAY",
+                    "severity": "critical",
+                    "evidence": f"{entrypoint_name} returns saved output when saved tensor data_ptr matches input",
+                }]
 
     return []
 
