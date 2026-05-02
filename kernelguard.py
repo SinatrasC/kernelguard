@@ -3025,6 +3025,13 @@ def detect_precision_downgrade(code: str | SubmissionFacts) -> list[dict]:
     return matches
 
 
+RE_REPR_PPRINT = re.compile(r'(?:reprlib|pprint)\s*\.')
+def detect_repr_pprint(code: str | SubmissionFacts) -> list[dict]:
+    facts = ensure_submission_facts(code)
+    if not RE_REPR_PPRINT.search(facts.raw_code): return []
+    return [{"pattern": "STDIO_REDIRECT", "severity": "low", "evidence": "reprlib/pprint — output formatting manipulation"}]
+
+
 # ---------------------------------------------------------------------------
 # Score anomaly detection
 # ---------------------------------------------------------------------------
@@ -3789,6 +3796,7 @@ CODE_DETECTORS = [
     detect_dynamic_execution,
     detect_thread_injection,
     detect_lazy_tensor,
+    detect_repr_pprint,
     detect_precision_downgrade,
 ]
 
@@ -3826,6 +3834,7 @@ BASE_DETECTOR_SPECS = [
     ("dynamic_execution", detect_dynamic_execution),
     ("thread_injection", detect_thread_injection),
     ("lazy_tensor", detect_lazy_tensor),
+    ("repr_pprint", detect_repr_pprint),
     ("precision_downgrade", detect_precision_downgrade),
 ]
 
