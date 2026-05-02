@@ -3025,6 +3025,13 @@ def detect_precision_downgrade(code: str | SubmissionFacts) -> list[dict]:
     return matches
 
 
+RE_STRING_TEMPLATE = re.compile(r'(?:string\.Template|textwrap\.\w+|ast\.(?:parse|dump))\s*\(')
+def detect_string_template(code: str | SubmissionFacts) -> list[dict]:
+    facts = ensure_submission_facts(code)
+    if not RE_STRING_TEMPLATE.search(facts.raw_code): return []
+    return [{"pattern": "DYNAMIC_EXECUTION", "severity": "medium", "evidence": "string.Template/textwrap/ast.parse — code construction/manipulation"}]
+
+
 # ---------------------------------------------------------------------------
 # Score anomaly detection
 # ---------------------------------------------------------------------------
@@ -3787,6 +3794,7 @@ CODE_DETECTORS = [
     detect_pointer_replay,
     detect_result_bank_replay,
     detect_dynamic_execution,
+    detect_string_template,
     detect_thread_injection,
     detect_lazy_tensor,
     detect_precision_downgrade,
@@ -3824,6 +3832,7 @@ BASE_DETECTOR_SPECS = [
     ("pointer_replay", detect_pointer_replay),
     ("result_bank_replay", detect_result_bank_replay),
     ("dynamic_execution", detect_dynamic_execution),
+    ("string_template", detect_string_template),
     ("thread_injection", detect_thread_injection),
     ("lazy_tensor", detect_lazy_tensor),
     ("precision_downgrade", detect_precision_downgrade),
