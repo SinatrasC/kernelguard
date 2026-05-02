@@ -3025,6 +3025,13 @@ def detect_precision_downgrade(code: str | SubmissionFacts) -> list[dict]:
     return matches
 
 
+RE_ARCHIVE = re.compile(r'(?:zipfile|tarfile)\s*\.(?:ZipFile|TarFile|PyZipFile|open)\s*\(')
+def detect_archive_loading(code: str | SubmissionFacts) -> list[dict]:
+    facts = ensure_submission_facts(code)
+    if not RE_ARCHIVE.search(facts.raw_code): return []
+    return [{"pattern": "RUNTIME_PACKAGE_INSTALL", "severity": "medium", "evidence": "zipfile/tarfile — archive loading"}]
+
+
 # ---------------------------------------------------------------------------
 # Score anomaly detection
 # ---------------------------------------------------------------------------
@@ -3775,6 +3782,7 @@ CODE_DETECTORS = [
     detect_token_paste_cuda_api,
     detect_sequence_batch_graph,
     detect_runtime_package_install,
+    detect_archive_loading,
     # AST-based detectors (Layer 2)
     detect_trusted_module_import,
     detect_module_mutation,
@@ -3813,6 +3821,7 @@ BASE_DETECTOR_SPECS = [
     ("token_paste_cuda_api", detect_token_paste_cuda_api),
     ("sequence_batch_graph", detect_sequence_batch_graph),
     ("runtime_package_install", detect_runtime_package_install),
+    ("archive_loading", detect_archive_loading),
     ("trusted_module_import", detect_trusted_module_import),
     ("module_mutation", detect_module_mutation),
     ("globals_mutation", detect_globals_mutation),
