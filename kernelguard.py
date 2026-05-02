@@ -2168,6 +2168,38 @@ def detect_last_call_replay(code: str | SubmissionFacts) -> list[dict]:
         return []
     entrypoint_name = entrypoint_label(facts.entrypoint_name)
 
+    exec_sources: list[str] = []
+    for call in ast.walk(tree):
+        if not isinstance(call, ast.Call) or not call.args:
+            continue
+        is_exec = (
+            isinstance(call.func, ast.Name) and call.func.id == "exec"
+        ) or (
+            isinstance(call.func, ast.Attribute)
+            and call.func.attr == "exec"
+            and _ast_root_name(call.func.value) == "builtins"
+        )
+        if is_exec and isinstance(call.args[0], ast.Constant) and isinstance(call.args[0].value, str):
+            exec_sources.append(call.args[0].value)
+
+    if exec_sources:
+        joined_exec = "\n".join(exec_sources)
+        has_pointer_cache = (
+            "data_ptr" in joined_exec
+            and re.search(r"if\s+\w+\s+in\s+\w+\s*:\s*\n?\s*return\s+\w+\s*\[\s*\w+\s*\]", joined_exec)
+            and re.search(r"\w+\s*\[\s*\w+\s*\]\s*=", joined_exec)
+        )
+        installs_entrypoint = "custom_kernel" in joined_exec
+        if has_pointer_cache and installs_entrypoint:
+            return [{
+                "pattern": "LAST_CALL_REPLAY",
+                "severity": "critical",
+                "evidence": (
+                    f"{entrypoint_name} is installed by exec string containing "
+                    "data_ptr-keyed output replay"
+                ),
+            }]
+
     # Use pre-computed indices from build_submission_facts
     none_inited = facts._none_inited
     data_ptr_helpers = facts._data_ptr_helpers
