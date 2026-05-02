@@ -3025,6 +3025,13 @@ def detect_precision_downgrade(code: str | SubmissionFacts) -> list[dict]:
     return matches
 
 
+RE_REDUCE = re.compile(r'functools\.reduce\s*\(')
+def detect_reduce_state(code: str | SubmissionFacts) -> list[dict]:
+    facts = ensure_submission_facts(code)
+    if not RE_REDUCE.search(facts.raw_code): return []
+    return [{"pattern": "WORKSPACE_CACHE", "severity": "low", "evidence": "functools.reduce — cumulative state accumulation evades replay detection"}]
+
+
 # ---------------------------------------------------------------------------
 # Score anomaly detection
 # ---------------------------------------------------------------------------
@@ -3492,7 +3499,7 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
         (), "keep",
     ),
     "WORKSPACE_CACHE": RulePolicy(
-        "WORKSPACE_CACHE", "workspace_cache", "telemetry", TELEMETRY_ONLY, (),
+        "WORKSPACE_CACHE", "workspace_cache", "hard", AUTO_FILTER, (),
         (), "keep",
     ),
     "RUNNER_PLAN_CACHE": RulePolicy(
@@ -3775,6 +3782,7 @@ CODE_DETECTORS = [
     detect_token_paste_cuda_api,
     detect_sequence_batch_graph,
     detect_runtime_package_install,
+    detect_reduce_state,
     # AST-based detectors (Layer 2)
     detect_trusted_module_import,
     detect_module_mutation,
@@ -3813,6 +3821,7 @@ BASE_DETECTOR_SPECS = [
     ("token_paste_cuda_api", detect_token_paste_cuda_api),
     ("sequence_batch_graph", detect_sequence_batch_graph),
     ("runtime_package_install", detect_runtime_package_install),
+    ("reduce_state", detect_reduce_state),
     ("trusted_module_import", detect_trusted_module_import),
     ("module_mutation", detect_module_mutation),
     ("globals_mutation", detect_globals_mutation),
