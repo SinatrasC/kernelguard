@@ -2462,6 +2462,150 @@ def detect_last_call_replay(code: str | SubmissionFacts) -> list[dict]:
     return []
 
 
+def detect_method_reader_replay(code: str | SubmissionFacts) -> list[dict]:
+    """Pattern: object reader/writer methods hide saved output replay."""
+    facts = ensure_submission_facts(code)
+    tree = facts.ast_tree
+    if tree is None:
+        return []
+    entrypoint_name = entrypoint_label(facts.entrypoint_name)
+
+    classes = {
+        stmt.name: stmt
+        for stmt in tree.body
+        if isinstance(stmt, ast.ClassDef)
+    }
+    readers: dict[tuple[str, str], str] = {}
+    writers: dict[tuple[str, str], str] = {}
+
+    for class_name, cls in classes.items():
+        for item in cls.body:
+            if not isinstance(item, ast.FunctionDef) or not item.args.args:
+                continue
+            self_name = item.args.args[0].arg
+            returns = [stmt.value for stmt in ast.walk(item) if isinstance(stmt, ast.Return)]
+            if len(item.args.args) == 1 and len(returns) == 1:
+                ret = returns[0]
+                if (
+                    isinstance(ret, ast.Attribute)
+                    and isinstance(ret.value, ast.Name)
+                    and ret.value.id == self_name
+                ):
+                    readers[(class_name, item.name)] = ret.attr
+                    continue
+            if len(item.args.args) != 2:
+                continue
+            value_name = item.args.args[1].arg
+            for stmt in ast.walk(item):
+                if not (
+                    isinstance(stmt, ast.Assign)
+                    and isinstance(stmt.value, ast.Name)
+                    and stmt.value.id == value_name
+                ):
+                    continue
+                for target in stmt.targets:
+                    if (
+                        isinstance(target, ast.Attribute)
+                        and isinstance(target.value, ast.Name)
+                        and target.value.id == self_name
+                    ):
+                        writers[(class_name, item.name)] = target.attr
+
+    instances = {
+        target.id: stmt.value.func.id
+        for stmt in tree.body
+        if isinstance(stmt, ast.Assign)
+        and isinstance(stmt.value, ast.Call)
+        and isinstance(stmt.value.func, ast.Name)
+        and stmt.value.func.id in classes
+        for target in stmt.targets
+        if isinstance(target, ast.Name)
+    }
+
+    def _param_names(node: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
+        params = {arg.arg for arg in node.args.args}
+        params.update(arg.arg for arg in node.args.posonlyargs)
+        params.update(arg.arg for arg in node.args.kwonlyargs)
+        return params
+
+    def _method_attr(expr: ast.AST | None, table: dict[tuple[str, str], str]) -> tuple[str, str] | None:
+        if not (
+            isinstance(expr, ast.Call)
+            and isinstance(expr.func, ast.Attribute)
+            and isinstance(expr.func.value, ast.Name)
+            and expr.func.value.id in instances
+        ):
+            return None
+        class_name = instances[expr.func.value.id]
+        attr = table.get((class_name, expr.func.attr))
+        if attr is None:
+            return None
+        return expr.func.value.id, attr
+
+    def _body_has_only_reader_calls(body: list[ast.stmt], expected: set[tuple[str, str]]) -> bool:
+        for stmt in body:
+            for expr in ast.walk(stmt):
+                if not isinstance(expr, ast.Call):
+                    continue
+                if _method_attr(expr, readers) in expected:
+                    continue
+                return False
+        return True
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not is_entrypoint_name(node.name):
+            continue
+
+        params = _param_names(node)
+        mutated = {
+            attr
+            for call in ast.walk(node)
+            if isinstance(call, ast.Call)
+            and len(call.args) == 1
+            and bool(_expr_names(call.args[0]) & params)
+            for attr in [_method_attr(call, writers)]
+            if attr is not None
+        }
+        if not mutated:
+            continue
+
+        for child in ast.walk(node):
+            if not isinstance(child, ast.If):
+                continue
+            if _expr_names(child.test) & params:
+                continue
+            tested = {
+                attr
+                for expr in ast.walk(child.test)
+                for attr in [_method_attr(expr, readers)]
+                if attr in mutated
+            }
+            if not tested:
+                continue
+            if not _body_has_only_reader_calls(child.body, mutated):
+                continue
+            returned = {
+                attr
+                for stmt in child.body
+                if isinstance(stmt, ast.Return)
+                for attr in [_method_attr(stmt.value, readers)]
+                if attr in mutated
+            }
+            if tested & returned:
+                return [{
+                    "pattern": "METHOD_READER_REPLAY",
+                    "severity": "critical",
+                    "evidence": (
+                        f"{entrypoint_name} replays output through paired "
+                        "object reader/writer methods"
+                    ),
+                }]
+
+    return []
+
+
 RE_OBJECT_ID_DATA = re.compile(r"\bdata_id\s*=\s*id\s*\(\s*data\s*\)")
 RE_RESULT_BANK_SET = re.compile(r"_superbatch_results\s*\[\s*(?:did|data_id)\s*\]\s*=")
 RE_RESULT_BANK_RETURN = re.compile(r"return\s+_superbatch_results\s*\[\s*data_id\s*\]")
@@ -3479,6 +3623,10 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
         "LAST_CALL_REPLAY", "result_reuse", "hard", AUTO_FILTER, (),
         AMD_MANUAL_LAST_CALL_REPLAY_FIXTURES, "keep",
     ),
+    "METHOD_READER_REPLAY": RulePolicy(
+        "METHOD_READER_REPLAY", "result_reuse", "hard", AUTO_FILTER, (),
+        (), "keep",
+    ),
     "SHAPE_OUTPUT_REPLAY": RulePolicy(
         "SHAPE_OUTPUT_REPLAY", "result_reuse", "hard", AUTO_FILTER, (),
         AMD_PACKAGE_SHAPE_REPLAY_FIXTURES, "keep",
@@ -3762,6 +3910,7 @@ CODE_DETECTORS = [
     detect_decode_mm_ref,
     detect_result_caching,
     detect_last_call_replay,
+    detect_method_reader_replay,
     detect_shape_output_replay,
     detect_timed_input_replay,
     detect_cuda_graph_replay,
@@ -3800,6 +3949,7 @@ BASE_DETECTOR_SPECS = [
     ("decode_mm_ref", detect_decode_mm_ref),
     ("result_caching", detect_result_caching),
     ("last_call_replay", detect_last_call_replay),
+    ("method_reader_replay", detect_method_reader_replay),
     ("shape_output_replay", detect_shape_output_replay),
     ("timed_input_replay", detect_timed_input_replay),
     ("cuda_graph_replay", detect_cuda_graph_replay),
@@ -4696,7 +4846,7 @@ AUDIT_RULE_ORDER = [
     "EVALUATOR_EXPLOIT", "HARNESS_RUNTIME_PATCHING", "MODULE_MUTATION", "GLOBALS_MUTATION", "CODE_REPLACEMENT",
     "FRAME_WALK_ACCESS", "FRAME_WALK_MUTATION", "SYS_MODULES_ACCESS", "GLOBALS_ACCESS", "CODE_ACCESS",
     "TRUSTED_MODULE_IMPORT",
-    "OUTPUT_REPLAY_CACHE", "LAST_CALL_REPLAY", "SHAPE_OUTPUT_REPLAY", "TIMED_INPUT_REPLAY", "CONFIG_CACHE_EXPLOIT", "POINTER_REPLAY", "RESULT_BANK_REPLAY", "PREPROCESS_CACHE", "WORKSPACE_CACHE",
+    "OUTPUT_REPLAY_CACHE", "LAST_CALL_REPLAY", "METHOD_READER_REPLAY", "SHAPE_OUTPUT_REPLAY", "TIMED_INPUT_REPLAY", "CONFIG_CACHE_EXPLOIT", "POINTER_REPLAY", "RESULT_BANK_REPLAY", "PREPROCESS_CACHE", "WORKSPACE_CACHE",
     "RUNNER_PLAN_CACHE", "CUDA_GRAPH_PYTHON", "CUDA_GRAPH_REPLAY",
     "TIMER_MONKEYPATCH", "FAKE_BENCHMARK_EMIT", "STDIO_REDIRECT", "UNSYNC_MULTISTREAM", "CUDA_EVENT_DISABLE_TIMING",
     "SCALED_MM_REF", "DECODE_MM_REF", "SILENT_FALLBACK", "REFERENCE_PRECOMPUTE_REPLAY", "TORCH_COMPILE_CACHE",
