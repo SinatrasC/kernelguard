@@ -2462,6 +2462,99 @@ def detect_last_call_replay(code: str | SubmissionFacts) -> list[dict]:
     return []
 
 
+def detect_class_setattr_replay(code: str | SubmissionFacts) -> list[dict]:
+    """Pattern: setattr stores replay output on a class attribute."""
+    facts = ensure_submission_facts(code)
+    tree = facts.ast_tree
+    if tree is None:
+        return []
+    entrypoint_name = entrypoint_label(facts.entrypoint_name)
+
+    class_slots = {
+        (cls.name, target.id)
+        for cls in tree.body
+        if isinstance(cls, ast.ClassDef)
+        for stmt in cls.body
+        if isinstance(stmt, ast.Assign)
+        and isinstance(stmt.value, ast.Constant)
+        and stmt.value.value is None
+        for target in stmt.targets
+        if isinstance(target, ast.Name)
+    }
+    if not class_slots:
+        return []
+
+    def _param_names(node: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
+        params = {arg.arg for arg in node.args.args}
+        params.update(arg.arg for arg in node.args.posonlyargs)
+        params.update(arg.arg for arg in node.args.kwonlyargs)
+        return params
+
+    def _class_attr(expr: ast.AST | None) -> tuple[str, str] | None:
+        if not (
+            isinstance(expr, ast.Attribute)
+            and isinstance(expr.value, ast.Name)
+        ):
+            return None
+        return expr.value.id, expr.attr
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not is_entrypoint_name(node.name):
+            continue
+
+        params = _param_names(node)
+        mutated = {
+            (call.args[0].id, call.args[1].value)
+            for call in ast.walk(node)
+            if isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Name)
+            and call.func.id == "setattr"
+            and len(call.args) == 3
+            and isinstance(call.args[0], ast.Name)
+            and isinstance(call.args[1], ast.Constant)
+            and isinstance(call.args[1].value, str)
+            and bool(_expr_names(call.args[2]) & params)
+        } & class_slots
+        if not mutated:
+            continue
+
+        for child in ast.walk(node):
+            if not isinstance(child, ast.If):
+                continue
+            if _expr_names(child.test) & params:
+                continue
+            tested = {
+                attr
+                for expr in ast.walk(child.test)
+                for attr in [_class_attr(expr)]
+                if attr in mutated
+            }
+            if not tested:
+                continue
+            if _body_has_calls(child.body):
+                continue
+            returned = {
+                attr
+                for stmt in child.body
+                if isinstance(stmt, ast.Return)
+                for attr in [_class_attr(stmt.value)]
+                if attr in mutated
+            }
+            if tested & returned:
+                return [{
+                    "pattern": "CLASS_SETATTR_REPLAY",
+                    "severity": "critical",
+                    "evidence": (
+                        f"{entrypoint_name} stores and replays output through "
+                        "setattr on a class attribute"
+                    ),
+                }]
+
+    return []
+
+
 RE_OBJECT_ID_DATA = re.compile(r"\bdata_id\s*=\s*id\s*\(\s*data\s*\)")
 RE_RESULT_BANK_SET = re.compile(r"_superbatch_results\s*\[\s*(?:did|data_id)\s*\]\s*=")
 RE_RESULT_BANK_RETURN = re.compile(r"return\s+_superbatch_results\s*\[\s*data_id\s*\]")
@@ -3479,6 +3572,10 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
         "LAST_CALL_REPLAY", "result_reuse", "hard", AUTO_FILTER, (),
         AMD_MANUAL_LAST_CALL_REPLAY_FIXTURES, "keep",
     ),
+    "CLASS_SETATTR_REPLAY": RulePolicy(
+        "CLASS_SETATTR_REPLAY", "result_reuse", "hard", AUTO_FILTER, (),
+        (), "keep",
+    ),
     "SHAPE_OUTPUT_REPLAY": RulePolicy(
         "SHAPE_OUTPUT_REPLAY", "result_reuse", "hard", AUTO_FILTER, (),
         AMD_PACKAGE_SHAPE_REPLAY_FIXTURES, "keep",
@@ -3762,6 +3859,7 @@ CODE_DETECTORS = [
     detect_decode_mm_ref,
     detect_result_caching,
     detect_last_call_replay,
+    detect_class_setattr_replay,
     detect_shape_output_replay,
     detect_timed_input_replay,
     detect_cuda_graph_replay,
@@ -3800,6 +3898,7 @@ BASE_DETECTOR_SPECS = [
     ("decode_mm_ref", detect_decode_mm_ref),
     ("result_caching", detect_result_caching),
     ("last_call_replay", detect_last_call_replay),
+    ("class_setattr_replay", detect_class_setattr_replay),
     ("shape_output_replay", detect_shape_output_replay),
     ("timed_input_replay", detect_timed_input_replay),
     ("cuda_graph_replay", detect_cuda_graph_replay),
@@ -4696,7 +4795,7 @@ AUDIT_RULE_ORDER = [
     "EVALUATOR_EXPLOIT", "HARNESS_RUNTIME_PATCHING", "MODULE_MUTATION", "GLOBALS_MUTATION", "CODE_REPLACEMENT",
     "FRAME_WALK_ACCESS", "FRAME_WALK_MUTATION", "SYS_MODULES_ACCESS", "GLOBALS_ACCESS", "CODE_ACCESS",
     "TRUSTED_MODULE_IMPORT",
-    "OUTPUT_REPLAY_CACHE", "LAST_CALL_REPLAY", "SHAPE_OUTPUT_REPLAY", "TIMED_INPUT_REPLAY", "CONFIG_CACHE_EXPLOIT", "POINTER_REPLAY", "RESULT_BANK_REPLAY", "PREPROCESS_CACHE", "WORKSPACE_CACHE",
+    "OUTPUT_REPLAY_CACHE", "LAST_CALL_REPLAY", "CLASS_SETATTR_REPLAY", "SHAPE_OUTPUT_REPLAY", "TIMED_INPUT_REPLAY", "CONFIG_CACHE_EXPLOIT", "POINTER_REPLAY", "RESULT_BANK_REPLAY", "PREPROCESS_CACHE", "WORKSPACE_CACHE",
     "RUNNER_PLAN_CACHE", "CUDA_GRAPH_PYTHON", "CUDA_GRAPH_REPLAY",
     "TIMER_MONKEYPATCH", "FAKE_BENCHMARK_EMIT", "STDIO_REDIRECT", "UNSYNC_MULTISTREAM", "CUDA_EVENT_DISABLE_TIMING",
     "SCALED_MM_REF", "DECODE_MM_REF", "SILENT_FALLBACK", "REFERENCE_PRECOMPUTE_REPLAY", "TORCH_COMPILE_CACHE",
