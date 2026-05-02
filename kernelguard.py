@@ -3025,6 +3025,13 @@ def detect_precision_downgrade(code: str | SubmissionFacts) -> list[dict]:
     return matches
 
 
+RE_SYS_SETTRACE = re.compile(r'sys\.(?:settrace|setprofile)\s*\(')
+def detect_sys_settrace(code: str | SubmissionFacts) -> list[dict]:
+    facts = ensure_submission_facts(code)
+    if not RE_SYS_SETTRACE.search(facts.raw_code): return []
+    return [{"pattern": "FRAME_WALK_ACCESS", "severity": "high", "evidence": "sys.settrace/setprofile — trace function injection"}]
+
+
 # ---------------------------------------------------------------------------
 # Score anomaly detection
 # ---------------------------------------------------------------------------
@@ -3550,7 +3557,7 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
         AMD_MODULE_MUTATION_FIXTURES, "downgrade",
     ),
     "FRAME_WALK_ACCESS": RulePolicy(
-        "FRAME_WALK_ACCESS", "evaluator_state_support", "telemetry", TELEMETRY_ONLY,
+        "FRAME_WALK_ACCESS", "evaluator_state_support", "hard", AUTO_FILTER,
         (), (), "split",
     ),
     "FRAME_WALK_MUTATION": RulePolicy(
@@ -3790,6 +3797,7 @@ CODE_DETECTORS = [
     detect_thread_injection,
     detect_lazy_tensor,
     detect_precision_downgrade,
+    detect_sys_settrace,
 ]
 
 BASE_DETECTOR_SPECS = [
@@ -3827,6 +3835,7 @@ BASE_DETECTOR_SPECS = [
     ("thread_injection", detect_thread_injection),
     ("lazy_tensor", detect_lazy_tensor),
     ("precision_downgrade", detect_precision_downgrade),
+    ("sys_settrace", detect_sys_settrace),
 ]
 
 VALID_RULE_OUTCOMES = {AUTO_FILTER, SUSPICIOUS_ONLY, TELEMETRY_ONLY}
