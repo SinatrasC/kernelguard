@@ -1483,6 +1483,18 @@ def detect_closure_dataptr_replay(code_or_facts: str | SubmissionFacts) -> list[
     return []
 
 
+def detect_lambda_operator_dispatch(code_or_facts: str | SubmissionFacts) -> list[dict]:
+    facts = ensure_submission_facts(code_or_facts)
+    if not facts.python_active:
+        return []
+    has_lambda = bool(re.search(r'custom_kernel\s*=\s*lambda', facts.raw_code))
+    has_operator_setitem = bool(re.search(r'operator\.setitem', facts.raw_code))
+    has_dataptr = bool(re.search(r'data_ptr\s*\(', facts.raw_code))
+    if has_lambda and has_operator_setitem and has_dataptr:
+        return [{"pattern": "LAMBDA_OPERATOR_DISPATCH", "severity": "high", "evidence": "Lambda entrypoint with operator.setitem and data_ptr keyed dispatch"}]
+    return []
+
+
 # ---------------------------------------------------------------------------
 # AST-based detectors (Layer 2: structural analysis beyond regex)
 # ---------------------------------------------------------------------------
@@ -2048,6 +2060,19 @@ def detect_timed_input_replay(code: str | SubmissionFacts) -> list[dict]:
             "severity": "critical",
             "evidence": "timed-input quantization / transformed-Q replay: " + ", ".join(sorted(set(indicators))),
         }]
+    return []
+
+
+def detect_getframe_dataptr_replay(code: str | SubmissionFacts) -> list[dict]:
+    """Pattern: sys._getframe() frame walk to detect repeated calls + data_ptr comparison for result caching."""
+    facts = ensure_submission_facts(code)
+    if not facts.custom_kernel_active:
+        return []
+    active = facts.custom_kernel_active
+    has_getframe = bool(re.search(r'sys\._getframe\s*\(', active))
+    has_dataptr_compare = bool(re.search(r'data_ptr\s*\(\s*\).*==.*data\.data_ptr', active))
+    if has_getframe and has_dataptr_compare:
+        return [{"pattern": "GETFRAME_DATAPTR_REPLAY", "severity": "high", "evidence": "sys._getframe() combined with data_ptr comparison for result caching"}]
     return []
 
 
@@ -3640,6 +3665,10 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
         "DICT_ITEMS_REPLAY", "result_reuse", "hard", AUTO_FILTER, (),
         (), "rewrite",
     ),
+    "GETFRAME_DATAPTR_REPLAY": RulePolicy(
+        "GETFRAME_DATAPTR_REPLAY", "result_reuse", "hard", AUTO_FILTER, (),
+        (), "keep",
+    ),
     "TOKEN_PASTE_CUDA_API": RulePolicy(
         "TOKEN_PASTE_CUDA_API", "filter_evasion", "hard", AUTO_FILTER, (),
         (), "keep",
@@ -3798,6 +3827,7 @@ CODE_DETECTORS = [
     detect_last_call_replay,
     detect_shape_output_replay,
     detect_timed_input_replay,
+    detect_getframe_dataptr_replay,
     detect_cuda_graph_replay,
     detect_silent_fallback,
     detect_trivial_probe,
@@ -3809,7 +3839,7 @@ CODE_DETECTORS = [
     detect_token_paste_cuda_api,
     detect_sequence_batch_graph,
     detect_runtime_package_install,
-    detect_closure_dataptr_replay,
+    detect_lambda_operator_dispatch,
     # AST-based detectors (Layer 2)
     detect_trusted_module_import,
     detect_module_mutation,
