@@ -2202,6 +2202,35 @@ def detect_last_call_replay(code: str | SubmissionFacts) -> list[dict]:
             continue
         if not is_entrypoint_name(node.name):
             continue
+        params = {arg.arg for arg in node.args.args}
+
+        guarded_input_state: set[str] = set()
+        for child in ast.walk(node):
+            if not isinstance(child, ast.If):
+                continue
+            test_roots = _expr_names(child.test)
+            assigned_from_input = {
+                _ast_root_name(target)
+                for stmt in child.body
+                if isinstance(stmt, ast.Assign) and (_expr_names(stmt.value) & params)
+                for target in stmt.targets
+            } - {None}
+            guarded_input_state.update(test_roots & assigned_from_input)
+
+        if len(guarded_input_state) >= 2:
+            for stmt in node.body:
+                if not isinstance(stmt, ast.Return) or stmt.value is None:
+                    continue
+                returned_state = _expr_names(stmt.value) & guarded_input_state
+                if len(returned_state) >= 2:
+                    return [{
+                        "pattern": "LAST_CALL_REPLAY",
+                        "severity": "critical",
+                        "evidence": (
+                            f"{entrypoint_name} combines multiple first-call "
+                            "state slots initialized from live input"
+                        ),
+                    }]
 
         signature_features: dict[str, set[str]] = defaultdict(set)
         saved_state_features: dict[str, set[str]] = defaultdict(set)
