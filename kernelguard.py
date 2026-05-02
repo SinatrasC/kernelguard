@@ -3025,6 +3025,14 @@ def detect_precision_downgrade(code: str | SubmissionFacts) -> list[dict]:
     return matches
 
 
+def detect_instancecheck_metaclass(code: str | SubmissionFacts) -> list[dict]:
+    facts = ensure_submission_facts(code)
+    code = facts.raw_code
+    if re.search(r'def\s+__instancecheck__\s*\(', code) and re.search(r'\bisinstance\b', code):
+        return [{"pattern": "INSTANCECHECK_METACLASS", "severity": "critical", "evidence": "__instancecheck__ metaclass + isinstance in entrypoint (type-check caching bypass)"}]
+    return []
+
+
 # ---------------------------------------------------------------------------
 # Score anomaly detection
 # ---------------------------------------------------------------------------
@@ -3653,6 +3661,10 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
         "NEAR_CLONE_SPAM", "administrative", "support", SUSPICIOUS_ONLY, (),
         (), "downgrade",
     ),
+    "INSTANCECHECK_METACLASS": RulePolicy(
+        "INSTANCECHECK_METACLASS", "result_reuse", "hard", AUTO_FILTER, (),
+        (), "keep",
+    ),
 }
 
 BASE_SCORE_CONFIG = {
@@ -3790,6 +3802,7 @@ CODE_DETECTORS = [
     detect_thread_injection,
     detect_lazy_tensor,
     detect_precision_downgrade,
+    detect_instancecheck_metaclass,
 ]
 
 BASE_DETECTOR_SPECS = [
@@ -3827,6 +3840,7 @@ BASE_DETECTOR_SPECS = [
     ("thread_injection", detect_thread_injection),
     ("lazy_tensor", detect_lazy_tensor),
     ("precision_downgrade", detect_precision_downgrade),
+    ("instancecheck_metaclass", detect_instancecheck_metaclass),
 ]
 
 VALID_RULE_OUTCOMES = {AUTO_FILTER, SUSPICIOUS_ONLY, TELEMETRY_ONLY}
