@@ -3026,6 +3026,17 @@ def detect_precision_downgrade(code: str | SubmissionFacts) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Pattern: sys.excepthook / sys.unraisablehook hijacking
+# ---------------------------------------------------------------------------
+
+RE_EXCEPTHOOK = re.compile(r'sys\.(?:excepthook|unraisablehook)\s*=\s*')
+def detect_excepthook_injection(code: str | SubmissionFacts) -> list[dict]:
+    facts = ensure_submission_facts(code)
+    if not RE_EXCEPTHOOK.search(facts.raw_code): return []
+    return [{"pattern": "THREAD_INJECTION", "severity": "high", "evidence": "sys.excepthook/unraisablehook — exception hook hijacking"}]
+
+
+# ---------------------------------------------------------------------------
 # Score anomaly detection
 # ---------------------------------------------------------------------------
 
@@ -3790,6 +3801,7 @@ CODE_DETECTORS = [
     detect_thread_injection,
     detect_lazy_tensor,
     detect_precision_downgrade,
+    detect_excepthook_injection,
 ]
 
 BASE_DETECTOR_SPECS = [
@@ -3827,6 +3839,7 @@ BASE_DETECTOR_SPECS = [
     ("thread_injection", detect_thread_injection),
     ("lazy_tensor", detect_lazy_tensor),
     ("precision_downgrade", detect_precision_downgrade),
+    ("excepthook_injection", detect_excepthook_injection),
 ]
 
 VALID_RULE_OUTCOMES = {AUTO_FILTER, SUSPICIOUS_ONLY, TELEMETRY_ONLY}
