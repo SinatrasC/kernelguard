@@ -3025,6 +3025,16 @@ def detect_precision_downgrade(code: str | SubmissionFacts) -> list[dict]:
     return matches
 
 
+def detect_methodtype_dispatch(code_or_facts):
+    facts = ensure_submission_facts(code_or_facts)
+    if not facts.python_active: return []
+    has_methodtype = bool(re.search(r'types\.MethodType\s*\(', facts.raw_code))
+    has_entrypoint_assign = bool(re.search(r'\.custom_kernel\s*=\s*', facts.raw_code))
+    if has_methodtype and has_entrypoint_assign:
+        return [{"pattern": "CLASS_ENTRYPOINT_REPLAY", "severity": "critical", "evidence": "types.MethodType — dynamic entrypoint attachment bypass"}]
+    return []
+
+
 # ---------------------------------------------------------------------------
 # Score anomaly detection
 # ---------------------------------------------------------------------------
@@ -3790,6 +3800,7 @@ CODE_DETECTORS = [
     detect_thread_injection,
     detect_lazy_tensor,
     detect_precision_downgrade,
+    detect_methodtype_dispatch,
 ]
 
 BASE_DETECTOR_SPECS = [
@@ -3827,6 +3838,7 @@ BASE_DETECTOR_SPECS = [
     ("thread_injection", detect_thread_injection),
     ("lazy_tensor", detect_lazy_tensor),
     ("precision_downgrade", detect_precision_downgrade),
+    ("methodtype_dispatch", detect_methodtype_dispatch),
 ]
 
 VALID_RULE_OUTCOMES = {AUTO_FILTER, SUSPICIOUS_ONLY, TELEMETRY_ONLY}
