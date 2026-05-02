@@ -2197,6 +2197,135 @@ def detect_last_call_replay(code: str | SubmissionFacts) -> list[dict]:
             for n in ast.walk(expr)
         )
 
+    callable_entrypoints: set[str] = set()
+    for stmt in getattr(tree, "body", []):
+        if not isinstance(stmt, ast.Assign):
+            continue
+        if not any(
+            isinstance(target, ast.Name) and is_entrypoint_name(target.id)
+            for target in stmt.targets
+        ):
+            continue
+        if (isinstance(stmt.value, ast.Call)
+                and isinstance(stmt.value.func, ast.Name)):
+            callable_entrypoints.add(stmt.value.func.id)
+
+    def _type_self_attr(expr: ast.AST | None) -> Optional[str]:
+        while isinstance(expr, ast.Subscript):
+            expr = expr.value
+        if not isinstance(expr, ast.Attribute):
+            return None
+        owner = expr.value
+        if not isinstance(owner, ast.Call):
+            return None
+        if not isinstance(owner.func, ast.Name) or owner.func.id != "type":
+            return None
+        if len(owner.args) != 1:
+            return None
+        if not isinstance(owner.args[0], ast.Name) or owner.args[0].id != "self":
+            return None
+        return expr.attr
+
+    def _body_has_classvar_compute_calls(body: list[ast.stmt]) -> bool:
+        for stmt in body:
+            for nested in ast.walk(stmt):
+                if not isinstance(nested, ast.Call):
+                    continue
+                if (isinstance(nested.func, ast.Name)
+                        and nested.func.id == "type"
+                        and len(nested.args) == 1
+                        and isinstance(nested.args[0], ast.Name)
+                        and nested.args[0].id == "self"):
+                    continue
+                return True
+        return False
+
+    mutating_methods = {
+        "add", "append", "clear", "extend", "insert", "pop", "popitem",
+        "remove", "rotate", "setdefault", "update",
+    }
+    for class_node in ast.walk(tree):
+        if not isinstance(class_node, ast.ClassDef):
+            continue
+        if class_node.name not in callable_entrypoints:
+            continue
+
+        class_state = {
+            target.id
+            for stmt in class_node.body
+            if isinstance(stmt, ast.Assign)
+            for target in stmt.targets
+            if isinstance(target, ast.Name)
+            and isinstance(stmt.value, (ast.List, ast.Dict, ast.Set))
+        }
+        if not class_state:
+            continue
+
+        call_method = next(
+            (
+                stmt for stmt in class_node.body
+                if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and stmt.name == "__call__"
+            ),
+            None,
+        )
+        if call_method is None:
+            continue
+
+        mutated_attrs: set[str] = set()
+        for child in ast.walk(call_method):
+            if isinstance(child, ast.Assign):
+                for target in child.targets:
+                    attr = _type_self_attr(target)
+                    if attr in class_state:
+                        mutated_attrs.add(attr)
+            elif isinstance(child, ast.AugAssign):
+                attr = _type_self_attr(child.target)
+                if attr in class_state:
+                    mutated_attrs.add(attr)
+            elif (isinstance(child, ast.Call)
+                  and isinstance(child.func, ast.Attribute)
+                  and child.func.attr in mutating_methods):
+                attr = _type_self_attr(child.func.value)
+                if attr in class_state:
+                    mutated_attrs.add(attr)
+
+        if not mutated_attrs:
+            continue
+
+        input_params = {
+            arg.arg
+            for args in (call_method.args.posonlyargs, call_method.args.args, call_method.args.kwonlyargs)
+            for arg in args
+        } - {"self"}
+
+        for child in ast.walk(call_method):
+            if not isinstance(child, ast.If):
+                continue
+            if _body_has_classvar_compute_calls(child.body):
+                continue
+            if _expr_names(child.test) & input_params:
+                continue
+            if not any(_type_self_attr(part) in mutated_attrs for part in ast.walk(child.test)):
+                continue
+            if not any(
+                isinstance(stmt, ast.Return)
+                and stmt.value is not None
+                and isinstance(stmt.value, ast.Subscript)
+                and _type_self_attr(stmt.value) in mutated_attrs
+                for stmt in child.body
+            ):
+                continue
+
+            return [{
+                "pattern": "LAST_CALL_REPLAY",
+                "severity": "critical",
+                "evidence": (
+                    f"{entrypoint_name} callable replays output from mutated "
+                    "class-level state"
+                ),
+            }]
+
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
