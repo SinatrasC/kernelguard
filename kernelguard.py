@@ -2459,6 +2459,113 @@ def detect_last_call_replay(code: str | SubmissionFacts) -> list[dict]:
                 ),
             }]
 
+        # Fourth pass: replay through a local iterable snapshot of captured
+        # state that the entrypoint mutates after the fast path.
+        #
+        # Pattern: values = list(_state)
+        #          if values: return values[0]
+        #          _state.values.append(data.clone())
+        params = {
+            arg.arg
+            for args in (node.args.posonlyargs, node.args.args, node.args.kwonlyargs)
+            for arg in args
+        }
+        if node.args.vararg is not None:
+            params.add(node.args.vararg.arg)
+        if node.args.kwarg is not None:
+            params.add(node.args.kwarg.arg)
+
+        global_names = {
+            name
+            for stmt in node.body
+            if isinstance(stmt, ast.Global)
+            for name in stmt.names
+        }
+        local_names = {
+            target.id
+            for stmt in node.body
+            if isinstance(stmt, (ast.Assign, ast.AnnAssign, ast.AugAssign))
+            for target in (
+                stmt.targets if isinstance(stmt, ast.Assign)
+                else [stmt.target]
+            )
+            if isinstance(target, ast.Name) and target.id not in global_names
+        }
+        captured = _expr_names(node) - params - local_names
+
+        snapshot_sources: dict[str, str] = {}
+        for child in ast.walk(node):
+            if not isinstance(child, ast.Assign):
+                continue
+            if len(child.targets) != 1 or not isinstance(child.targets[0], ast.Name):
+                continue
+            if not isinstance(child.value, ast.Call):
+                continue
+            if not isinstance(child.value.func, ast.Name):
+                continue
+            if child.value.func.id not in {"list", "tuple"}:
+                continue
+            if len(child.value.args) != 1:
+                continue
+            source = _ast_root_name(child.value.args[0])
+            if source in captured:
+                snapshot_sources[child.targets[0].id] = source
+
+        mutating_methods = {
+            "add", "append", "clear", "extend", "insert", "pop", "popitem",
+            "remove", "rotate", "setdefault", "update",
+        }
+        mutated_captures: set[str] = set()
+        for child in ast.walk(node):
+            if isinstance(child, ast.Assign):
+                for target in child.targets:
+                    target_root = _ast_root_name(target)
+                    if target_root in captured and not isinstance(target, ast.Name):
+                        mutated_captures.add(target_root)
+            elif isinstance(child, ast.AugAssign):
+                target_root = _ast_root_name(child.target)
+                if target_root in captured:
+                    mutated_captures.add(target_root)
+            elif (isinstance(child, ast.Call)
+                  and isinstance(child.func, ast.Attribute)
+                  and child.func.attr in mutating_methods):
+                target_root = _ast_root_name(child.func.value)
+                if target_root in captured:
+                    mutated_captures.add(target_root)
+
+        if mutated_captures:
+            replay_snapshots = {
+                name
+                for name, source in snapshot_sources.items()
+                if source in mutated_captures
+            }
+            for child in ast.walk(node):
+                if not isinstance(child, ast.If):
+                    continue
+                if _body_has_calls(child.body):
+                    continue
+                if _expr_names(child.test) & params:
+                    continue
+                if not (_expr_names(child.test) & replay_snapshots):
+                    continue
+                if not any(
+                    isinstance(stmt, ast.Return)
+                    and stmt.value is not None
+                    and isinstance(stmt.value, ast.Subscript)
+                    and _ast_root_name(stmt.value) in replay_snapshots
+                    for stmt in child.body
+                ):
+                    continue
+
+                return [{
+                    "pattern": "LAST_CALL_REPLAY",
+                    "severity": "critical",
+                    "evidence": (
+                        f"{entrypoint_name} returns from an iterable snapshot "
+                        "of captured state mutated by the entrypoint"
+                    ),
+                }]
+
     return []
 
 
