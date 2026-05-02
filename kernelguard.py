@@ -2197,6 +2197,96 @@ def detect_last_call_replay(code: str | SubmissionFacts) -> list[dict]:
             for n in ast.walk(expr)
         )
 
+    instance_classes: dict[str, str] = {}
+    classes_by_name: dict[str, ast.ClassDef] = {}
+    for stmt in getattr(tree, "body", []):
+        if isinstance(stmt, ast.ClassDef):
+            classes_by_name[stmt.name] = stmt
+        if not isinstance(stmt, ast.Assign):
+            continue
+        if not (isinstance(stmt.value, ast.Call) and isinstance(stmt.value.func, ast.Name)):
+            continue
+        for target in stmt.targets:
+            if isinstance(target, ast.Name):
+                instance_classes[target.id] = stmt.value.func.id
+
+    partial_bound_methods: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
+    for stmt in getattr(tree, "body", []):
+        if not isinstance(stmt, ast.Assign):
+            continue
+        if not any(
+            isinstance(target, ast.Name) and is_entrypoint_name(target.id)
+            for target in stmt.targets
+        ):
+            continue
+        if not isinstance(stmt.value, ast.Call):
+            continue
+        is_partial = (
+            isinstance(stmt.value.func, ast.Name) and stmt.value.func.id == "partial"
+        ) or (
+            isinstance(stmt.value.func, ast.Attribute)
+            and stmt.value.func.attr == "partial"
+        )
+        if not is_partial or not stmt.value.args:
+            continue
+        method_ref = stmt.value.args[0]
+        if not isinstance(method_ref, ast.Attribute):
+            continue
+        instance_name = _ast_root_name(method_ref.value)
+        class_name = instance_classes.get(instance_name or "")
+        class_node = classes_by_name.get(class_name or "")
+        if class_node is None:
+            continue
+        for class_stmt in class_node.body:
+            if (isinstance(class_stmt, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and class_stmt.name == method_ref.attr):
+                partial_bound_methods.append(class_stmt)
+
+    for method in partial_bound_methods:
+        mutated_attrs: set[str] = set()
+        for child in ast.walk(method):
+            if isinstance(child, ast.Assign):
+                for target in child.targets:
+                    if isinstance(target, ast.Attribute) and _ast_root_name(target) == "self":
+                        mutated_attrs.add(target.attr)
+            elif isinstance(child, ast.AugAssign):
+                target = child.target
+                if isinstance(target, ast.Attribute) and _ast_root_name(target) == "self":
+                    mutated_attrs.add(target.attr)
+        if not mutated_attrs:
+            continue
+
+        input_params = {
+            arg.arg
+            for args in (method.args.posonlyargs, method.args.args, method.args.kwonlyargs)
+            for arg in args
+        } - {"self"}
+        for child in ast.walk(method):
+            if not isinstance(child, ast.If):
+                continue
+            if _body_has_calls(child.body):
+                continue
+            if _expr_names(child.test) & input_params:
+                continue
+            returned_attrs = {
+                stmt.value.attr
+                for stmt in child.body
+                if isinstance(stmt, ast.Return)
+                and isinstance(stmt.value, ast.Attribute)
+                and _ast_root_name(stmt.value) == "self"
+            }
+            if not (returned_attrs & mutated_attrs):
+                continue
+
+            return [{
+                "pattern": "LAST_CALL_REPLAY",
+                "severity": "critical",
+                "evidence": (
+                    f"{entrypoint_name} is a partial of a bound method that "
+                    "replays output from mutated instance state"
+                ),
+            }]
+
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
