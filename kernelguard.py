@@ -3025,6 +3025,108 @@ def detect_precision_downgrade(code: str | SubmissionFacts) -> list[dict]:
     return matches
 
 
+def detect_closure_replay(code: str | SubmissionFacts) -> list[dict]:
+    """Pattern: closure-cell factory-return alias for stateful replay.
+
+    Catches RED #32:
+        def _mk():
+            _tk = None; _ot = None
+            def custom_kernel(data):
+                nonlocal _tk, _ot
+                if _tk is not None and _tk.data_ptr() == data.data_ptr():
+                    return _ot
+                ...return custom_kernel
+        custom_kernel = _mk()
+
+    The entrypoint is aliased from a factory return. The inner function
+    uses nonlocal for state with is-None + data_ptr replay.
+    """
+    facts = ensure_submission_facts(code)
+    tree = facts.ast_tree
+    if tree is None:
+        return []
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not is_entrypoint_name(node.name):
+            continue
+
+        has_nonlocal = False
+        nonlocal_names: set[str] = set()
+        for stmt in node.body:
+            if isinstance(stmt, ast.Nonlocal):
+                has_nonlocal = True
+                nonlocal_names.update(stmt.names)
+
+        if not has_nonlocal:
+            continue
+
+        for child in ast.walk(node):
+            if not isinstance(child, ast.If):
+                continue
+            if not isinstance(child.test, ast.BoolOp):
+                continue
+            if _body_has_calls(child.body):
+                continue
+
+            has_is_none = False
+            has_data_ptr = False
+
+            for operand in child.test.values:
+                if isinstance(operand, ast.Compare):
+                    for op in operand.ops:
+                        if isinstance(op, (ast.Is, ast.IsNot)):
+                            left = operand.left
+                            for right in operand.comparators:
+                                none_side = None
+                                name_side = None
+                                if isinstance(left, ast.Constant) and left.value is None:
+                                    none_side = left; name_side = right
+                                elif isinstance(right, ast.Constant) and right.value is None:
+                                    none_side = right; name_side = left
+                                if none_side is not None and isinstance(name_side, ast.Name):
+                                    has_is_none = True
+                                break
+                            break
+
+                if isinstance(operand, ast.Compare):
+                    for op in operand.ops:
+                        if isinstance(op, ast.Eq):
+                            if (
+                                _expr_has_data_ptr_fast(operand.left, facts._nodes_with_data_ptr)
+                                and operand.comparators
+                                and _expr_has_data_ptr_fast(operand.comparators[0], facts._nodes_with_data_ptr)
+                            ):
+                                has_data_ptr = True
+                                break
+
+            if not (has_is_none and has_data_ptr):
+                continue
+
+            returned = {
+                _ast_root_name(stmt.value)
+                for stmt in child.body
+                if isinstance(stmt, ast.Return) and stmt.value is not None
+            } - {None}
+            if not returned:
+                continue
+            if not any(r in nonlocal_names for r in returned):
+                continue
+
+            return [{
+                "pattern": "CLOSURE_REPLAY",
+                "severity": "critical",
+                "evidence": (
+                    f"{node.name} uses nonlocal state with "
+                    f"is-None sentinel + data_ptr replay "
+                    f"(closure-cell factory-return alias)"
+                ),
+            }]
+
+    return []
+
+
 # ---------------------------------------------------------------------------
 # Score anomaly detection
 # ---------------------------------------------------------------------------
@@ -3645,6 +3747,10 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
         "SCORE_EXTREME_SPEEDUP", "score_anomaly", "support", SUSPICIOUS_ONLY, (),
         (), "downgrade",
     ),
+    "CLOSURE_REPLAY": RulePolicy(
+        "CLOSURE_REPLAY", "result_reuse", "hard", AUTO_FILTER, (),
+        (), "keep",
+    ),
     "DUPLICATE_SPAM": RulePolicy(
         "DUPLICATE_SPAM", "administrative", "support", SUSPICIOUS_ONLY, (),
         (), "downgrade",
@@ -3790,6 +3896,7 @@ CODE_DETECTORS = [
     detect_thread_injection,
     detect_lazy_tensor,
     detect_precision_downgrade,
+    detect_closure_replay,
 ]
 
 BASE_DETECTOR_SPECS = [
@@ -3827,6 +3934,7 @@ BASE_DETECTOR_SPECS = [
     ("thread_injection", detect_thread_injection),
     ("lazy_tensor", detect_lazy_tensor),
     ("precision_downgrade", detect_precision_downgrade),
+    ("closure_replay", detect_closure_replay),
 ]
 
 VALID_RULE_OUTCOMES = {AUTO_FILTER, SUSPICIOUS_ONLY, TELEMETRY_ONLY}
@@ -4703,7 +4811,7 @@ AUDIT_RULE_ORDER = [
     "HARDCODED_SHAPES", "TRIVIAL_PROBE",
     "OBFUSCATED_EXEC", "DYNAMIC_EXECUTION", "MODULE_RELOAD", "THREAD_INJECTION", "LAZY_TENSOR",
     "TOKEN_PASTE_CUDA_API", "SEQUENCE_BATCH_GRAPH", "PARTIAL_GRAPH_KEY", "RUNTIME_PACKAGE_INSTALL",
-    "PRECISION_DOWNGRADE", "SCORE_PHYSICS_FLOOR", "SCORE_IMPOSSIBLE", "SCORE_SUSPECT_FLOOR",
+    "PRECISION_DOWNGRADE", "CLOSURE_REPLAY", "SCORE_PHYSICS_FLOOR", "SCORE_IMPOSSIBLE", "SCORE_SUSPECT_FLOOR",
     "SCORE_BROKEN", "SCORE_EXTREME_SPEEDUP", "DUPLICATE_SPAM", "NEAR_CLONE_SPAM",
 ]
 
