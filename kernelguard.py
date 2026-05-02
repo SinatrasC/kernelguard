@@ -2462,6 +2462,95 @@ def detect_last_call_replay(code: str | SubmissionFacts) -> list[dict]:
     return []
 
 
+def detect_counter_flag_replay(code: str | SubmissionFacts) -> list[dict]:
+    """Pattern: Counter flag gates replay from a separate saved output slot."""
+    facts = ensure_submission_facts(code)
+    tree = facts.ast_tree
+    if tree is None:
+        return []
+    entrypoint_name = entrypoint_label(facts.entrypoint_name)
+
+    counters = {
+        target.id
+        for stmt in tree.body
+        if isinstance(stmt, ast.Assign)
+        and isinstance(stmt.value, ast.Call)
+        and isinstance(stmt.value.func, ast.Name)
+        and stmt.value.func.id == "Counter"
+        for target in stmt.targets
+        if isinstance(target, ast.Name)
+    }
+    slots = {
+        target.id
+        for stmt in tree.body
+        if isinstance(stmt, ast.Assign)
+        and isinstance(stmt.value, ast.List)
+        and any(isinstance(elt, ast.Constant) and elt.value is None for elt in stmt.value.elts)
+        for target in stmt.targets
+        if isinstance(target, ast.Name)
+    }
+    if not counters or not slots:
+        return []
+
+    def _param_names(node: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
+        params = {arg.arg for arg in node.args.args}
+        params.update(arg.arg for arg in node.args.posonlyargs)
+        params.update(arg.arg for arg in node.args.kwonlyargs)
+        return params
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not is_entrypoint_name(node.name):
+            continue
+
+        params = _param_names(node)
+        updated_counters = {
+            _ast_root_name(call.func.value)
+            for call in ast.walk(node)
+            if isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "update"
+        } & counters
+        written_slots = {
+            _ast_root_name(target)
+            for stmt in ast.walk(node)
+            if isinstance(stmt, ast.Assign)
+            and bool(_expr_names(stmt.value) & params)
+            for target in stmt.targets
+            if isinstance(target, ast.Subscript)
+        } & slots
+        if not updated_counters or not written_slots:
+            continue
+
+        for child in ast.walk(node):
+            if not isinstance(child, ast.If):
+                continue
+            if _expr_names(child.test) & params:
+                continue
+            if not (_expr_names(child.test) & updated_counters):
+                continue
+            if _body_has_calls(child.body):
+                continue
+            returned = {
+                _ast_root_name(stmt.value)
+                for stmt in child.body
+                if isinstance(stmt, ast.Return)
+                and isinstance(stmt.value, ast.Subscript)
+            } - {None}
+            if returned & written_slots:
+                return [{
+                    "pattern": "COUNTER_FLAG_REPLAY",
+                    "severity": "critical",
+                    "evidence": (
+                        f"{entrypoint_name} gates saved output replay with "
+                        "a Counter flag"
+                    ),
+                }]
+
+    return []
+
+
 RE_OBJECT_ID_DATA = re.compile(r"\bdata_id\s*=\s*id\s*\(\s*data\s*\)")
 RE_RESULT_BANK_SET = re.compile(r"_superbatch_results\s*\[\s*(?:did|data_id)\s*\]\s*=")
 RE_RESULT_BANK_RETURN = re.compile(r"return\s+_superbatch_results\s*\[\s*data_id\s*\]")
@@ -3479,6 +3568,10 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
         "LAST_CALL_REPLAY", "result_reuse", "hard", AUTO_FILTER, (),
         AMD_MANUAL_LAST_CALL_REPLAY_FIXTURES, "keep",
     ),
+    "COUNTER_FLAG_REPLAY": RulePolicy(
+        "COUNTER_FLAG_REPLAY", "result_reuse", "hard", AUTO_FILTER, (),
+        (), "keep",
+    ),
     "SHAPE_OUTPUT_REPLAY": RulePolicy(
         "SHAPE_OUTPUT_REPLAY", "result_reuse", "hard", AUTO_FILTER, (),
         AMD_PACKAGE_SHAPE_REPLAY_FIXTURES, "keep",
@@ -3762,6 +3855,7 @@ CODE_DETECTORS = [
     detect_decode_mm_ref,
     detect_result_caching,
     detect_last_call_replay,
+    detect_counter_flag_replay,
     detect_shape_output_replay,
     detect_timed_input_replay,
     detect_cuda_graph_replay,
@@ -3800,6 +3894,7 @@ BASE_DETECTOR_SPECS = [
     ("decode_mm_ref", detect_decode_mm_ref),
     ("result_caching", detect_result_caching),
     ("last_call_replay", detect_last_call_replay),
+    ("counter_flag_replay", detect_counter_flag_replay),
     ("shape_output_replay", detect_shape_output_replay),
     ("timed_input_replay", detect_timed_input_replay),
     ("cuda_graph_replay", detect_cuda_graph_replay),
@@ -4696,7 +4791,7 @@ AUDIT_RULE_ORDER = [
     "EVALUATOR_EXPLOIT", "HARNESS_RUNTIME_PATCHING", "MODULE_MUTATION", "GLOBALS_MUTATION", "CODE_REPLACEMENT",
     "FRAME_WALK_ACCESS", "FRAME_WALK_MUTATION", "SYS_MODULES_ACCESS", "GLOBALS_ACCESS", "CODE_ACCESS",
     "TRUSTED_MODULE_IMPORT",
-    "OUTPUT_REPLAY_CACHE", "LAST_CALL_REPLAY", "SHAPE_OUTPUT_REPLAY", "TIMED_INPUT_REPLAY", "CONFIG_CACHE_EXPLOIT", "POINTER_REPLAY", "RESULT_BANK_REPLAY", "PREPROCESS_CACHE", "WORKSPACE_CACHE",
+    "OUTPUT_REPLAY_CACHE", "LAST_CALL_REPLAY", "COUNTER_FLAG_REPLAY", "SHAPE_OUTPUT_REPLAY", "TIMED_INPUT_REPLAY", "CONFIG_CACHE_EXPLOIT", "POINTER_REPLAY", "RESULT_BANK_REPLAY", "PREPROCESS_CACHE", "WORKSPACE_CACHE",
     "RUNNER_PLAN_CACHE", "CUDA_GRAPH_PYTHON", "CUDA_GRAPH_REPLAY",
     "TIMER_MONKEYPATCH", "FAKE_BENCHMARK_EMIT", "STDIO_REDIRECT", "UNSYNC_MULTISTREAM", "CUDA_EVENT_DISABLE_TIMING",
     "SCALED_MM_REF", "DECODE_MM_REF", "SILENT_FALLBACK", "REFERENCE_PRECOMPUTE_REPLAY", "TORCH_COMPILE_CACHE",
