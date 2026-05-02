@@ -1697,6 +1697,24 @@ def detect_introspection_exploit(code: str | SubmissionFacts) -> list[dict]:
                 if key not in seen_patterns:
                     seen_patterns.add(key)
                     saw_frame_access = True
+            elif (isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "sys"
+                    and node.func.attr == "_getframe"):
+                key = "sys._getframe"
+                if key not in seen_patterns:
+                    seen_patterns.add(key)
+                    saw_frame_access = True
+            elif (isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "sys"
+                    and node.func.attr == "_current_frames"):
+                key = "sys._current_frames"
+                if key not in seen_patterns:
+                    seen_patterns.add(key)
+                    matches.append({
+                        "pattern": "SYS_GETFRAME",
+                        "severity": "high",
+                        "evidence": "sys._current_frames() — multi-threaded frame walk access",
+                    })
 
         # f_back, f_globals, f_locals attribute access
         if isinstance(node, ast.Attribute) and node.attr in ("f_back", "f_globals", "f_locals"):
@@ -3024,6 +3042,19 @@ def detect_precision_downgrade(code: str | SubmissionFacts) -> list[dict]:
 
     return matches
 
+RE_REDUCE = re.compile(r'functools\.reduce\s*\(')
+def detect_reduce_state(code: str | SubmissionFacts) -> list[dict]:
+    facts = ensure_submission_facts(code)
+    active = facts.custom_kernel_active or facts.python_active
+    if not RE_REDUCE.search(active): return []
+    return [{"pattern": "WORKSPACE_CACHE", "severity": "low", "evidence": "functools.reduce — cumulative state accumulation evades replay detection"}]
+
+RE_LOGGING_FAKE = re.compile(r'logging\.(?:basicConfig|getLogger|setLevel|StreamHandler|FileHandler)\s*\(')
+def detect_logging_output_injection(code: str | SubmissionFacts) -> list[dict]:
+    facts = ensure_submission_facts(code)
+    if not RE_LOGGING_FAKE.search(facts.raw_code): return []
+    return [{"pattern": "STDIO_REDIRECT", "severity": "medium", "evidence": "logging module \u2014 output injection/manipulation"}]
+
 
 # ---------------------------------------------------------------------------
 # Score anomaly detection
@@ -3790,6 +3821,8 @@ CODE_DETECTORS = [
     detect_thread_injection,
     detect_lazy_tensor,
     detect_precision_downgrade,
+    detect_reduce_state,
+    detect_logging_output_injection,
 ]
 
 BASE_DETECTOR_SPECS = [
@@ -3827,6 +3860,8 @@ BASE_DETECTOR_SPECS = [
     ("thread_injection", detect_thread_injection),
     ("lazy_tensor", detect_lazy_tensor),
     ("precision_downgrade", detect_precision_downgrade),
+    ("reduce_state", detect_reduce_state),
+    ("logging_output_injection", detect_logging_output_injection),
 ]
 
 VALID_RULE_OUTCOMES = {AUTO_FILTER, SUSPICIOUS_ONLY, TELEMETRY_ONLY}
