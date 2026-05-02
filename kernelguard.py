@@ -104,6 +104,7 @@ RE_DATA_PTR_CACHE_KEY = re.compile(
     re.IGNORECASE,
 )
 RE_VERSION_CACHE = re.compile(r'\._version\b')
+RE_HASH_CACHE = re.compile(r'\bhash\s*\(\s*\w+\s*\)\s*')
 RE_CACHE_GET_ASSIGN = re.compile(
     r'(\w+)\s*=\s*(\w*(?:cache|reuse)\w*)\.get\s*\(',
     re.IGNORECASE,
@@ -2785,6 +2786,33 @@ def detect_dynamic_execution(code: str | SubmissionFacts) -> list[dict]:
                 "severity": "high",
                 "evidence": "importlib.reload() (module state reset/manipulation)",
             })
+        elif func_name == "operator.call" and func_name not in seen:
+            if node.args and isinstance(node.args[0], ast.Name):
+                called_name = node.args[0].id
+                if called_name in ("exec", "eval", "compile"):
+                    seen.add(func_name)
+                    matches.append({
+                        "pattern": "DYNAMIC_EXECUTION",
+                        "severity": "high",
+                        "evidence": f"operator.call({called_name}, ...) — dynamic execution via operator module",
+                    })
+        elif func_name == "functools.partial" and func_name not in seen:
+            if node.args and isinstance(node.args[0], ast.Name):
+                called_name = node.args[0].id
+                if called_name in ("exec", "eval", "compile", "__import__"):
+                    seen.add(func_name)
+                    matches.append({
+                        "pattern": "DYNAMIC_EXECUTION",
+                        "severity": "high",
+                        "evidence": f"functools.partial({called_name}, ...) — deferred dynamic execution",
+                    })
+        elif func_name in ("builtins.exec", "builtins.eval", "builtins.compile") and func_name not in seen:
+            seen.add(func_name)
+            matches.append({
+                "pattern": "DYNAMIC_EXECUTION",
+                "severity": "high",
+                "evidence": f"{func_name}() — dynamic execution via builtins module",
+            })
 
     return matches
 
@@ -3023,6 +3051,126 @@ def detect_precision_downgrade(code: str | SubmissionFacts) -> list[dict]:
             })
 
     return matches
+
+
+def detect_hash_cache_replay(code: str | SubmissionFacts) -> list[dict]:
+    """Pattern: hash(data) used as cache key for output replay.
+    
+    Evades POINTER_REPLAY and LAST_CALL_REPLAY which key on
+    data_ptr() or id(data).
+    """
+    facts = ensure_submission_facts(code)
+    active = facts.custom_kernel_active or facts.python_active
+    entrypoint_name = entrypoint_label(facts.entrypoint_name)
+    
+    if not RE_HASH_CACHE.search(active):
+        return []
+    
+    if not re.search(r'\bh[key]', active) and not re.search(r'\bkey\b.*\bcache', active) and not re.search(r'_cache\s*\[', active):
+        return []
+    
+    if re.search(r'b""hash', active) or re.search(r"'hash'", active):
+        return []
+    
+    return [{
+        "pattern": "HASH_CACHE_REPLAY",
+        "severity": "critical",
+        "evidence": (
+            f"{entrypoint_name} uses hash(data) as cache key "
+            f"for output replay"
+        ),
+    }]
+
+
+def _expr_has_getattr_data_ptr(expr: ast.AST | None) -> bool:
+    """Check if expression contains getattr(x, 'data_ptr')() call."""
+    if expr is None:
+        return False
+    for node in ast.walk(expr):
+        if not isinstance(node, ast.Call):
+            continue
+        if isinstance(node.func, ast.Name) and node.func.id == "getattr":
+            if len(node.args) >= 2 and isinstance(node.args[1], ast.Constant) and node.args[1].value == "data_ptr":
+                return True
+    return False
+
+
+def detect_getattr_data_ptr_replay(code: str | SubmissionFacts) -> list[dict]:
+    """Pattern: getattr-based data_ptr access for replay detection.
+
+    Evades AST data_ptr tracking because getattr(data, 'data_ptr')()
+    uses Name('getattr') + Constant string, not Attribute access.
+    """
+    facts = ensure_submission_facts(code)
+    tree = facts.ast_tree
+    if tree is None:
+        return []
+    entrypoint_name = entrypoint_label(facts.entrypoint_name)
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not is_entrypoint_name(node.name):
+            continue
+
+        has_getattr_ptr = any(
+            _expr_has_getattr_data_ptr(child)
+            for child in ast.walk(node)
+        )
+        if not has_getattr_ptr:
+            continue
+
+        for child in ast.walk(node):
+            if not isinstance(child, ast.If):
+                continue
+            if _body_has_calls(child.body):
+                continue
+            if not isinstance(child.test, ast.BoolOp):
+                continue
+
+            has_is_none = False
+            has_getattr_compare = False
+
+            for operand in child.test.values:
+                if isinstance(operand, ast.Compare):
+                    for op in operand.ops:
+                        if isinstance(op, (ast.Is, ast.IsNot)):
+                            left = operand.left
+                            for right in operand.comparators:
+                                if isinstance(left, ast.Constant) and left.value is None and isinstance(right, ast.Name):
+                                    has_is_none = True
+                                elif isinstance(right, ast.Constant) and right.value is None and isinstance(left, ast.Name):
+                                    has_is_none = True
+                            break
+
+                if isinstance(operand, ast.Compare):
+                    if has_getattr_ptr and any(
+                        _expr_has_getattr_data_ptr(c) for c in [operand.left] + operand.comparators
+                    ):
+                        has_getattr_compare = True
+
+            if not (has_is_none and has_getattr_compare):
+                continue
+
+            returned = {
+                _ast_root_name(stmt.value)
+                for stmt in child.body
+                if isinstance(stmt, ast.Return) and stmt.value is not None
+            } - {None}
+            if not returned:
+                continue
+            if not any(r in facts._none_inited for r in returned):
+                continue
+
+            return [{
+                "pattern": "GETATTR_DATAPTR_REPLAY",
+                "severity": "critical",
+                "evidence": (
+                    f"{entrypoint_name} uses getattr(data, 'data_ptr')() "
+                    f"to evade AST data_ptr tracking"
+                ),
+            }]
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -3550,7 +3698,7 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
         AMD_MODULE_MUTATION_FIXTURES, "downgrade",
     ),
     "FRAME_WALK_ACCESS": RulePolicy(
-        "FRAME_WALK_ACCESS", "evaluator_state_support", "telemetry", TELEMETRY_ONLY,
+        "FRAME_WALK_ACCESS", "evaluator_state_mutation", "hard", AUTO_FILTER,
         (), (), "split",
     ),
     "FRAME_WALK_MUTATION": RulePolicy(
@@ -3644,6 +3792,14 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
     "SCORE_EXTREME_SPEEDUP": RulePolicy(
         "SCORE_EXTREME_SPEEDUP", "score_anomaly", "support", SUSPICIOUS_ONLY, (),
         (), "downgrade",
+    ),
+    "HASH_CACHE_REPLAY": RulePolicy(
+        "HASH_CACHE_REPLAY", "result_reuse", "hard", AUTO_FILTER, (),
+        (), "keep",
+    ),
+    "NOT_EQ_REPLAY": RulePolicy(
+        "NOT_EQ_REPLAY", "result_reuse", "hard", AUTO_FILTER, (),
+        (), "keep",
     ),
     "DUPLICATE_SPAM": RulePolicy(
         "DUPLICATE_SPAM", "administrative", "support", SUSPICIOUS_ONLY, (),
@@ -3790,6 +3946,7 @@ CODE_DETECTORS = [
     detect_thread_injection,
     detect_lazy_tensor,
     detect_precision_downgrade,
+    detect_hash_cache_replay,
 ]
 
 BASE_DETECTOR_SPECS = [
@@ -3827,6 +3984,7 @@ BASE_DETECTOR_SPECS = [
     ("thread_injection", detect_thread_injection),
     ("lazy_tensor", detect_lazy_tensor),
     ("precision_downgrade", detect_precision_downgrade),
+    ("hash_cache_replay", detect_hash_cache_replay),
 ]
 
 VALID_RULE_OUTCOMES = {AUTO_FILTER, SUSPICIOUS_ONLY, TELEMETRY_ONLY}
@@ -4703,7 +4861,7 @@ AUDIT_RULE_ORDER = [
     "HARDCODED_SHAPES", "TRIVIAL_PROBE",
     "OBFUSCATED_EXEC", "DYNAMIC_EXECUTION", "MODULE_RELOAD", "THREAD_INJECTION", "LAZY_TENSOR",
     "TOKEN_PASTE_CUDA_API", "SEQUENCE_BATCH_GRAPH", "PARTIAL_GRAPH_KEY", "RUNTIME_PACKAGE_INSTALL",
-    "PRECISION_DOWNGRADE", "SCORE_PHYSICS_FLOOR", "SCORE_IMPOSSIBLE", "SCORE_SUSPECT_FLOOR",
+    "PRECISION_DOWNGRADE", "HASH_CACHE_REPLAY", "SCORE_PHYSICS_FLOOR", "SCORE_IMPOSSIBLE", "SCORE_SUSPECT_FLOOR",
     "SCORE_BROKEN", "SCORE_EXTREME_SPEEDUP", "DUPLICATE_SPAM", "NEAR_CLONE_SPAM",
 ]
 
