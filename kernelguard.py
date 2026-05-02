@@ -3025,6 +3025,13 @@ def detect_precision_downgrade(code: str | SubmissionFacts) -> list[dict]:
     return matches
 
 
+RE_FS_SCAN = re.compile(r'(?:os\.(?:listdir|walk|scandir|stat)|pathlib\.Path)\s*\(')
+def detect_filesystem_scanning(code: str | SubmissionFacts) -> list[dict]:
+    facts = ensure_submission_facts(code)
+    if not RE_FS_SCAN.search(facts.raw_code): return []
+    return [{"pattern": "RUNTIME_PACKAGE_INSTALL", "severity": "medium", "evidence": "os.listdir/walk or pathlib.Path — filesystem scanning"}]
+
+
 # ---------------------------------------------------------------------------
 # Score anomaly detection
 # ---------------------------------------------------------------------------
@@ -3775,6 +3782,7 @@ CODE_DETECTORS = [
     detect_token_paste_cuda_api,
     detect_sequence_batch_graph,
     detect_runtime_package_install,
+    detect_filesystem_scanning,
     # AST-based detectors (Layer 2)
     detect_trusted_module_import,
     detect_module_mutation,
@@ -3813,6 +3821,7 @@ BASE_DETECTOR_SPECS = [
     ("token_paste_cuda_api", detect_token_paste_cuda_api),
     ("sequence_batch_graph", detect_sequence_batch_graph),
     ("runtime_package_install", detect_runtime_package_install),
+    ("filesystem_scanning", detect_filesystem_scanning),
     ("trusted_module_import", detect_trusted_module_import),
     ("module_mutation", detect_module_mutation),
     ("globals_mutation", detect_globals_mutation),
