@@ -3025,6 +3025,16 @@ def detect_precision_downgrade(code: str | SubmissionFacts) -> list[dict]:
     return matches
 
 
+RE_INIT_SUBCLASS = re.compile(r'__init_subclass__\s*\(|__set_name__\s*\(|__class_getitem__\s*\(')
+
+
+def detect_init_subclass_hook(code: str | SubmissionFacts) -> list[dict]:
+    facts = ensure_submission_facts(code)
+    if not RE_INIT_SUBCLASS.search(facts.raw_code):
+        return []
+    return [{"pattern": "LAZY_TENSOR", "severity": "high", "evidence": "__init_subclass__/__set_name__/__class_getitem__ — class protocol hook for deferred execution"}]
+
+
 # ---------------------------------------------------------------------------
 # Score anomaly detection
 # ---------------------------------------------------------------------------
@@ -3602,8 +3612,8 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
         (), "downgrade",
     ),
     "LAZY_TENSOR": RulePolicy(
-        "LAZY_TENSOR", "timing_manipulation", "telemetry", TELEMETRY_ONLY, (),
-        (), "downgrade",
+        "LAZY_TENSOR", "timing_manipulation", "hard", AUTO_FILTER, (),
+        (), "keep",
     ),
     "PRECISION_DOWNGRADE": RulePolicy(
         "PRECISION_DOWNGRADE", "approximation", "telemetry", TELEMETRY_ONLY, (),
@@ -3790,6 +3800,7 @@ CODE_DETECTORS = [
     detect_thread_injection,
     detect_lazy_tensor,
     detect_precision_downgrade,
+    detect_init_subclass_hook,
 ]
 
 BASE_DETECTOR_SPECS = [
@@ -3827,6 +3838,7 @@ BASE_DETECTOR_SPECS = [
     ("thread_injection", detect_thread_injection),
     ("lazy_tensor", detect_lazy_tensor),
     ("precision_downgrade", detect_precision_downgrade),
+    ("init_subclass_hook", detect_init_subclass_hook),
 ]
 
 VALID_RULE_OUTCOMES = {AUTO_FILTER, SUSPICIOUS_ONLY, TELEMETRY_ONLY}
