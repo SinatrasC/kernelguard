@@ -2459,6 +2459,83 @@ def detect_last_call_replay(code: str | SubmissionFacts) -> list[dict]:
                 ),
             }]
 
+        # Fourth pass: replay from an attribute installed with
+        # object.__setattr__ on captured state.
+        #
+        # Pattern: if hasattr(_state, "value"): return _state.value
+        #          object.__setattr__(_state, "value", data.clone())
+        params = {
+            arg.arg
+            for args in (node.args.posonlyargs, node.args.args, node.args.kwonlyargs)
+            for arg in args
+        }
+        if node.args.vararg is not None:
+            params.add(node.args.vararg.arg)
+        if node.args.kwarg is not None:
+            params.add(node.args.kwarg.arg)
+
+        global_names = {
+            name
+            for stmt in node.body
+            if isinstance(stmt, ast.Global)
+            for name in stmt.names
+        }
+        local_names = {
+            target.id
+            for stmt in node.body
+            if isinstance(stmt, (ast.Assign, ast.AnnAssign, ast.AugAssign))
+            for target in (
+                stmt.targets if isinstance(stmt, ast.Assign)
+                else [stmt.target]
+            )
+            if isinstance(target, ast.Name) and target.id not in global_names
+        }
+        captured = _expr_names(node) - params - local_names
+
+        setattr_attrs: set[tuple[str, str]] = set()
+        for child in ast.walk(node):
+            if not isinstance(child, ast.Call):
+                continue
+            if not (
+                isinstance(child.func, ast.Attribute)
+                and child.func.attr == "__setattr__"
+                and isinstance(child.func.value, ast.Name)
+                and child.func.value.id == "object"
+            ):
+                continue
+            if len(child.args) < 2:
+                continue
+            target_root = _ast_root_name(child.args[0])
+            attr_arg = child.args[1]
+            if target_root in captured and isinstance(attr_arg, ast.Constant) and isinstance(attr_arg.value, str):
+                setattr_attrs.add((target_root, attr_arg.value))
+
+        if setattr_attrs:
+            for child in ast.walk(node):
+                if not isinstance(child, ast.If):
+                    continue
+                if _body_has_calls(child.body):
+                    continue
+                if _expr_names(child.test) & params:
+                    continue
+                returned_attrs = {
+                    (_ast_root_name(stmt.value), stmt.value.attr)
+                    for stmt in child.body
+                    if isinstance(stmt, ast.Return)
+                    and isinstance(stmt.value, ast.Attribute)
+                }
+                if not (returned_attrs & setattr_attrs):
+                    continue
+
+                return [{
+                    "pattern": "LAST_CALL_REPLAY",
+                    "severity": "critical",
+                    "evidence": (
+                        f"{entrypoint_name} returns an attribute installed "
+                        "with object.__setattr__ on captured state"
+                    ),
+                }]
+
     return []
 
 
