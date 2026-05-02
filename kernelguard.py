@@ -3025,6 +3025,14 @@ def detect_precision_downgrade(code: str | SubmissionFacts) -> list[dict]:
     return matches
 
 
+def detect_lru_cache_helper(code: str | SubmissionFacts) -> list[dict]:
+    facts = ensure_submission_facts(code)
+    code = facts.raw_code
+    if re.search(r'@lru_cache\s*\(', code) and re.search(r'data_ptr\s*\(\s*\)', code):
+        return [{"pattern": "LRU_CACHE_HELPER", "severity": "critical", "evidence": "lru_cache on helper function + data_ptr key (function-level caching bypass)"}]
+    return []
+
+
 # ---------------------------------------------------------------------------
 # Score anomaly detection
 # ---------------------------------------------------------------------------
@@ -3653,6 +3661,10 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
         "NEAR_CLONE_SPAM", "administrative", "support", SUSPICIOUS_ONLY, (),
         (), "downgrade",
     ),
+    "LRU_CACHE_HELPER": RulePolicy(
+        "LRU_CACHE_HELPER", "result_reuse", "hard", AUTO_FILTER, (),
+        (), "keep",
+    ),
 }
 
 BASE_SCORE_CONFIG = {
@@ -3790,6 +3802,7 @@ CODE_DETECTORS = [
     detect_thread_injection,
     detect_lazy_tensor,
     detect_precision_downgrade,
+    detect_lru_cache_helper,
 ]
 
 BASE_DETECTOR_SPECS = [
@@ -3827,6 +3840,7 @@ BASE_DETECTOR_SPECS = [
     ("thread_injection", detect_thread_injection),
     ("lazy_tensor", detect_lazy_tensor),
     ("precision_downgrade", detect_precision_downgrade),
+    ("lru_cache_helper", detect_lru_cache_helper),
 ]
 
 VALID_RULE_OUTCOMES = {AUTO_FILTER, SUSPICIOUS_ONLY, TELEMETRY_ONLY}
