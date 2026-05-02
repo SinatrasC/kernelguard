@@ -1699,7 +1699,7 @@ def detect_introspection_exploit(code: str | SubmissionFacts) -> list[dict]:
                     saw_frame_access = True
 
         # f_back, f_globals, f_locals attribute access
-        if isinstance(node, ast.Attribute) and node.attr in ("f_back", "f_globals", "f_locals"):
+        if isinstance(node, ast.Attribute) and node.attr in ("f_back", "f_globals", "f_locals", "tb_frame", "tb_next"):
             key = f".{node.attr}"
             if key not in seen_patterns:
                 seen_patterns.add(key)
@@ -1731,6 +1731,20 @@ def detect_introspection_exploit(code: str | SubmissionFacts) -> list[dict]:
                     "pattern": "SYS_MODULES_ACCESS",
                     "severity": "high",
                     "evidence": "sys.modules accessed (potential module namespace manipulation)",
+                })
+
+        # traceback module frame walking
+        elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+              and isinstance(node.func.value, ast.Name)
+              and node.func.value.id == "traceback"
+              and node.func.attr in ("extract_tb", "print_tb", "format_tb", "walk_tb")):
+            key = f"traceback.{node.func.attr}"
+            if key not in seen_patterns:
+                seen_patterns.add(key)
+                matches.append({
+                    "pattern": "FRAME_WALK_ACCESS",
+                    "severity": "medium",
+                    "evidence": f"traceback.{node.func.attr}() — traceback-based frame walk",
                 })
 
     if saw_frame_mutation:
