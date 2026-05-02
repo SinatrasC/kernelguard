@@ -3023,9 +3023,15 @@ def detect_precision_downgrade(code: str | SubmissionFacts) -> list[dict]:
             })
 
     return matches
-
-
-# ---------------------------------------------------------------------------
+def detect_contextvar_state_reuse(code_or_facts):
+    facts = ensure_submission_facts(code_or_facts)
+    if not facts.custom_kernel_active: return []
+    has_ctx = "contextvars.ContextVar" in facts.raw_code
+    has_get = ".get()" in facts.custom_kernel_active
+    has_set = ".set(" in facts.custom_kernel_active
+    if has_ctx and has_get and has_set:
+        return [{"pattern": "CONTEXTVAR_STATE_REUSE", "severity": "high", "evidence": "contextvars.ContextVar used for inter-call state persistence"}]
+    return []
 # Score anomaly detection
 # ---------------------------------------------------------------------------
 
@@ -3653,6 +3659,7 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
         "NEAR_CLONE_SPAM", "administrative", "support", SUSPICIOUS_ONLY, (),
         (), "downgrade",
     ),
+    "CONTEXTVAR_STATE_REUSE": RulePolicy("CONTEXTVAR_STATE_REUSE", "result_reuse", "hard", AUTO_FILTER, (), (), "rewrite"),
 }
 
 BASE_SCORE_CONFIG = {
@@ -3790,6 +3797,7 @@ CODE_DETECTORS = [
     detect_thread_injection,
     detect_lazy_tensor,
     detect_precision_downgrade,
+    detect_contextvar_state_reuse,
 ]
 
 BASE_DETECTOR_SPECS = [
@@ -3827,6 +3835,7 @@ BASE_DETECTOR_SPECS = [
     ("thread_injection", detect_thread_injection),
     ("lazy_tensor", detect_lazy_tensor),
     ("precision_downgrade", detect_precision_downgrade),
+    ("contextvar_state_reuse", detect_contextvar_state_reuse),
 ]
 
 VALID_RULE_OUTCOMES = {AUTO_FILTER, SUSPICIOUS_ONLY, TELEMETRY_ONLY}
