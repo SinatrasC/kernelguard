@@ -2462,6 +2462,116 @@ def detect_last_call_replay(code: str | SubmissionFacts) -> list[dict]:
     return []
 
 
+def detect_bound_classmethod_replay(code: str | SubmissionFacts) -> list[dict]:
+    """Pattern: custom_kernel is a classmethod bound to class replay state."""
+    facts = ensure_submission_facts(code)
+    tree = facts.ast_tree
+    if tree is None:
+        return []
+    entrypoint_name = entrypoint_label(facts.entrypoint_name)
+
+    def _decorator_name(expr: ast.AST) -> str | None:
+        if isinstance(expr, ast.Name):
+            return expr.id
+        if isinstance(expr, ast.Attribute):
+            return expr.attr
+        return None
+
+    classes = {
+        stmt.name: stmt
+        for stmt in tree.body
+        if isinstance(stmt, ast.ClassDef)
+    }
+    class_list_attrs = {
+        (cls.name, target.id)
+        for cls in classes.values()
+        for stmt in cls.body
+        if isinstance(stmt, ast.Assign)
+        and isinstance(stmt.value, ast.List)
+        for target in stmt.targets
+        if isinstance(target, ast.Name)
+    }
+
+    bound = []
+    for stmt in tree.body:
+        if not (
+            isinstance(stmt, ast.Assign)
+            and any(isinstance(target, ast.Name) and is_entrypoint_name(target.id) for target in stmt.targets)
+            and isinstance(stmt.value, ast.Attribute)
+            and isinstance(stmt.value.value, ast.Name)
+            and stmt.value.value.id in classes
+        ):
+            continue
+        cls = classes[stmt.value.value.id]
+        for item in cls.body:
+            if (
+                isinstance(item, ast.FunctionDef)
+                and item.name == stmt.value.attr
+                and any(_decorator_name(deco) == "classmethod" for deco in item.decorator_list)
+            ):
+                bound.append((cls.name, item))
+
+    for class_name, method in bound:
+        if len(method.args.args) < 2:
+            continue
+        cls_param = method.args.args[0].arg
+        data_params = {arg.arg for arg in method.args.args[1:]}
+
+        mutated = {
+            call.func.value.attr
+            for call in ast.walk(method)
+            if isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "append"
+            and isinstance(call.func.value, ast.Attribute)
+            and isinstance(call.func.value.value, ast.Name)
+            and call.func.value.value.id == cls_param
+            and (class_name, call.func.value.attr) in class_list_attrs
+            and any(bool(_expr_names(arg) & data_params) for arg in call.args)
+        }
+        if not mutated:
+            continue
+
+        for child in ast.walk(method):
+            if not isinstance(child, ast.If):
+                continue
+            if _expr_names(child.test) & data_params:
+                continue
+            tested = {
+                expr.attr
+                for expr in ast.walk(child.test)
+                if isinstance(expr, ast.Attribute)
+                and isinstance(expr.value, ast.Name)
+                and expr.value.id == cls_param
+                and expr.attr in mutated
+            }
+            if not tested:
+                continue
+            if _body_has_calls(child.body):
+                continue
+            returned = {
+                stmt.value.value.attr
+                for stmt in child.body
+                if isinstance(stmt, ast.Return)
+                and isinstance(stmt.value, ast.Subscript)
+                and isinstance(stmt.value.value, ast.Attribute)
+                and isinstance(stmt.value.value.value, ast.Name)
+                and stmt.value.value.value.id == cls_param
+                and stmt.value.value.attr in mutated
+            }
+            if tested & returned:
+                return [{
+                    "pattern": "BOUND_CLASSMETHOD_REPLAY",
+                    "severity": "critical",
+                    "evidence": (
+                        f"{entrypoint_name} is bound to a classmethod that "
+                        "replays class list state"
+                    ),
+                }]
+
+    return []
+
+
 RE_OBJECT_ID_DATA = re.compile(r"\bdata_id\s*=\s*id\s*\(\s*data\s*\)")
 RE_RESULT_BANK_SET = re.compile(r"_superbatch_results\s*\[\s*(?:did|data_id)\s*\]\s*=")
 RE_RESULT_BANK_RETURN = re.compile(r"return\s+_superbatch_results\s*\[\s*data_id\s*\]")
@@ -3479,6 +3589,10 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
         "LAST_CALL_REPLAY", "result_reuse", "hard", AUTO_FILTER, (),
         AMD_MANUAL_LAST_CALL_REPLAY_FIXTURES, "keep",
     ),
+    "BOUND_CLASSMETHOD_REPLAY": RulePolicy(
+        "BOUND_CLASSMETHOD_REPLAY", "result_reuse", "hard", AUTO_FILTER, (),
+        (), "keep",
+    ),
     "SHAPE_OUTPUT_REPLAY": RulePolicy(
         "SHAPE_OUTPUT_REPLAY", "result_reuse", "hard", AUTO_FILTER, (),
         AMD_PACKAGE_SHAPE_REPLAY_FIXTURES, "keep",
@@ -3762,6 +3876,7 @@ CODE_DETECTORS = [
     detect_decode_mm_ref,
     detect_result_caching,
     detect_last_call_replay,
+    detect_bound_classmethod_replay,
     detect_shape_output_replay,
     detect_timed_input_replay,
     detect_cuda_graph_replay,
@@ -3800,6 +3915,7 @@ BASE_DETECTOR_SPECS = [
     ("decode_mm_ref", detect_decode_mm_ref),
     ("result_caching", detect_result_caching),
     ("last_call_replay", detect_last_call_replay),
+    ("bound_classmethod_replay", detect_bound_classmethod_replay),
     ("shape_output_replay", detect_shape_output_replay),
     ("timed_input_replay", detect_timed_input_replay),
     ("cuda_graph_replay", detect_cuda_graph_replay),
@@ -4696,7 +4812,7 @@ AUDIT_RULE_ORDER = [
     "EVALUATOR_EXPLOIT", "HARNESS_RUNTIME_PATCHING", "MODULE_MUTATION", "GLOBALS_MUTATION", "CODE_REPLACEMENT",
     "FRAME_WALK_ACCESS", "FRAME_WALK_MUTATION", "SYS_MODULES_ACCESS", "GLOBALS_ACCESS", "CODE_ACCESS",
     "TRUSTED_MODULE_IMPORT",
-    "OUTPUT_REPLAY_CACHE", "LAST_CALL_REPLAY", "SHAPE_OUTPUT_REPLAY", "TIMED_INPUT_REPLAY", "CONFIG_CACHE_EXPLOIT", "POINTER_REPLAY", "RESULT_BANK_REPLAY", "PREPROCESS_CACHE", "WORKSPACE_CACHE",
+    "OUTPUT_REPLAY_CACHE", "LAST_CALL_REPLAY", "BOUND_CLASSMETHOD_REPLAY", "SHAPE_OUTPUT_REPLAY", "TIMED_INPUT_REPLAY", "CONFIG_CACHE_EXPLOIT", "POINTER_REPLAY", "RESULT_BANK_REPLAY", "PREPROCESS_CACHE", "WORKSPACE_CACHE",
     "RUNNER_PLAN_CACHE", "CUDA_GRAPH_PYTHON", "CUDA_GRAPH_REPLAY",
     "TIMER_MONKEYPATCH", "FAKE_BENCHMARK_EMIT", "STDIO_REDIRECT", "UNSYNC_MULTISTREAM", "CUDA_EVENT_DISABLE_TIMING",
     "SCALED_MM_REF", "DECODE_MM_REF", "SILENT_FALLBACK", "REFERENCE_PRECOMPUTE_REPLAY", "TORCH_COMPILE_CACHE",
