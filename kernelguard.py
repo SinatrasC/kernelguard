@@ -3025,6 +3025,12 @@ def detect_precision_downgrade(code: str | SubmissionFacts) -> list[dict]:
     return matches
 
 
+RE_DATETIME_TIMING = re.compile(r'(?:datetime|time|timeit)\s*\.')
+def detect_datetime_timing(code: str | SubmissionFacts) -> list[dict]:
+    facts = ensure_submission_facts(code)
+    if not RE_DATETIME_TIMING.search(facts.raw_code): return []
+    return [{"pattern": "TIMER_MONKEYPATCH", "severity": "medium", "evidence": "datetime/time/timeit module — potential timing manipulation"}]
+
 # ---------------------------------------------------------------------------
 # Score anomaly detection
 # ---------------------------------------------------------------------------
@@ -3790,6 +3796,7 @@ CODE_DETECTORS = [
     detect_thread_injection,
     detect_lazy_tensor,
     detect_precision_downgrade,
+    detect_datetime_timing,
 ]
 
 BASE_DETECTOR_SPECS = [
@@ -3826,6 +3833,7 @@ BASE_DETECTOR_SPECS = [
     ("dynamic_execution", detect_dynamic_execution),
     ("thread_injection", detect_thread_injection),
     ("lazy_tensor", detect_lazy_tensor),
+    ("datetime_timing", detect_datetime_timing),
     ("precision_downgrade", detect_precision_downgrade),
 ]
 
