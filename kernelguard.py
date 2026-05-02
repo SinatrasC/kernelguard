@@ -2197,6 +2197,48 @@ def detect_last_call_replay(code: str | SubmissionFacts) -> list[dict]:
             for n in ast.walk(expr)
         )
 
+    mutating_methods = {
+        "add", "append", "clear", "extend", "insert", "pop", "popitem",
+        "remove", "rotate", "setdefault", "update",
+    }
+    instance_classes: dict[str, str] = {}
+    class_mutators: dict[str, set[str]] = defaultdict(set)
+
+    for stmt in getattr(tree, "body", []):
+        if not isinstance(stmt, ast.Assign):
+            continue
+        if not (isinstance(stmt.value, ast.Call) and isinstance(stmt.value.func, ast.Name)):
+            continue
+        for target in stmt.targets:
+            if isinstance(target, ast.Name):
+                instance_classes[target.id] = stmt.value.func.id
+
+    for class_node in ast.walk(tree):
+        if not isinstance(class_node, ast.ClassDef):
+            continue
+        for method in class_node.body:
+            if not isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            mutates_self = False
+            for child in ast.walk(method):
+                if isinstance(child, ast.Assign):
+                    for target in child.targets:
+                        if _ast_root_name(target) == "self":
+                            mutates_self = True
+                            break
+                elif isinstance(child, ast.AugAssign):
+                    if _ast_root_name(child.target) == "self":
+                        mutates_self = True
+                elif (isinstance(child, ast.Call)
+                      and isinstance(child.func, ast.Attribute)
+                      and child.func.attr in mutating_methods
+                      and _ast_root_name(child.func.value) == "self"):
+                    mutates_self = True
+                if mutates_self:
+                    break
+            if mutates_self:
+                class_mutators[class_node.name].add(method.name)
+
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
@@ -2458,6 +2500,79 @@ def detect_last_call_replay(code: str | SubmissionFacts) -> list[dict]:
                     f"object identity + tensor version check"
                 ),
             }]
+
+        # Fourth pass: replay from a captured instance whose custom method
+        # mutates the instance through self.
+        #
+        # Pattern: if _state: return _state[0]
+        #          _state.save(data.clone())   # save mutates self
+        params = {
+            arg.arg
+            for args in (node.args.posonlyargs, node.args.args, node.args.kwonlyargs)
+            for arg in args
+        }
+        if node.args.vararg is not None:
+            params.add(node.args.vararg.arg)
+        if node.args.kwarg is not None:
+            params.add(node.args.kwarg.arg)
+
+        global_names = {
+            name
+            for stmt in node.body
+            if isinstance(stmt, ast.Global)
+            for name in stmt.names
+        }
+        local_names = {
+            target.id
+            for stmt in node.body
+            if isinstance(stmt, (ast.Assign, ast.AnnAssign, ast.AugAssign))
+            for target in (
+                stmt.targets if isinstance(stmt, ast.Assign)
+                else [stmt.target]
+            )
+            if isinstance(target, ast.Name) and target.id not in global_names
+        }
+        captured = _expr_names(node) - params - local_names
+
+        mutated_instances: set[str] = set()
+        for child in ast.walk(node):
+            if not (isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute)):
+                continue
+            instance = _ast_root_name(child.func.value)
+            class_name = instance_classes.get(instance or "")
+            if class_name is None:
+                continue
+            if child.func.attr in class_mutators.get(class_name, set()):
+                mutated_instances.add(instance)
+
+        if mutated_instances:
+            replay_instances = captured & mutated_instances
+            for child in ast.walk(node):
+                if not isinstance(child, ast.If):
+                    continue
+                if _body_has_calls(child.body):
+                    continue
+                if _expr_names(child.test) & params:
+                    continue
+                if not (_expr_names(child.test) & replay_instances):
+                    continue
+                if not any(
+                    isinstance(stmt, ast.Return)
+                    and stmt.value is not None
+                    and isinstance(stmt.value, ast.Subscript)
+                    and _ast_root_name(stmt.value) in replay_instances
+                    for stmt in child.body
+                ):
+                    continue
+
+                return [{
+                    "pattern": "LAST_CALL_REPLAY",
+                    "severity": "critical",
+                    "evidence": (
+                        f"{entrypoint_name} returns from captured state mutated "
+                        "through a custom instance method"
+                    ),
+                }]
 
     return []
 
