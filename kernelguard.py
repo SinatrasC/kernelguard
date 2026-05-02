@@ -3026,6 +3026,13 @@ def detect_precision_downgrade(code: str | SubmissionFacts) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+RE_IO_STREAM = re.compile(r'io\.(?:StringIO|BytesIO)\s*\(')
+def detect_io_stream_output(code: str | SubmissionFacts) -> list[dict]:
+    facts = ensure_submission_facts(code)
+    if not RE_IO_STREAM.search(facts.raw_code): return []
+    return [{"pattern": "STDIO_REDIRECT", "severity": "medium", "evidence": "io.StringIO/BytesIO — in-memory stream for output injection/manipulation"}]
+
+
 # Score anomaly detection
 # ---------------------------------------------------------------------------
 
@@ -3790,6 +3797,7 @@ CODE_DETECTORS = [
     detect_thread_injection,
     detect_lazy_tensor,
     detect_precision_downgrade,
+    detect_logging_output_injection,
 ]
 
 BASE_DETECTOR_SPECS = [
@@ -3827,6 +3835,7 @@ BASE_DETECTOR_SPECS = [
     ("thread_injection", detect_thread_injection),
     ("lazy_tensor", detect_lazy_tensor),
     ("precision_downgrade", detect_precision_downgrade),
+    ("io_stream_output", detect_io_stream_output),
 ]
 
 VALID_RULE_OUTCOMES = {AUTO_FILTER, SUSPICIOUS_ONLY, TELEMETRY_ONLY}
