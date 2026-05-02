@@ -3025,6 +3025,12 @@ def detect_precision_downgrade(code: str | SubmissionFacts) -> list[dict]:
     return matches
 
 
+RE_BUILTINS_IMPORT = re.compile(r'__builtins__\s*\[\s*["\']__import__["\']\s*\]')
+def detect_builtins_import(code: str | SubmissionFacts) -> list[dict]:
+    facts = ensure_submission_facts(code)
+    if not RE_BUILTINS_IMPORT.search(facts.raw_code): return []
+    return [{"pattern": "DYNAMIC_EXECUTION", "severity": "high", "evidence": "__builtins__['__import__'] — dynamic import"}]
+
 # ---------------------------------------------------------------------------
 # Score anomaly detection
 # ---------------------------------------------------------------------------
@@ -3790,6 +3796,7 @@ CODE_DETECTORS = [
     detect_thread_injection,
     detect_lazy_tensor,
     detect_precision_downgrade,
+    detect_builtins_import,
 ]
 
 BASE_DETECTOR_SPECS = [
@@ -3827,6 +3834,7 @@ BASE_DETECTOR_SPECS = [
     ("thread_injection", detect_thread_injection),
     ("lazy_tensor", detect_lazy_tensor),
     ("precision_downgrade", detect_precision_downgrade),
+    ("builtins_import", detect_builtins_import),
 ]
 
 VALID_RULE_OUTCOMES = {AUTO_FILTER, SUSPICIOUS_ONLY, TELEMETRY_ONLY}
