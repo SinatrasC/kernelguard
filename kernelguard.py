@@ -2197,6 +2197,90 @@ def detect_last_call_replay(code: str | SubmissionFacts) -> list[dict]:
             for n in ast.walk(expr)
         )
 
+    entrypoint_methods: set[tuple[str, str]] = set()
+    for stmt in getattr(tree, "body", []):
+        if not isinstance(stmt, ast.Assign):
+            continue
+        if not any(
+            isinstance(target, ast.Name) and is_entrypoint_name(target.id)
+            for target in stmt.targets
+        ):
+            continue
+        if (isinstance(stmt.value, ast.Attribute)
+                and isinstance(stmt.value.value, ast.Name)):
+            entrypoint_methods.add((stmt.value.value.id, stmt.value.attr))
+
+    mutating_methods = {
+        "add", "append", "clear", "extend", "insert", "pop", "popitem",
+        "remove", "rotate", "setdefault", "update",
+    }
+    for class_node in ast.walk(tree):
+        if not isinstance(class_node, ast.ClassDef):
+            continue
+        for method in class_node.body:
+            if not isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if (class_node.name, method.name) not in entrypoint_methods:
+                continue
+
+            default_params: set[str] = set()
+            defaults = list(method.args.defaults)
+            args_with_defaults = method.args.args[-len(defaults):] if defaults else []
+            for arg, default in zip(args_with_defaults, defaults):
+                if isinstance(default, (ast.List, ast.Dict, ast.Set)):
+                    default_params.add(arg.arg)
+            for arg, default in zip(method.args.kwonlyargs, method.args.kw_defaults):
+                if isinstance(default, (ast.List, ast.Dict, ast.Set)):
+                    default_params.add(arg.arg)
+            if not default_params:
+                continue
+
+            mutates_default = False
+            for child in ast.walk(method):
+                if isinstance(child, ast.Assign):
+                    if any(_ast_root_name(target) in default_params for target in child.targets):
+                        mutates_default = True
+                        break
+                if (isinstance(child, ast.Call)
+                        and isinstance(child.func, ast.Attribute)
+                        and child.func.attr in mutating_methods
+                        and _ast_root_name(child.func.value) in default_params):
+                    mutates_default = True
+                    break
+            if not mutates_default:
+                continue
+
+            input_params = {
+                arg.arg
+                for args in (method.args.posonlyargs, method.args.args, method.args.kwonlyargs)
+                for arg in args
+            } - default_params - {"self", "cls"}
+
+            for child in ast.walk(method):
+                if not isinstance(child, ast.If):
+                    continue
+                if _body_has_calls(child.body):
+                    continue
+                if _expr_names(child.test) & input_params:
+                    continue
+                if not any(
+                    isinstance(stmt, ast.Return)
+                    and stmt.value is not None
+                    and isinstance(stmt.value, ast.Subscript)
+                    and _ast_root_name(stmt.value) in default_params
+                    for stmt in child.body
+                ):
+                    continue
+
+                return [{
+                    "pattern": "LAST_CALL_REPLAY",
+                    "severity": "critical",
+                    "evidence": (
+                        f"{entrypoint_name} is aliased to a method that replays "
+                        "output from a mutated mutable default"
+                    ),
+                }]
+
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
