@@ -2459,6 +2459,66 @@ def detect_last_call_replay(code: str | SubmissionFacts) -> list[dict]:
                 ),
             }]
 
+        # Fourth pass: replay through a local globals() alias.
+        #
+        # Pattern: g = globals()
+        #          if key in g: return g[key]
+        #          g[key] = data.clone()
+        params = {
+            arg.arg
+            for args in (node.args.posonlyargs, node.args.args, node.args.kwonlyargs)
+            for arg in args
+        }
+        if node.args.vararg is not None:
+            params.add(node.args.vararg.arg)
+        if node.args.kwarg is not None:
+            params.add(node.args.kwarg.arg)
+
+        globals_aliases: set[str] = set()
+        mutated_aliases: set[str] = set()
+        for child in ast.walk(node):
+            if not isinstance(child, ast.Assign):
+                continue
+            if (len(child.targets) == 1
+                    and isinstance(child.targets[0], ast.Name)
+                    and isinstance(child.value, ast.Call)
+                    and isinstance(child.value.func, ast.Name)
+                    and child.value.func.id == "globals"):
+                globals_aliases.add(child.targets[0].id)
+            for target in child.targets:
+                if isinstance(target, ast.Subscript):
+                    target_root = _ast_root_name(target)
+                    if target_root in globals_aliases:
+                        mutated_aliases.add(target_root)
+
+        if mutated_aliases:
+            for child in ast.walk(node):
+                if not isinstance(child, ast.If):
+                    continue
+                if _body_has_calls(child.body):
+                    continue
+                if _expr_names(child.test) & params:
+                    continue
+                if not (_expr_names(child.test) & mutated_aliases):
+                    continue
+                if not any(
+                    isinstance(stmt, ast.Return)
+                    and stmt.value is not None
+                    and isinstance(stmt.value, ast.Subscript)
+                    and _ast_root_name(stmt.value) in mutated_aliases
+                    for stmt in child.body
+                ):
+                    continue
+
+                return [{
+                    "pattern": "LAST_CALL_REPLAY",
+                    "severity": "critical",
+                    "evidence": (
+                        f"{entrypoint_name} replays output through a mutated "
+                        "globals() alias"
+                    ),
+                }]
+
     return []
 
 
