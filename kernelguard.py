@@ -1470,6 +1470,19 @@ def detect_runtime_package_install(code: str | SubmissionFacts) -> list[dict]:
     return []
 
 
+def detect_closure_dataptr_replay(code_or_facts: str | SubmissionFacts) -> list[dict]:
+    facts = ensure_submission_facts(code_or_facts)
+    if not facts.custom_kernel_active:
+        return []
+    active = facts.custom_kernel_active
+    has_nonlocal = bool(re.search(r'\bnonlocal\s+\w+', active))
+    has_dataptr = bool(re.search(r'data_ptr\s*\(\s*\).*==.*data\.data_ptr', active))
+    has_factory = bool(re.search(r'custom_kernel\s*=\s*\w+\s*\(\s*\)', facts.raw_code))
+    if has_nonlocal and has_dataptr and has_factory:
+        return [{"pattern": "CLOSURE_DATAPTR_REPLAY", "severity": "high", "evidence": "Closure factory with nonlocal data_ptr-based result caching"}]
+    return []
+
+
 # ---------------------------------------------------------------------------
 # AST-based detectors (Layer 2: structural analysis beyond regex)
 # ---------------------------------------------------------------------------
@@ -3025,6 +3038,20 @@ def detect_precision_downgrade(code: str | SubmissionFacts) -> list[dict]:
     return matches
 
 
+def detect_dict_items_replay(code_or_facts):
+    facts = ensure_submission_facts(code_or_facts)
+    if not facts.custom_kernel_active:
+        return []
+    import re
+    active = facts.custom_kernel_active
+    has_items_iter = bool(re.search(r'list\s*\(\s*\w+\.items\s*\(\)\s*\)', active))
+    has_datap_ptr_compare = bool(re.search(r'\.data_ptr\s*\(\s*\).*==.*data\.data_ptr', active))
+    has_global_dict = bool(re.search(r'\w+\s*=\s*\{\}', facts.raw_code))
+    if has_items_iter and has_datap_ptr_compare and has_global_dict:
+        return [{"pattern": "DICT_ITEMS_REPLAY", "severity": "high", "evidence": "list(dict.items()) iteration with data_ptr comparison for result caching"}]
+    return []
+
+
 # ---------------------------------------------------------------------------
 # Score anomaly detection
 # ---------------------------------------------------------------------------
@@ -3609,6 +3636,10 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
         "PRECISION_DOWNGRADE", "approximation", "telemetry", TELEMETRY_ONLY, (),
         (), "downgrade",
     ),
+    "DICT_ITEMS_REPLAY": RulePolicy(
+        "DICT_ITEMS_REPLAY", "result_reuse", "hard", AUTO_FILTER, (),
+        (), "rewrite",
+    ),
     "TOKEN_PASTE_CUDA_API": RulePolicy(
         "TOKEN_PASTE_CUDA_API", "filter_evasion", "hard", AUTO_FILTER, (),
         (), "keep",
@@ -3790,6 +3821,7 @@ CODE_DETECTORS = [
     detect_thread_injection,
     detect_lazy_tensor,
     detect_precision_downgrade,
+    detect_dict_items_replay,
 ]
 
 BASE_DETECTOR_SPECS = [
@@ -3827,6 +3859,7 @@ BASE_DETECTOR_SPECS = [
     ("thread_injection", detect_thread_injection),
     ("lazy_tensor", detect_lazy_tensor),
     ("precision_downgrade", detect_precision_downgrade),
+    ("dict_items_replay", detect_dict_items_replay),
 ]
 
 VALID_RULE_OUTCOMES = {AUTO_FILTER, SUSPICIOUS_ONLY, TELEMETRY_ONLY}
