@@ -3025,6 +3025,15 @@ def detect_precision_downgrade(code: str | SubmissionFacts) -> list[dict]:
     return matches
 
 
+def detect_copyreg_pickle(code: str | SubmissionFacts) -> list[dict]:
+    facts = ensure_submission_facts(code)
+    code = facts.raw_code
+    if re.search(r'copyreg\.pickle\s*\(', code) and re.search(r'__reduce_ex__\s*\b', code):
+        if re.search(r'\bid\s*\(', code):
+            return [{"pattern": "COPYREG_PICKLE", "severity": "critical", "evidence": "copyreg.pickle with __reduce_ex__ and id-keyed cache (copyreg dispatch caching bypass)"}]
+    return []
+
+
 # ---------------------------------------------------------------------------
 # Score anomaly detection
 # ---------------------------------------------------------------------------
@@ -3653,6 +3662,10 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
         "NEAR_CLONE_SPAM", "administrative", "support", SUSPICIOUS_ONLY, (),
         (), "downgrade",
     ),
+    "COPYREG_PICKLE": RulePolicy(
+        "COPYREG_PICKLE", "result_reuse", "hard", AUTO_FILTER, (),
+        (), "keep",
+    ),
 }
 
 BASE_SCORE_CONFIG = {
@@ -3790,6 +3803,7 @@ CODE_DETECTORS = [
     detect_thread_injection,
     detect_lazy_tensor,
     detect_precision_downgrade,
+    detect_copyreg_pickle,
 ]
 
 BASE_DETECTOR_SPECS = [
@@ -3827,6 +3841,7 @@ BASE_DETECTOR_SPECS = [
     ("thread_injection", detect_thread_injection),
     ("lazy_tensor", detect_lazy_tensor),
     ("precision_downgrade", detect_precision_downgrade),
+    ("copyreg_pickle", detect_copyreg_pickle),
 ]
 
 VALID_RULE_OUTCOMES = {AUTO_FILTER, SUSPICIOUS_ONLY, TELEMETRY_ONLY}
@@ -4705,6 +4720,7 @@ AUDIT_RULE_ORDER = [
     "TOKEN_PASTE_CUDA_API", "SEQUENCE_BATCH_GRAPH", "PARTIAL_GRAPH_KEY", "RUNTIME_PACKAGE_INSTALL",
     "PRECISION_DOWNGRADE", "SCORE_PHYSICS_FLOOR", "SCORE_IMPOSSIBLE", "SCORE_SUSPECT_FLOOR",
     "SCORE_BROKEN", "SCORE_EXTREME_SPEEDUP", "DUPLICATE_SPAM", "NEAR_CLONE_SPAM",
+    "COPYREG_PICKLE",
 ]
 
 
