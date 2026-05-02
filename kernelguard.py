@@ -1470,6 +1470,17 @@ def detect_runtime_package_install(code: str | SubmissionFacts) -> list[dict]:
     return []
 
 
+def detect_class_call_entrypoint(code_or_facts):
+    facts = ensure_submission_facts(code_or_facts)
+    if not facts.python_active:
+        return []
+    has_class_entry = bool(re.search(r'class\s+custom_kernel[\s\S]{0,500}?def\s+__call__', facts.raw_code))
+    has_dataptr = bool(re.search(r'data_ptr\s*\(\s*\).*==.*data\.data_ptr', facts.custom_kernel_active or ''))
+    if has_class_entry and has_dataptr:
+        return [{"pattern": "CLASS_CALL_ENTRYPOINT", "severity": "high", "evidence": "Class-based entrypoint with __call__ and data_ptr caching"}]
+    return []
+
+
 # ---------------------------------------------------------------------------
 # AST-based detectors (Layer 2: structural analysis beyond regex)
 # ---------------------------------------------------------------------------
@@ -2035,6 +2046,19 @@ def detect_timed_input_replay(code: str | SubmissionFacts) -> list[dict]:
             "severity": "critical",
             "evidence": "timed-input quantization / transformed-Q replay: " + ", ".join(sorted(set(indicators))),
         }]
+    return []
+
+
+def detect_getframe_dataptr_replay(code: str | SubmissionFacts) -> list[dict]:
+    """Pattern: sys._getframe() frame walk to detect repeated calls + data_ptr comparison for result caching."""
+    facts = ensure_submission_facts(code)
+    if not facts.custom_kernel_active:
+        return []
+    active = facts.custom_kernel_active
+    has_getframe = bool(re.search(r'sys\._getframe\s*\(', active))
+    has_dataptr_compare = bool(re.search(r'data_ptr\s*\(\s*\).*==.*data\.data_ptr', active))
+    if has_getframe and has_dataptr_compare:
+        return [{"pattern": "GETFRAME_DATAPTR_REPLAY", "severity": "high", "evidence": "sys._getframe() combined with data_ptr comparison for result caching"}]
     return []
 
 
@@ -3585,6 +3609,10 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
         "RESULT_BANK_REPLAY", "result_reuse", "hard", AUTO_FILTER, (),
         TOP5_LOWCONF_RESULT_BANK_FIXTURES, "keep",
     ),
+    "GETFRAME_DATAPTR_REPLAY": RulePolicy(
+        "GETFRAME_DATAPTR_REPLAY", "result_reuse", "hard", AUTO_FILTER, (),
+        (), "keep",
+    ),
     "OBFUSCATED_EXEC": RulePolicy(
         "OBFUSCATED_EXEC", "dynamic_execution", "hard", AUTO_FILTER, (),
         (), "keep",
@@ -3652,6 +3680,9 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
     "NEAR_CLONE_SPAM": RulePolicy(
         "NEAR_CLONE_SPAM", "administrative", "support", SUSPICIOUS_ONLY, (),
         (), "downgrade",
+    ),
+    "LAMBDA_OPERATOR_DISPATCH": RulePolicy(
+        "LAMBDA_OPERATOR_DISPATCH", "result_reuse", "hard", AUTO_FILTER, (), (), "keep",
     ),
 }
 
@@ -3764,6 +3795,7 @@ CODE_DETECTORS = [
     detect_last_call_replay,
     detect_shape_output_replay,
     detect_timed_input_replay,
+    detect_getframe_dataptr_replay,
     detect_cuda_graph_replay,
     detect_silent_fallback,
     detect_trivial_probe,
@@ -3775,6 +3807,7 @@ CODE_DETECTORS = [
     detect_token_paste_cuda_api,
     detect_sequence_batch_graph,
     detect_runtime_package_install,
+    detect_class_call_entrypoint,
     # AST-based detectors (Layer 2)
     detect_trusted_module_import,
     detect_module_mutation,
@@ -3802,6 +3835,7 @@ BASE_DETECTOR_SPECS = [
     ("last_call_replay", detect_last_call_replay),
     ("shape_output_replay", detect_shape_output_replay),
     ("timed_input_replay", detect_timed_input_replay),
+    ("getframe_dataptr_replay", detect_getframe_dataptr_replay),
     ("cuda_graph_replay", detect_cuda_graph_replay),
     ("silent_fallback", detect_silent_fallback),
     ("trivial_probe", detect_trivial_probe),
@@ -5827,6 +5861,32 @@ def main():
         summary_path = os.path.join(args.output_dir, f"detection_summary_{stem}.json")
         scan_parquet(args.parquet, results_path, best_path, summary_path, workers=args.workers)
 
+
+# ---------------------------------------------------------------------------
+# Verification: KG#42 — sys._getframe() + data_ptr replay
+# ---------------------------------------------------------------------------
+
+_GETFRAME_EXPLOIT_CODE = '''import torch, sys
+_PREV = None
+_OUT = None
+def custom_kernel(data):
+    global _PREV, _OUT
+    fr = sys._getframe()
+    if _PREV is not None and _PREV.data_ptr() == data.data_ptr():
+        return _OUT
+    _PREV = data
+    _OUT = torch.mm(data, data.t())
+    return _OUT
+'''
+
+_GETFRAME_VERIFIED = False
+if True:
+    _facts = build_submission_facts(_GETFRAME_EXPLOIT_CODE)
+    _result = detect_getframe_dataptr_replay(_facts)
+    assert len(_result) == 1, f"Expected 1 match, got {len(_result)}: {_result}"
+    assert _result[0]["pattern"] == "GETFRAME_DATAPTR_REPLAY"
+    assert _result[0]["severity"] == "high"
+    _GETFRAME_VERIFIED = True
 
 if __name__ == "__main__":
     main()
