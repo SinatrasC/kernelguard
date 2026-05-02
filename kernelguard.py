@@ -3024,7 +3024,20 @@ def detect_precision_downgrade(code: str | SubmissionFacts) -> list[dict]:
 
     return matches
 
+RE_WEAKREF = re.compile(r'weakref\.(?:ref|WeakValueDictionary|WeakKeyDictionary|WeakSet|finalize)\s*\(')
+def detect_weakref_state(code: str | SubmissionFacts) -> list[dict]:
+    facts = ensure_submission_facts(code)
+    if not RE_WEAKREF.search(facts.raw_code): return []
+    return [{"pattern": "WORKSPACE_CACHE", "severity": "low", "evidence": "weakref.ref/WeakValueDictionary/WeakKeyDictionary — garbage-collectible state container evades replay detection"}]
 
+RE_DIS = re.compile(r'dis\.(?:dis|get_instructions|Bytecode|code_info)\s*\(')
+def detect_dis_bytecode(code: str | SubmissionFacts) -> list[dict]:
+    facts = ensure_submission_facts(code)
+    if not RE_DIS.search(facts.raw_code): return []
+    return [{"pattern": "CODE_ACCESS", "severity": "high", "evidence": "dis.dis/Bytecode/get_instructions — bytecode inspection for code manipulation"}]
+
+# ---------------------------------------------------------------------------
+# Score anomaly detection
 # ---------------------------------------------------------------------------
 # Score anomaly detection
 # ---------------------------------------------------------------------------
@@ -3790,6 +3803,7 @@ CODE_DETECTORS = [
     detect_thread_injection,
     detect_lazy_tensor,
     detect_precision_downgrade,
+    detect_contextvars_state,
 ]
 
 BASE_DETECTOR_SPECS = [
@@ -3827,6 +3841,7 @@ BASE_DETECTOR_SPECS = [
     ("thread_injection", detect_thread_injection),
     ("lazy_tensor", detect_lazy_tensor),
     ("precision_downgrade", detect_precision_downgrade),
+    ("contextvars_state", detect_contextvars_state),
 ]
 
 VALID_RULE_OUTCOMES = {AUTO_FILTER, SUSPICIOUS_ONLY, TELEMETRY_ONLY}
