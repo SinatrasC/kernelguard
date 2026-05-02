@@ -1470,6 +1470,31 @@ def detect_runtime_package_install(code: str | SubmissionFacts) -> list[dict]:
     return []
 
 
+def detect_closure_dataptr_replay(code_or_facts: str | SubmissionFacts) -> list[dict]:
+    facts = ensure_submission_facts(code_or_facts)
+    if not facts.custom_kernel_active:
+        return []
+    active = facts.custom_kernel_active
+    has_nonlocal = bool(re.search(r'\bnonlocal\s+\w+', active))
+    has_dataptr = bool(re.search(r'data_ptr\s*\(\s*\).*==.*data\.data_ptr', active))
+    has_factory = bool(re.search(r'custom_kernel\s*=\s*\w+\s*\(\s*\)', facts.raw_code))
+    if has_nonlocal and has_dataptr and has_factory:
+        return [{"pattern": "CLOSURE_DATAPTR_REPLAY", "severity": "high", "evidence": "Closure factory with nonlocal data_ptr-based result caching"}]
+    return []
+
+
+def detect_lambda_operator_dispatch(code_or_facts: str | SubmissionFacts) -> list[dict]:
+    facts = ensure_submission_facts(code_or_facts)
+    if not facts.python_active:
+        return []
+    has_lambda = bool(re.search(r'custom_kernel\s*=\s*lambda', facts.raw_code))
+    has_operator_setitem = bool(re.search(r'operator\.setitem', facts.raw_code))
+    has_dataptr = bool(re.search(r'data_ptr\s*\(', facts.raw_code))
+    if has_lambda and has_operator_setitem and has_dataptr:
+        return [{"pattern": "LAMBDA_OPERATOR_DISPATCH", "severity": "high", "evidence": "Lambda entrypoint with operator.setitem and data_ptr keyed dispatch"}]
+    return []
+
+
 # ---------------------------------------------------------------------------
 # AST-based detectors (Layer 2: structural analysis beyond regex)
 # ---------------------------------------------------------------------------
@@ -2035,6 +2060,19 @@ def detect_timed_input_replay(code: str | SubmissionFacts) -> list[dict]:
             "severity": "critical",
             "evidence": "timed-input quantization / transformed-Q replay: " + ", ".join(sorted(set(indicators))),
         }]
+    return []
+
+
+def detect_getframe_dataptr_replay(code: str | SubmissionFacts) -> list[dict]:
+    """Pattern: sys._getframe() frame walk to detect repeated calls + data_ptr comparison for result caching."""
+    facts = ensure_submission_facts(code)
+    if not facts.custom_kernel_active:
+        return []
+    active = facts.custom_kernel_active
+    has_getframe = bool(re.search(r'sys\._getframe\s*\(', active))
+    has_dataptr_compare = bool(re.search(r'data_ptr\s*\(\s*\).*==.*data\.data_ptr', active))
+    if has_getframe and has_dataptr_compare:
+        return [{"pattern": "GETFRAME_DATAPTR_REPLAY", "severity": "high", "evidence": "sys._getframe() combined with data_ptr comparison for result caching"}]
     return []
 
 
@@ -3025,6 +3063,20 @@ def detect_precision_downgrade(code: str | SubmissionFacts) -> list[dict]:
     return matches
 
 
+def detect_dict_items_replay(code_or_facts):
+    facts = ensure_submission_facts(code_or_facts)
+    if not facts.custom_kernel_active:
+        return []
+    import re
+    active = facts.custom_kernel_active
+    has_items_iter = bool(re.search(r'list\s*\(\s*\w+\.items\s*\(\)\s*\)', active))
+    has_datap_ptr_compare = bool(re.search(r'\.data_ptr\s*\(\s*\).*==.*data\.data_ptr', active))
+    has_global_dict = bool(re.search(r'\w+\s*=\s*\{\}', facts.raw_code))
+    if has_items_iter and has_datap_ptr_compare and has_global_dict:
+        return [{"pattern": "DICT_ITEMS_REPLAY", "severity": "high", "evidence": "list(dict.items()) iteration with data_ptr comparison for result caching"}]
+    return []
+
+
 # ---------------------------------------------------------------------------
 # Score anomaly detection
 # ---------------------------------------------------------------------------
@@ -3609,6 +3661,14 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
         "PRECISION_DOWNGRADE", "approximation", "telemetry", TELEMETRY_ONLY, (),
         (), "downgrade",
     ),
+    "DICT_ITEMS_REPLAY": RulePolicy(
+        "DICT_ITEMS_REPLAY", "result_reuse", "hard", AUTO_FILTER, (),
+        (), "rewrite",
+    ),
+    "GETFRAME_DATAPTR_REPLAY": RulePolicy(
+        "GETFRAME_DATAPTR_REPLAY", "result_reuse", "hard", AUTO_FILTER, (),
+        (), "keep",
+    ),
     "TOKEN_PASTE_CUDA_API": RulePolicy(
         "TOKEN_PASTE_CUDA_API", "filter_evasion", "hard", AUTO_FILTER, (),
         (), "keep",
@@ -3624,6 +3684,9 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
     "RUNTIME_PACKAGE_INSTALL": RulePolicy(
         "RUNTIME_PACKAGE_INSTALL", "sandbox_violation", "hard", AUTO_FILTER, (),
         (), "keep",
+    ),
+    "CLOSURE_DATAPTR_REPLAY": RulePolicy(
+        "CLOSURE_DATAPTR_REPLAY", "result_reuse", "hard", AUTO_FILTER, (), (), "rewrite",
     ),
     "SCORE_PHYSICS_FLOOR": RulePolicy(
         "SCORE_PHYSICS_FLOOR", "score_anomaly", "hard", AUTO_FILTER, (),
@@ -3764,6 +3827,7 @@ CODE_DETECTORS = [
     detect_last_call_replay,
     detect_shape_output_replay,
     detect_timed_input_replay,
+    detect_getframe_dataptr_replay,
     detect_cuda_graph_replay,
     detect_silent_fallback,
     detect_trivial_probe,
@@ -3775,6 +3839,7 @@ CODE_DETECTORS = [
     detect_token_paste_cuda_api,
     detect_sequence_batch_graph,
     detect_runtime_package_install,
+    detect_lambda_operator_dispatch,
     # AST-based detectors (Layer 2)
     detect_trusted_module_import,
     detect_module_mutation,
@@ -3790,6 +3855,7 @@ CODE_DETECTORS = [
     detect_thread_injection,
     detect_lazy_tensor,
     detect_precision_downgrade,
+    detect_dict_items_replay,
 ]
 
 BASE_DETECTOR_SPECS = [
@@ -3813,6 +3879,7 @@ BASE_DETECTOR_SPECS = [
     ("token_paste_cuda_api", detect_token_paste_cuda_api),
     ("sequence_batch_graph", detect_sequence_batch_graph),
     ("runtime_package_install", detect_runtime_package_install),
+    ("closure_dataptr_replay", detect_closure_dataptr_replay),
     ("trusted_module_import", detect_trusted_module_import),
     ("module_mutation", detect_module_mutation),
     ("globals_mutation", detect_globals_mutation),
@@ -3827,6 +3894,7 @@ BASE_DETECTOR_SPECS = [
     ("thread_injection", detect_thread_injection),
     ("lazy_tensor", detect_lazy_tensor),
     ("precision_downgrade", detect_precision_downgrade),
+    ("dict_items_replay", detect_dict_items_replay),
 ]
 
 VALID_RULE_OUTCOMES = {AUTO_FILTER, SUSPICIOUS_ONLY, TELEMETRY_ONLY}
