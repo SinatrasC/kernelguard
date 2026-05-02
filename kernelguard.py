@@ -1475,9 +1475,21 @@ def detect_class_call_entrypoint(code_or_facts):
     if not facts.python_active:
         return []
     has_class_entry = bool(re.search(r'class\s+custom_kernel[\s\S]{0,500}?def\s+__call__', facts.raw_code))
-    has_dataptr = bool(re.search(r'data_ptr\s*\(\s*\).*==.*data\.data_ptr', facts.custom_kernel_active or ''))
+    has_dataptr = bool(re.search(r'data_ptr\s*\(\s*\).*==.*data\.data_ptr', facts.raw_code))
     if has_class_entry and has_dataptr:
         return [{"pattern": "CLASS_CALL_ENTRYPOINT", "severity": "high", "evidence": "Class-based entrypoint with __call__ and data_ptr caching"}]
+    return []
+
+
+def detect_lambda_operator_dispatch(code_or_facts: str | SubmissionFacts) -> list[dict]:
+    facts = ensure_submission_facts(code_or_facts)
+    if not facts.python_active:
+        return []
+    has_lambda = bool(re.search(r'custom_kernel\s*=\s*lambda', facts.raw_code))
+    has_operator_setitem = bool(re.search(r'operator\.setitem', facts.raw_code))
+    has_dataptr = bool(re.search(r'data_ptr\s*\(', facts.raw_code))
+    if has_lambda and has_operator_setitem and has_dataptr:
+        return [{"pattern": "LAMBDA_OPERATOR_DISPATCH", "severity": "high", "evidence": "Lambda entrypoint with operator.setitem and data_ptr keyed dispatch"}]
     return []
 
 
@@ -3684,6 +3696,9 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
     "LAMBDA_OPERATOR_DISPATCH": RulePolicy(
         "LAMBDA_OPERATOR_DISPATCH", "result_reuse", "hard", AUTO_FILTER, (), (), "keep",
     ),
+    "CLASS_CALL_ENTRYPOINT": RulePolicy(
+        "CLASS_CALL_ENTRYPOINT", "result_reuse", "hard", AUTO_FILTER, (), (), "keep",
+    ),
 }
 
 BASE_SCORE_CONFIG = {
@@ -3847,6 +3862,7 @@ BASE_DETECTOR_SPECS = [
     ("token_paste_cuda_api", detect_token_paste_cuda_api),
     ("sequence_batch_graph", detect_sequence_batch_graph),
     ("runtime_package_install", detect_runtime_package_install),
+    ("class_call_entrypoint", detect_class_call_entrypoint),
     ("trusted_module_import", detect_trusted_module_import),
     ("module_mutation", detect_module_mutation),
     ("globals_mutation", detect_globals_mutation),
@@ -5887,6 +5903,34 @@ if True:
     assert _result[0]["pattern"] == "GETFRAME_DATAPTR_REPLAY"
     assert _result[0]["severity"] == "high"
     _GETFRAME_VERIFIED = True
+
+# ---------------------------------------------------------------------------
+# Verification: KG#43 — class custom_kernel __call__ + data_ptr replay
+# ---------------------------------------------------------------------------
+
+_CLASS_CALL_EXPLOIT_CODE = '''import torch
+
+_NODE = None
+
+class custom_kernel:
+    @staticmethod
+    def __call__(data):
+        global _NODE
+        if _NODE is not None and _NODE[0].data_ptr() == data.data_ptr():
+            return _NODE[1]
+        r = torch.mm(data, data.t())
+        _NODE = (data, r)
+        return r
+'''
+
+_CLASS_CALL_VERIFIED = False
+if __name__ == "__main__":
+    _facts = build_submission_facts(_CLASS_CALL_EXPLOIT_CODE)
+    _result = detect_class_call_entrypoint(_facts)
+    assert len(_result) == 1, f"Expected 1 match, got {len(_result)}: {_result}"
+    assert _result[0]["pattern"] == "CLASS_CALL_ENTRYPOINT"
+    assert _result[0]["severity"] == "high"
+    _CLASS_CALL_VERIFIED = True
 
 if __name__ == "__main__":
     main()
