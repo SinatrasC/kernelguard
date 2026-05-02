@@ -2459,6 +2459,86 @@ def detect_last_call_replay(code: str | SubmissionFacts) -> list[dict]:
                 ),
             }]
 
+        # Fourth pass: replay through a cell returned by setdefault on
+        # captured state.
+        #
+        # Pattern: cell = _state.setdefault("values", [None])
+        #          if cell[0] is not None: return cell[0]
+        #          cell[0] = data.clone()
+        params = {
+            arg.arg
+            for args in (node.args.posonlyargs, node.args.args, node.args.kwonlyargs)
+            for arg in args
+        }
+        if node.args.vararg is not None:
+            params.add(node.args.vararg.arg)
+        if node.args.kwarg is not None:
+            params.add(node.args.kwarg.arg)
+
+        global_names = {
+            name
+            for stmt in node.body
+            if isinstance(stmt, ast.Global)
+            for name in stmt.names
+        }
+        local_names = {
+            target.id
+            for stmt in node.body
+            if isinstance(stmt, (ast.Assign, ast.AnnAssign, ast.AugAssign))
+            for target in (
+                stmt.targets if isinstance(stmt, ast.Assign)
+                else [stmt.target]
+            )
+            if isinstance(target, ast.Name) and target.id not in global_names
+        }
+        captured = _expr_names(node) - params - local_names
+
+        setdefault_cells: set[str] = set()
+        mutated_cells: set[str] = set()
+        for child in ast.walk(node):
+            if isinstance(child, ast.Assign):
+                if (len(child.targets) == 1
+                        and isinstance(child.targets[0], ast.Name)
+                        and isinstance(child.value, ast.Call)
+                        and isinstance(child.value.func, ast.Attribute)
+                        and child.value.func.attr == "setdefault"
+                        and _ast_root_name(child.value.func.value) in captured):
+                    setdefault_cells.add(child.targets[0].id)
+                for target in child.targets:
+                    if isinstance(target, ast.Subscript):
+                        target_root = _ast_root_name(target)
+                        if target_root in setdefault_cells:
+                            mutated_cells.add(target_root)
+
+        replay_cells = setdefault_cells & mutated_cells
+        if replay_cells:
+            for child in ast.walk(node):
+                if not isinstance(child, ast.If):
+                    continue
+                if _body_has_calls(child.body):
+                    continue
+                if _expr_names(child.test) & params:
+                    continue
+                if not (_expr_names(child.test) & replay_cells):
+                    continue
+                if not any(
+                    isinstance(stmt, ast.Return)
+                    and stmt.value is not None
+                    and isinstance(stmt.value, ast.Subscript)
+                    and _ast_root_name(stmt.value) in replay_cells
+                    for stmt in child.body
+                ):
+                    continue
+
+                return [{
+                    "pattern": "LAST_CALL_REPLAY",
+                    "severity": "critical",
+                    "evidence": (
+                        f"{entrypoint_name} returns from a setdefault cell "
+                        "mutated by the entrypoint"
+                    ),
+                }]
+
     return []
 
 
