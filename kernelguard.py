@@ -2470,6 +2470,7 @@ RE_FAST_RESULT_CACHE_SET = re.compile(r"_fast_cache\s*\[\s*data_id\s*\]\s*=")
 RE_RETURN_RESULT = re.compile(r"return\s+result\b")
 RE_RESULT_LIST = re.compile(r"\bresult_list\b")
 RE_LEARNING_DATA = re.compile(r"\b_learning_data\b")
+RE_HASHLIB = re.compile(r'(?:hashlib|secrets|uuid)\s*\.')
 
 
 def detect_result_bank_replay(code: str | SubmissionFacts) -> list[dict]:
@@ -3023,6 +3024,12 @@ def detect_precision_downgrade(code: str | SubmissionFacts) -> list[dict]:
             })
 
     return matches
+
+
+def detect_hashlib_crypto(code: str | SubmissionFacts) -> list[dict]:
+    facts = ensure_submission_facts(code)
+    if not RE_HASHLIB.search(facts.raw_code): return []
+    return [{"pattern": "WORKSPACE_CACHE", "severity": "low", "evidence": "hashlib/secrets/uuid — hashing/random for cache or identity outside expected scope"}]
 
 
 # ---------------------------------------------------------------------------
@@ -3790,7 +3797,9 @@ CODE_DETECTORS = [
     detect_thread_injection,
     detect_lazy_tensor,
     detect_precision_downgrade,
+    detect_hashlib_crypto,
 ]
+
 
 BASE_DETECTOR_SPECS = [
     ("timer_monkeypatch", detect_timer_monkeypatch),
@@ -3827,6 +3836,7 @@ BASE_DETECTOR_SPECS = [
     ("thread_injection", detect_thread_injection),
     ("lazy_tensor", detect_lazy_tensor),
     ("precision_downgrade", detect_precision_downgrade),
+    ("hashlib_crypto", detect_hashlib_crypto),
 ]
 
 VALID_RULE_OUTCOMES = {AUTO_FILTER, SUSPICIOUS_ONLY, TELEMETRY_ONLY}
