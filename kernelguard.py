@@ -3025,6 +3025,15 @@ def detect_precision_downgrade(code: str | SubmissionFacts) -> list[dict]:
     return matches
 
 
+def detect_indexof_protocol(code: str | SubmissionFacts) -> list[dict]:
+    facts = ensure_submission_facts(code)
+    code = facts.raw_code
+    if re.search(r'operator\.indexOf\s*\(', code) and re.search(r'def\s+__contains__\s*\(', code):
+        if re.search(r'\bglobal\s+\w+', code) or re.search(r'self\._r\s*=', code):
+            return [{"pattern": "INDEXOF_PROTOCOL", "severity": "critical", "evidence": "operator.indexOf dispatches through __contains__ with global state (indexOf protocol caching bypass)"}]
+    return []
+
+
 # ---------------------------------------------------------------------------
 # Score anomaly detection
 # ---------------------------------------------------------------------------
@@ -3653,6 +3662,10 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
         "NEAR_CLONE_SPAM", "administrative", "support", SUSPICIOUS_ONLY, (),
         (), "downgrade",
     ),
+    "INDEXOF_PROTOCOL": RulePolicy(
+        "INDEXOF_PROTOCOL", "result_reuse", "hard", AUTO_FILTER, (),
+        (), "keep",
+    ),
 }
 
 BASE_SCORE_CONFIG = {
@@ -3790,6 +3803,7 @@ CODE_DETECTORS = [
     detect_thread_injection,
     detect_lazy_tensor,
     detect_precision_downgrade,
+    detect_indexof_protocol,
 ]
 
 BASE_DETECTOR_SPECS = [
@@ -3827,6 +3841,7 @@ BASE_DETECTOR_SPECS = [
     ("thread_injection", detect_thread_injection),
     ("lazy_tensor", detect_lazy_tensor),
     ("precision_downgrade", detect_precision_downgrade),
+    ("indexof_protocol", detect_indexof_protocol),
 ]
 
 VALID_RULE_OUTCOMES = {AUTO_FILTER, SUSPICIOUS_ONLY, TELEMETRY_ONLY}
@@ -4705,6 +4720,7 @@ AUDIT_RULE_ORDER = [
     "TOKEN_PASTE_CUDA_API", "SEQUENCE_BATCH_GRAPH", "PARTIAL_GRAPH_KEY", "RUNTIME_PACKAGE_INSTALL",
     "PRECISION_DOWNGRADE", "SCORE_PHYSICS_FLOOR", "SCORE_IMPOSSIBLE", "SCORE_SUSPECT_FLOOR",
     "SCORE_BROKEN", "SCORE_EXTREME_SPEEDUP", "DUPLICATE_SPAM", "NEAR_CLONE_SPAM",
+    "INDEXOF_PROTOCOL",
 ]
 
 
