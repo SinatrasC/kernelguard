@@ -104,6 +104,7 @@ RE_DATA_PTR_CACHE_KEY = re.compile(
     re.IGNORECASE,
 )
 RE_VERSION_CACHE = re.compile(r'\._version\b')
+RE_HASH_CACHE = re.compile(r'\bhash\s*\(\s*\w+\s*\)\s*')
 RE_CACHE_GET_ASSIGN = re.compile(
     r'(\w+)\s*=\s*(\w*(?:cache|reuse)\w*)\.get\s*\(',
     re.IGNORECASE,
@@ -2785,6 +2786,33 @@ def detect_dynamic_execution(code: str | SubmissionFacts) -> list[dict]:
                 "severity": "high",
                 "evidence": "importlib.reload() (module state reset/manipulation)",
             })
+        elif func_name == "operator.call" and func_name not in seen:
+            if node.args and isinstance(node.args[0], ast.Name):
+                called_name = node.args[0].id
+                if called_name in ("exec", "eval", "compile"):
+                    seen.add(func_name)
+                    matches.append({
+                        "pattern": "DYNAMIC_EXECUTION",
+                        "severity": "high",
+                        "evidence": f"operator.call({called_name}, ...) — dynamic execution via operator module",
+                    })
+        elif func_name == "functools.partial" and func_name not in seen:
+            if node.args and isinstance(node.args[0], ast.Name):
+                called_name = node.args[0].id
+                if called_name in ("exec", "eval", "compile", "__import__"):
+                    seen.add(func_name)
+                    matches.append({
+                        "pattern": "DYNAMIC_EXECUTION",
+                        "severity": "high",
+                        "evidence": f"functools.partial({called_name}, ...) — deferred dynamic execution",
+                    })
+        elif func_name in ("builtins.exec", "builtins.eval", "builtins.compile") and func_name not in seen:
+            seen.add(func_name)
+            matches.append({
+                "pattern": "DYNAMIC_EXECUTION",
+                "severity": "high",
+                "evidence": f"{func_name}() — dynamic execution via builtins module",
+            })
 
     return matches
 
@@ -3023,6 +3051,35 @@ def detect_precision_downgrade(code: str | SubmissionFacts) -> list[dict]:
             })
 
     return matches
+
+
+def detect_hash_cache_replay(code: str | SubmissionFacts) -> list[dict]:
+    """Pattern: hash(data) used as cache key for output replay.
+    
+    Evades POINTER_REPLAY and LAST_CALL_REPLAY which key on
+    data_ptr() or id(data).
+    """
+    facts = ensure_submission_facts(code)
+    active = facts.custom_kernel_active or facts.python_active
+    entrypoint_name = entrypoint_label(facts.entrypoint_name)
+    
+    if not RE_HASH_CACHE.search(active):
+        return []
+    
+    if not re.search(r'\bh[key]', active) and not re.search(r'\bkey\b.*\bcache', active) and not re.search(r'_cache\s*\[', active):
+        return []
+    
+    if re.search(r'b""hash', active) or re.search(r"'hash'", active):
+        return []
+    
+    return [{
+        "pattern": "HASH_CACHE_REPLAY",
+        "severity": "critical",
+        "evidence": (
+            f"{entrypoint_name} uses hash(data) as cache key "
+            f"for output replay"
+        ),
+    }]
 
 
 # ---------------------------------------------------------------------------
@@ -3550,7 +3607,7 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
         AMD_MODULE_MUTATION_FIXTURES, "downgrade",
     ),
     "FRAME_WALK_ACCESS": RulePolicy(
-        "FRAME_WALK_ACCESS", "evaluator_state_support", "telemetry", TELEMETRY_ONLY,
+        "FRAME_WALK_ACCESS", "evaluator_state_mutation", "hard", AUTO_FILTER,
         (), (), "split",
     ),
     "FRAME_WALK_MUTATION": RulePolicy(
@@ -3790,6 +3847,7 @@ CODE_DETECTORS = [
     detect_thread_injection,
     detect_lazy_tensor,
     detect_precision_downgrade,
+    detect_hash_cache_replay,
 ]
 
 BASE_DETECTOR_SPECS = [
@@ -3827,6 +3885,7 @@ BASE_DETECTOR_SPECS = [
     ("thread_injection", detect_thread_injection),
     ("lazy_tensor", detect_lazy_tensor),
     ("precision_downgrade", detect_precision_downgrade),
+    ("hash_cache_replay", detect_hash_cache_replay),
 ]
 
 VALID_RULE_OUTCOMES = {AUTO_FILTER, SUSPICIOUS_ONLY, TELEMETRY_ONLY}
