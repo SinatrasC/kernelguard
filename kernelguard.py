@@ -2462,6 +2462,133 @@ def detect_last_call_replay(code: str | SubmissionFacts) -> list[dict]:
     return []
 
 
+def detect_bound_container_method_replay(code: str | SubmissionFacts) -> list[dict]:
+    """Pattern: aliased bound container methods mutate replay state."""
+    facts = ensure_submission_facts(code)
+    tree = facts.ast_tree
+    if tree is None:
+        return []
+    entrypoint_name = entrypoint_label(facts.entrypoint_name)
+    mutators = {"append", "extend", "insert", "update", "setdefault", "__setitem__"}
+    readers = {"__getitem__"}
+
+    containers = {
+        stmt.targets[0].id
+        for stmt in tree.body
+        if isinstance(stmt, ast.Assign)
+        and len(stmt.targets) == 1
+        and isinstance(stmt.targets[0], ast.Name)
+        and isinstance(stmt.value, (ast.List, ast.Dict))
+    }
+    aliases: dict[str, tuple[str, str]] = {}
+    for stmt in tree.body:
+        if not (
+            isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name)
+            and isinstance(stmt.value, ast.Attribute)
+            and isinstance(stmt.value.value, ast.Name)
+            and stmt.value.value.id in containers
+            and stmt.value.attr in mutators | readers
+        ):
+            continue
+        aliases[stmt.targets[0].id] = (stmt.value.value.id, stmt.value.attr)
+
+    def _param_names(node: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
+        params = {arg.arg for arg in node.args.args}
+        params.update(arg.arg for arg in node.args.posonlyargs)
+        params.update(arg.arg for arg in node.args.kwonlyargs)
+        return params
+
+    def _input_derived(expr: ast.AST | None, params: set[str]) -> bool:
+        return bool(_expr_names(expr) & params)
+
+    def _container_return_root(expr: ast.AST | None) -> str | None:
+        if isinstance(expr, ast.Subscript):
+            root = _ast_root_name(expr)
+            if root in containers:
+                return root
+        if (
+            isinstance(expr, ast.Call)
+            and isinstance(expr.func, ast.Name)
+            and expr.func.id in aliases
+            and aliases[expr.func.id][1] in readers
+        ):
+            return aliases[expr.func.id][0]
+        return None
+
+    def _body_has_only_reader_calls(body: list[ast.stmt]) -> bool:
+        for stmt in body:
+            for expr in ast.walk(stmt):
+                if not isinstance(expr, ast.Call):
+                    continue
+                if isinstance(expr.func, ast.Name) and expr.func.id in aliases and aliases[expr.func.id][1] in readers:
+                    continue
+                return True
+        return False
+
+    def _tested_roots(expr: ast.AST, roots: set[str]) -> set[str]:
+        found = _expr_names(expr) & roots
+        for call in ast.walk(expr):
+            if not (
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Name)
+                and call.func.id in aliases
+                and aliases[call.func.id][1] in readers
+            ):
+                continue
+            root = aliases[call.func.id][0]
+            if root in roots:
+                found.add(root)
+        return found
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not is_entrypoint_name(node.name):
+            continue
+
+        params = _param_names(node)
+        mutated = {
+            aliases[expr.func.id][0]
+            for expr in ast.walk(node)
+            if isinstance(expr, ast.Call)
+            and isinstance(expr.func, ast.Name)
+            and expr.func.id in aliases
+            and aliases[expr.func.id][1] in mutators
+            and any(_input_derived(arg, params) for arg in expr.args)
+        }
+        if not mutated:
+            continue
+
+        for child in ast.walk(node):
+            if not isinstance(child, ast.If):
+                continue
+            if _body_has_only_reader_calls(child.body):
+                continue
+            if _expr_names(child.test) & params:
+                continue
+            tested = _tested_roots(child.test, mutated)
+            returned = {
+                root
+                for stmt in child.body
+                if isinstance(stmt, ast.Return)
+                for root in [_container_return_root(stmt.value)]
+                if root is not None
+            }
+            if tested & returned & mutated:
+                return [{
+                    "pattern": "BOUND_CONTAINER_METHOD_REPLAY",
+                    "severity": "critical",
+                    "evidence": (
+                        f"{entrypoint_name} returns state populated through "
+                        "an aliased bound container method"
+                    ),
+                }]
+
+    return []
+
+
 RE_OBJECT_ID_DATA = re.compile(r"\bdata_id\s*=\s*id\s*\(\s*data\s*\)")
 RE_RESULT_BANK_SET = re.compile(r"_superbatch_results\s*\[\s*(?:did|data_id)\s*\]\s*=")
 RE_RESULT_BANK_RETURN = re.compile(r"return\s+_superbatch_results\s*\[\s*data_id\s*\]")
@@ -3479,6 +3606,10 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
         "LAST_CALL_REPLAY", "result_reuse", "hard", AUTO_FILTER, (),
         AMD_MANUAL_LAST_CALL_REPLAY_FIXTURES, "keep",
     ),
+    "BOUND_CONTAINER_METHOD_REPLAY": RulePolicy(
+        "BOUND_CONTAINER_METHOD_REPLAY", "result_reuse", "hard", AUTO_FILTER, (),
+        (), "keep",
+    ),
     "SHAPE_OUTPUT_REPLAY": RulePolicy(
         "SHAPE_OUTPUT_REPLAY", "result_reuse", "hard", AUTO_FILTER, (),
         AMD_PACKAGE_SHAPE_REPLAY_FIXTURES, "keep",
@@ -3762,6 +3893,7 @@ CODE_DETECTORS = [
     detect_decode_mm_ref,
     detect_result_caching,
     detect_last_call_replay,
+    detect_bound_container_method_replay,
     detect_shape_output_replay,
     detect_timed_input_replay,
     detect_cuda_graph_replay,
@@ -3800,6 +3932,7 @@ BASE_DETECTOR_SPECS = [
     ("decode_mm_ref", detect_decode_mm_ref),
     ("result_caching", detect_result_caching),
     ("last_call_replay", detect_last_call_replay),
+    ("bound_container_method_replay", detect_bound_container_method_replay),
     ("shape_output_replay", detect_shape_output_replay),
     ("timed_input_replay", detect_timed_input_replay),
     ("cuda_graph_replay", detect_cuda_graph_replay),
@@ -4696,7 +4829,7 @@ AUDIT_RULE_ORDER = [
     "EVALUATOR_EXPLOIT", "HARNESS_RUNTIME_PATCHING", "MODULE_MUTATION", "GLOBALS_MUTATION", "CODE_REPLACEMENT",
     "FRAME_WALK_ACCESS", "FRAME_WALK_MUTATION", "SYS_MODULES_ACCESS", "GLOBALS_ACCESS", "CODE_ACCESS",
     "TRUSTED_MODULE_IMPORT",
-    "OUTPUT_REPLAY_CACHE", "LAST_CALL_REPLAY", "SHAPE_OUTPUT_REPLAY", "TIMED_INPUT_REPLAY", "CONFIG_CACHE_EXPLOIT", "POINTER_REPLAY", "RESULT_BANK_REPLAY", "PREPROCESS_CACHE", "WORKSPACE_CACHE",
+    "OUTPUT_REPLAY_CACHE", "LAST_CALL_REPLAY", "BOUND_CONTAINER_METHOD_REPLAY", "SHAPE_OUTPUT_REPLAY", "TIMED_INPUT_REPLAY", "CONFIG_CACHE_EXPLOIT", "POINTER_REPLAY", "RESULT_BANK_REPLAY", "PREPROCESS_CACHE", "WORKSPACE_CACHE",
     "RUNNER_PLAN_CACHE", "CUDA_GRAPH_PYTHON", "CUDA_GRAPH_REPLAY",
     "TIMER_MONKEYPATCH", "FAKE_BENCHMARK_EMIT", "STDIO_REDIRECT", "UNSYNC_MULTISTREAM", "CUDA_EVENT_DISABLE_TIMING",
     "SCALED_MM_REF", "DECODE_MM_REF", "SILENT_FALLBACK", "REFERENCE_PRECOMPUTE_REPLAY", "TORCH_COMPILE_CACHE",
