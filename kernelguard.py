@@ -3025,6 +3025,12 @@ def detect_precision_downgrade(code: str | SubmissionFacts) -> list[dict]:
     return matches
 
 
+RE_WEAKREF = re.compile(r'weakref\.(?:ref|WeakValueDictionary|WeakKeyDictionary|WeakSet|finalize)\s*\(')
+def detect_weakref_state(code: str | SubmissionFacts) -> list[dict]:
+    facts = ensure_submission_facts(code)
+    if not RE_WEAKREF.search(facts.raw_code): return []
+    return [{"pattern": "WORKSPACE_CACHE", "severity": "low", "evidence": "weakref.ref/WeakValueDictionary/WeakKeyDictionary — garbage-collectible state container evades replay detection"}]
+
 # ---------------------------------------------------------------------------
 # Score anomaly detection
 # ---------------------------------------------------------------------------
