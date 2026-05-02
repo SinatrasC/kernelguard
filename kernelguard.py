@@ -3025,6 +3025,91 @@ def detect_precision_downgrade(code: str | SubmissionFacts) -> list[dict]:
     return matches
 
 
+def detect_dict_items_replay(code: str | SubmissionFacts) -> list[dict]:
+    """Pattern: for-loop dict.items() iteration + data_ptr replay.
+
+    Catches RED #31:
+        for k, v in list(_HIST.items()):
+            if k.data_ptr() == data.data_ptr():
+                return v
+
+    Evades POINTER_REPLAY which checks ast.In, not for-loop iteration
+    over dict.items().
+    """
+    facts = ensure_submission_facts(code)
+    tree = facts.ast_tree
+    if tree is None:
+        return []
+    entrypoint_name = entrypoint_label(facts.entrypoint_name)
+    dp_index = facts._nodes_with_data_ptr
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not is_entrypoint_name(node.name):
+            continue
+
+        for child in ast.walk(node):
+            if not isinstance(child, ast.For):
+                continue
+            if not isinstance(child.iter, ast.Call):
+                continue
+
+            iter_call = child.iter
+            if (
+                isinstance(iter_call.func, ast.Name)
+                and iter_call.func.id == "list"
+                and iter_call.args
+            ):
+                iter_call = iter_call.args[0]
+
+            if not (
+                isinstance(iter_call.func, ast.Attribute)
+                and iter_call.func.attr == "items"
+                and isinstance(iter_call.func.value, ast.Name)
+            ):
+                continue
+
+            for body_child in ast.walk(child):
+                if not isinstance(body_child, ast.If):
+                    continue
+                if _body_has_calls(body_child.body):
+                    continue
+                if not isinstance(body_child.test, ast.Compare):
+                    continue
+                test = body_child.test
+                has_ptr = False
+                for op in test.ops:
+                    if isinstance(op, ast.Eq):
+                        if (
+                            _expr_has_data_ptr_fast(test.left, dp_index)
+                            and test.comparators
+                            and _expr_has_data_ptr_fast(
+                                test.comparators[0], dp_index
+                            )
+                        ):
+                            has_ptr = True
+                            break
+                if not has_ptr:
+                    continue
+
+                returned = {
+                    _ast_root_name(stmt.value)
+                    for stmt in body_child.body
+                    if isinstance(stmt, ast.Return) and stmt.value is not None
+                } - {None}
+                if returned:
+                    return [{
+                        "pattern": "DICT_ITEMS_REPLAY",
+                        "severity": "critical",
+                        "evidence": (
+                            f"{entrypoint_name} replays saved output from "
+                            f"dict.items() iteration with data_ptr comparison"
+                        ),
+                    }]
+    return []
+
+
 # ---------------------------------------------------------------------------
 # Score anomaly detection
 # ---------------------------------------------------------------------------
@@ -3645,6 +3730,10 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
         "SCORE_EXTREME_SPEEDUP", "score_anomaly", "support", SUSPICIOUS_ONLY, (),
         (), "downgrade",
     ),
+    "DICT_ITEMS_REPLAY": RulePolicy(
+        "DICT_ITEMS_REPLAY", "result_reuse", "hard", AUTO_FILTER, (),
+        (), "keep",
+    ),
     "DUPLICATE_SPAM": RulePolicy(
         "DUPLICATE_SPAM", "administrative", "support", SUSPICIOUS_ONLY, (),
         (), "downgrade",
@@ -3790,6 +3879,7 @@ CODE_DETECTORS = [
     detect_thread_injection,
     detect_lazy_tensor,
     detect_precision_downgrade,
+    detect_dict_items_replay,
 ]
 
 BASE_DETECTOR_SPECS = [
@@ -3827,6 +3917,7 @@ BASE_DETECTOR_SPECS = [
     ("thread_injection", detect_thread_injection),
     ("lazy_tensor", detect_lazy_tensor),
     ("precision_downgrade", detect_precision_downgrade),
+    ("dict_items_replay", detect_dict_items_replay),
 ]
 
 VALID_RULE_OUTCOMES = {AUTO_FILTER, SUSPICIOUS_ONLY, TELEMETRY_ONLY}
@@ -4703,7 +4794,7 @@ AUDIT_RULE_ORDER = [
     "HARDCODED_SHAPES", "TRIVIAL_PROBE",
     "OBFUSCATED_EXEC", "DYNAMIC_EXECUTION", "MODULE_RELOAD", "THREAD_INJECTION", "LAZY_TENSOR",
     "TOKEN_PASTE_CUDA_API", "SEQUENCE_BATCH_GRAPH", "PARTIAL_GRAPH_KEY", "RUNTIME_PACKAGE_INSTALL",
-    "PRECISION_DOWNGRADE", "SCORE_PHYSICS_FLOOR", "SCORE_IMPOSSIBLE", "SCORE_SUSPECT_FLOOR",
+    "PRECISION_DOWNGRADE", "DICT_ITEMS_REPLAY", "SCORE_PHYSICS_FLOOR", "SCORE_IMPOSSIBLE", "SCORE_SUSPECT_FLOOR",
     "SCORE_BROKEN", "SCORE_EXTREME_SPEEDUP", "DUPLICATE_SPAM", "NEAR_CLONE_SPAM",
 ]
 
