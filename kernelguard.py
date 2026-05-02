@@ -2197,6 +2197,101 @@ def detect_last_call_replay(code: str | SubmissionFacts) -> list[dict]:
             for n in ast.walk(expr)
         )
 
+    mutating_methods = {
+        "add", "append", "clear", "extend", "insert", "pop", "popitem",
+        "remove", "rotate", "setdefault", "update",
+    }
+    functions_by_name = {
+        child.name: child
+        for child in ast.walk(tree)
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    partial_bindings: list[tuple[ast.FunctionDef | ast.AsyncFunctionDef, set[str]]] = []
+
+    for stmt in getattr(tree, "body", []):
+        if not isinstance(stmt, ast.Assign):
+            continue
+        if not any(
+            isinstance(target, ast.Name) and is_entrypoint_name(target.id)
+            for target in stmt.targets
+        ):
+            continue
+        if not isinstance(stmt.value, ast.Call):
+            continue
+        partial_call = (
+            isinstance(stmt.value.func, ast.Name) and stmt.value.func.id == "partial"
+        ) or (
+            isinstance(stmt.value.func, ast.Attribute)
+            and stmt.value.func.attr == "partial"
+        )
+        if not partial_call or not stmt.value.args:
+            continue
+        if not isinstance(stmt.value.args[0], ast.Name):
+            continue
+        target_function = functions_by_name.get(stmt.value.args[0].id)
+        if target_function is None:
+            continue
+
+        bound_params: set[str] = set()
+        positional_args = target_function.args.args
+        for arg, value in zip(positional_args, stmt.value.args[1:]):
+            if isinstance(value, (ast.List, ast.Dict, ast.Set)):
+                bound_params.add(arg.arg)
+        if bound_params:
+            partial_bindings.append((target_function, bound_params))
+
+    for partial_function, bound_params in partial_bindings:
+        mutates_bound = False
+        for child in ast.walk(partial_function):
+            if isinstance(child, ast.Assign):
+                if any(_ast_root_name(target) in bound_params for target in child.targets):
+                    mutates_bound = True
+                    break
+            elif isinstance(child, ast.AugAssign):
+                if _ast_root_name(child.target) in bound_params:
+                    mutates_bound = True
+                    break
+            elif (isinstance(child, ast.Call)
+                  and isinstance(child.func, ast.Attribute)
+                  and child.func.attr in mutating_methods
+                  and _ast_root_name(child.func.value) in bound_params):
+                mutates_bound = True
+                break
+        if not mutates_bound:
+            continue
+
+        input_params = {
+            arg.arg
+            for args in (partial_function.args.posonlyargs, partial_function.args.args, partial_function.args.kwonlyargs)
+            for arg in args
+        } - bound_params
+        for child in ast.walk(partial_function):
+            if not isinstance(child, ast.If):
+                continue
+            if _body_has_calls(child.body):
+                continue
+            if _expr_names(child.test) & input_params:
+                continue
+            if not (_expr_names(child.test) & bound_params):
+                continue
+            if not any(
+                isinstance(stmt, ast.Return)
+                and stmt.value is not None
+                and isinstance(stmt.value, ast.Subscript)
+                and _ast_root_name(stmt.value) in bound_params
+                for stmt in child.body
+            ):
+                continue
+
+            return [{
+                "pattern": "LAST_CALL_REPLAY",
+                "severity": "critical",
+                "evidence": (
+                    f"{entrypoint_name} is a partial that replays output from "
+                    "a mutated bound mutable argument"
+                ),
+            }]
+
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
