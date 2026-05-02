@@ -2462,6 +2462,159 @@ def detect_last_call_replay(code: str | SubmissionFacts) -> list[dict]:
     return []
 
 
+def detect_method_store_replay(code: str | SubmissionFacts) -> list[dict]:
+    """Pattern: no-arg methods guard and return object replay state."""
+    facts = ensure_submission_facts(code)
+    tree = facts.ast_tree
+    if tree is None:
+        return []
+    entrypoint_name = entrypoint_label(facts.entrypoint_name)
+
+    method_info: dict[tuple[str, str], tuple[str, str]] = {}
+    classes = {
+        stmt.name: stmt
+        for stmt in tree.body
+        if isinstance(stmt, ast.ClassDef)
+    }
+    for class_name, cls in classes.items():
+        for item in cls.body:
+            if not isinstance(item, ast.FunctionDef) or len(item.args.args) != 1:
+                continue
+            self_name = item.args.args[0].arg
+            returns = [stmt.value for stmt in ast.walk(item) if isinstance(stmt, ast.Return)]
+            if len(returns) != 1:
+                continue
+            ret = returns[0]
+            if (
+                isinstance(ret, ast.Call)
+                and isinstance(ret.func, ast.Name)
+                and ret.func.id == "bool"
+                and len(ret.args) == 1
+                and isinstance(ret.args[0], ast.Attribute)
+                and isinstance(ret.args[0].value, ast.Name)
+                and ret.args[0].value.id == self_name
+            ):
+                method_info[(class_name, item.name)] = ("guard", ret.args[0].attr)
+                continue
+            if (
+                isinstance(ret, ast.Subscript)
+                and isinstance(ret.value, ast.Attribute)
+                and isinstance(ret.value.value, ast.Name)
+                and ret.value.value.id == self_name
+            ):
+                method_info[(class_name, item.name)] = ("value", ret.value.attr)
+
+    instances = {
+        stmt.targets[0].id: stmt.value.func.id
+        for stmt in tree.body
+        if isinstance(stmt, ast.Assign)
+        and len(stmt.targets) == 1
+        and isinstance(stmt.targets[0], ast.Name)
+        and isinstance(stmt.value, ast.Call)
+        and isinstance(stmt.value.func, ast.Name)
+        and stmt.value.func.id in classes
+    }
+
+    def _param_names(node: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
+        params = {arg.arg for arg in node.args.args}
+        params.update(arg.arg for arg in node.args.posonlyargs)
+        params.update(arg.arg for arg in node.args.kwonlyargs)
+        return params
+
+    def _method_call(expr: ast.AST | None) -> tuple[str, str, str] | None:
+        if not (
+            isinstance(expr, ast.Call)
+            and isinstance(expr.func, ast.Attribute)
+            and not expr.args
+            and not expr.keywords
+            and isinstance(expr.func.value, ast.Name)
+            and expr.func.value.id in instances
+        ):
+            return None
+        class_name = instances[expr.func.value.id]
+        info = method_info.get((class_name, expr.func.attr))
+        if info is None:
+            return None
+        kind, attr = info
+        return expr.func.value.id, kind, attr
+
+    def _instance_attr(expr: ast.AST | None) -> tuple[str, str] | None:
+        if isinstance(expr, ast.Subscript):
+            return _instance_attr(expr.value)
+        if not (
+            isinstance(expr, ast.Attribute)
+            and isinstance(expr.value, ast.Name)
+            and expr.value.id in instances
+        ):
+            return None
+        return expr.value.id, expr.attr
+
+    def _body_has_only_method_calls(body: list[ast.stmt]) -> bool:
+        for stmt in body:
+            for expr in ast.walk(stmt):
+                if not isinstance(expr, ast.Call):
+                    continue
+                call = _method_call(expr)
+                if call is not None and call[1] == "value":
+                    continue
+                return False
+        return True
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not is_entrypoint_name(node.name):
+            continue
+
+        params = _param_names(node)
+        mutated = {
+            key
+            for expr in ast.walk(node)
+            if isinstance(expr, ast.Call)
+            and isinstance(expr.func, ast.Attribute)
+            and expr.func.attr in {"append", "extend", "insert", "update", "setdefault"}
+            and any(bool(_expr_names(arg) & params) for arg in expr.args)
+            for key in [_instance_attr(expr.func.value)]
+            if key is not None
+        }
+        if not mutated:
+            continue
+
+        for child in ast.walk(node):
+            if not isinstance(child, ast.If):
+                continue
+            if not _body_has_only_method_calls(child.body):
+                continue
+            if _expr_names(child.test) & params:
+                continue
+            tested = {
+                (root, attr)
+                for expr in ast.walk(child.test)
+                for call in [_method_call(expr)]
+                if call is not None and call[1] == "guard"
+                for root, _kind, attr in [call]
+            }
+            returned = {
+                (root, attr)
+                for stmt in child.body
+                if isinstance(stmt, ast.Return)
+                for call in [_method_call(stmt.value)]
+                if call is not None and call[1] == "value"
+                for root, _kind, attr in [call]
+            }
+            if tested & returned & mutated:
+                return [{
+                    "pattern": "METHOD_STORE_REPLAY",
+                    "severity": "critical",
+                    "evidence": (
+                        f"{entrypoint_name} returns stored state through "
+                        "no-arg object methods"
+                    ),
+                }]
+
+    return []
+
+
 RE_OBJECT_ID_DATA = re.compile(r"\bdata_id\s*=\s*id\s*\(\s*data\s*\)")
 RE_RESULT_BANK_SET = re.compile(r"_superbatch_results\s*\[\s*(?:did|data_id)\s*\]\s*=")
 RE_RESULT_BANK_RETURN = re.compile(r"return\s+_superbatch_results\s*\[\s*data_id\s*\]")
@@ -3479,6 +3632,10 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
         "LAST_CALL_REPLAY", "result_reuse", "hard", AUTO_FILTER, (),
         AMD_MANUAL_LAST_CALL_REPLAY_FIXTURES, "keep",
     ),
+    "METHOD_STORE_REPLAY": RulePolicy(
+        "METHOD_STORE_REPLAY", "result_reuse", "hard", AUTO_FILTER, (),
+        (), "keep",
+    ),
     "SHAPE_OUTPUT_REPLAY": RulePolicy(
         "SHAPE_OUTPUT_REPLAY", "result_reuse", "hard", AUTO_FILTER, (),
         AMD_PACKAGE_SHAPE_REPLAY_FIXTURES, "keep",
@@ -3762,6 +3919,7 @@ CODE_DETECTORS = [
     detect_decode_mm_ref,
     detect_result_caching,
     detect_last_call_replay,
+    detect_method_store_replay,
     detect_shape_output_replay,
     detect_timed_input_replay,
     detect_cuda_graph_replay,
@@ -3800,6 +3958,7 @@ BASE_DETECTOR_SPECS = [
     ("decode_mm_ref", detect_decode_mm_ref),
     ("result_caching", detect_result_caching),
     ("last_call_replay", detect_last_call_replay),
+    ("method_store_replay", detect_method_store_replay),
     ("shape_output_replay", detect_shape_output_replay),
     ("timed_input_replay", detect_timed_input_replay),
     ("cuda_graph_replay", detect_cuda_graph_replay),
@@ -4696,7 +4855,7 @@ AUDIT_RULE_ORDER = [
     "EVALUATOR_EXPLOIT", "HARNESS_RUNTIME_PATCHING", "MODULE_MUTATION", "GLOBALS_MUTATION", "CODE_REPLACEMENT",
     "FRAME_WALK_ACCESS", "FRAME_WALK_MUTATION", "SYS_MODULES_ACCESS", "GLOBALS_ACCESS", "CODE_ACCESS",
     "TRUSTED_MODULE_IMPORT",
-    "OUTPUT_REPLAY_CACHE", "LAST_CALL_REPLAY", "SHAPE_OUTPUT_REPLAY", "TIMED_INPUT_REPLAY", "CONFIG_CACHE_EXPLOIT", "POINTER_REPLAY", "RESULT_BANK_REPLAY", "PREPROCESS_CACHE", "WORKSPACE_CACHE",
+    "OUTPUT_REPLAY_CACHE", "LAST_CALL_REPLAY", "METHOD_STORE_REPLAY", "SHAPE_OUTPUT_REPLAY", "TIMED_INPUT_REPLAY", "CONFIG_CACHE_EXPLOIT", "POINTER_REPLAY", "RESULT_BANK_REPLAY", "PREPROCESS_CACHE", "WORKSPACE_CACHE",
     "RUNNER_PLAN_CACHE", "CUDA_GRAPH_PYTHON", "CUDA_GRAPH_REPLAY",
     "TIMER_MONKEYPATCH", "FAKE_BENCHMARK_EMIT", "STDIO_REDIRECT", "UNSYNC_MULTISTREAM", "CUDA_EVENT_DISABLE_TIMING",
     "SCALED_MM_REF", "DECODE_MM_REF", "SILENT_FALLBACK", "REFERENCE_PRECOMPUTE_REPLAY", "TORCH_COMPILE_CACHE",
