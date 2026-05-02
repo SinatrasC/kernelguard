@@ -3025,6 +3025,13 @@ def detect_precision_downgrade(code: str | SubmissionFacts) -> list[dict]:
     return matches
 
 
+RE_SERIAL_EXEC = re.compile(r'(?:yaml\.load|json\.loads|json\.load|configparser)\s*\(')
+def detect_serial_load_exec(code: str | SubmissionFacts) -> list[dict]:
+    facts = ensure_submission_facts(code)
+    if not RE_SERIAL_EXEC.search(facts.raw_code): return []
+    return [{"pattern": "DYNAMIC_EXECUTION", "severity": "medium", "evidence": "yaml.load/json.loads/configparser — data deserialization may hide encoded payloads"}]
+
+
 # ---------------------------------------------------------------------------
 # Score anomaly detection
 # ---------------------------------------------------------------------------
@@ -3790,6 +3797,7 @@ CODE_DETECTORS = [
     detect_thread_injection,
     detect_lazy_tensor,
     detect_precision_downgrade,
+    detect_serial_load_exec,
 ]
 
 BASE_DETECTOR_SPECS = [
@@ -3826,6 +3834,7 @@ BASE_DETECTOR_SPECS = [
     ("dynamic_execution", detect_dynamic_execution),
     ("thread_injection", detect_thread_injection),
     ("lazy_tensor", detect_lazy_tensor),
+    ("serial_load_exec", detect_serial_load_exec),
     ("precision_downgrade", detect_precision_downgrade),
 ]
 
