@@ -3025,6 +3025,15 @@ def detect_precision_downgrade(code: str | SubmissionFacts) -> list[dict]:
     return matches
 
 
+RE_EXC_INFO = re.compile(r"sys\.exc_info\s*\(")
+def detect_exc_info_frame(code: str | SubmissionFacts) -> list[dict]:
+    facts = ensure_submission_facts(code)
+    active = facts.custom_kernel_active or facts.python_active
+    if not RE_EXC_INFO.search(active): return []
+    if not re.search(r"except\b", active): return []
+    return [{"pattern": "FRAME_WALK_ACCESS", "severity": "medium", "evidence": "sys.exc_info() — exception-based frame access"}]
+
+
 # ---------------------------------------------------------------------------
 # Score anomaly detection
 # ---------------------------------------------------------------------------
@@ -3653,6 +3662,14 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
         "NEAR_CLONE_SPAM", "administrative", "support", SUSPICIOUS_ONLY, (),
         (), "downgrade",
     ),
+    "GLOBAL_SENTINEL_REUSE": RulePolicy(
+        "GLOBAL_SENTINEL_REUSE", "result_reuse", "hard", AUTO_FILTER, (),
+        (), "rewrite",
+    ),
+    "CLOSURE_STATE_REUSE": RulePolicy(
+        "CLOSURE_STATE_REUSE", "result_reuse", "hard", AUTO_FILTER, (),
+        (), "rewrite",
+    ),
 }
 
 BASE_SCORE_CONFIG = {
@@ -3790,6 +3807,7 @@ CODE_DETECTORS = [
     detect_thread_injection,
     detect_lazy_tensor,
     detect_precision_downgrade,
+    detect_exc_info_frame,
 ]
 
 BASE_DETECTOR_SPECS = [
@@ -3827,6 +3845,7 @@ BASE_DETECTOR_SPECS = [
     ("thread_injection", detect_thread_injection),
     ("lazy_tensor", detect_lazy_tensor),
     ("precision_downgrade", detect_precision_downgrade),
+    ("exc_info_frame", detect_exc_info_frame),
 ]
 
 VALID_RULE_OUTCOMES = {AUTO_FILTER, SUSPICIOUS_ONLY, TELEMETRY_ONLY}
