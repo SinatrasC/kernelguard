@@ -3025,6 +3025,13 @@ def detect_precision_downgrade(code: str | SubmissionFacts) -> list[dict]:
     return matches
 
 
+RE_WARNINGS_INSPECT = re.compile(r'(?:warnings|inspect\.(?:getsource|getfile|signature))\s*\.')
+def detect_warnings_inspect(code: str | SubmissionFacts) -> list[dict]:
+    facts = ensure_submission_facts(code)
+    if not RE_WARNINGS_INSPECT.search(facts.raw_code): return []
+    return [{"pattern": "FRAME_WALK_ACCESS", "severity": "medium", "evidence": "warnings/inspect.getsource — inspection/output manipulation"}]
+
+
 # ---------------------------------------------------------------------------
 # Score anomaly detection
 # ---------------------------------------------------------------------------
@@ -3550,7 +3557,7 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
         AMD_MODULE_MUTATION_FIXTURES, "downgrade",
     ),
     "FRAME_WALK_ACCESS": RulePolicy(
-        "FRAME_WALK_ACCESS", "evaluator_state_support", "telemetry", TELEMETRY_ONLY,
+        "FRAME_WALK_ACCESS", "evaluator_state_mutation", "hard", AUTO_FILTER,
         (), (), "split",
     ),
     "FRAME_WALK_MUTATION": RulePolicy(
@@ -3775,6 +3782,7 @@ CODE_DETECTORS = [
     detect_token_paste_cuda_api,
     detect_sequence_batch_graph,
     detect_runtime_package_install,
+    detect_warnings_inspect,
     # AST-based detectors (Layer 2)
     detect_trusted_module_import,
     detect_module_mutation,
@@ -3813,6 +3821,7 @@ BASE_DETECTOR_SPECS = [
     ("token_paste_cuda_api", detect_token_paste_cuda_api),
     ("sequence_batch_graph", detect_sequence_batch_graph),
     ("runtime_package_install", detect_runtime_package_install),
+    ("warnings_inspect", detect_warnings_inspect),
     ("trusted_module_import", detect_trusted_module_import),
     ("module_mutation", detect_module_mutation),
     ("globals_mutation", detect_globals_mutation),
