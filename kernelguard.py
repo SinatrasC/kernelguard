@@ -3025,6 +3025,15 @@ def detect_precision_downgrade(code: str | SubmissionFacts) -> list[dict]:
     return matches
 
 
+def detect_set_name_cache(code: str | SubmissionFacts) -> list[dict]:
+    facts = ensure_submission_facts(code)
+    code = facts.raw_code
+    if re.search(r'def\s+__set_name__\s*\(', code) and re.search(r'def\s+__get__\s*\(', code):
+        if re.search(r'__set_name__.*?\w+\s*=\s*\{\}', code, re.DOTALL):
+            return [{"pattern": "SET_NAME_CACHE", "severity": "critical", "evidence": "__set_name__ descriptor with __get__ dict cache (metadata-tag caching bypass)"}]
+    return []
+
+
 # ---------------------------------------------------------------------------
 # Score anomaly detection
 # ---------------------------------------------------------------------------
@@ -3653,6 +3662,10 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
         "NEAR_CLONE_SPAM", "administrative", "support", SUSPICIOUS_ONLY, (),
         (), "downgrade",
     ),
+    "SET_NAME_CACHE": RulePolicy(
+        "SET_NAME_CACHE", "result_reuse", "hard", AUTO_FILTER, (),
+        (), "keep",
+    ),
 }
 
 BASE_SCORE_CONFIG = {
@@ -3790,6 +3803,7 @@ CODE_DETECTORS = [
     detect_thread_injection,
     detect_lazy_tensor,
     detect_precision_downgrade,
+    detect_set_name_cache,
 ]
 
 BASE_DETECTOR_SPECS = [
@@ -3827,6 +3841,7 @@ BASE_DETECTOR_SPECS = [
     ("thread_injection", detect_thread_injection),
     ("lazy_tensor", detect_lazy_tensor),
     ("precision_downgrade", detect_precision_downgrade),
+    ("set_name_cache", detect_set_name_cache),
 ]
 
 VALID_RULE_OUTCOMES = {AUTO_FILTER, SUSPICIOUS_ONLY, TELEMETRY_ONLY}
