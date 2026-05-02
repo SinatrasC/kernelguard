@@ -3025,6 +3025,16 @@ def detect_precision_downgrade(code: str | SubmissionFacts) -> list[dict]:
     return matches
 
 
+def detect_autograd_function_forward(code_or_facts):
+    facts = ensure_submission_facts(code_or_facts)
+    if not facts.python_active: return []
+    has_autograd_fn = bool(re.search(r'torch\.autograd\.Function', facts.raw_code))
+    has_forward = bool(re.search(r'def\s+forward\s*\([^)]*\)', facts.raw_code))
+    if has_autograd_fn and has_forward:
+        return [{"pattern": "LAZY_TENSOR", "severity": "high", "evidence": "torch.autograd.Function subclass — computation entrypoint bypass"}]
+    return []
+
+
 # ---------------------------------------------------------------------------
 # Score anomaly detection
 # ---------------------------------------------------------------------------
@@ -3790,6 +3800,7 @@ CODE_DETECTORS = [
     detect_thread_injection,
     detect_lazy_tensor,
     detect_precision_downgrade,
+    detect_autograd_function_forward,
 ]
 
 BASE_DETECTOR_SPECS = [
@@ -3827,6 +3838,7 @@ BASE_DETECTOR_SPECS = [
     ("thread_injection", detect_thread_injection),
     ("lazy_tensor", detect_lazy_tensor),
     ("precision_downgrade", detect_precision_downgrade),
+    ("autograd_function_forward", detect_autograd_function_forward),
 ]
 
 VALID_RULE_OUTCOMES = {AUTO_FILTER, SUSPICIOUS_ONLY, TELEMETRY_ONLY}
