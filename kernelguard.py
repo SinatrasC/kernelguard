@@ -2462,6 +2462,132 @@ def detect_last_call_replay(code: str | SubmissionFacts) -> list[dict]:
     return []
 
 
+def detect_pop_restore_replay(code: str | SubmissionFacts) -> list[dict]:
+    """Pattern: pop saved state, restore it, then return the saved value."""
+    facts = ensure_submission_facts(code)
+    tree = facts.ast_tree
+    if tree is None:
+        return []
+    entrypoint_name = entrypoint_label(facts.entrypoint_name)
+
+    states = {
+        stmt.targets[0].id
+        for stmt in tree.body
+        if isinstance(stmt, ast.Assign)
+        and len(stmt.targets) == 1
+        and isinstance(stmt.targets[0], ast.Name)
+        and (
+            isinstance(stmt.value, (ast.List, ast.Dict))
+            or (
+                isinstance(stmt.value, ast.Call)
+                and _ast_root_name(stmt.value.func) == "deque"
+            )
+        )
+    }
+
+    def _param_names(node: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
+        params = {arg.arg for arg in node.args.args}
+        params.update(arg.arg for arg in node.args.posonlyargs)
+        params.update(arg.arg for arg in node.args.kwonlyargs)
+        return params
+
+    def _pop_assign(stmt: ast.stmt) -> tuple[str, str] | None:
+        if not (
+            isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name)
+            and isinstance(stmt.value, ast.Call)
+            and isinstance(stmt.value.func, ast.Attribute)
+            and stmt.value.func.attr == "pop"
+        ):
+            return None
+        root = _ast_root_name(stmt.value.func.value)
+        if root in states:
+            return stmt.targets[0].id, root
+        return None
+
+    def _restores_value(stmt: ast.stmt, local: str, root: str) -> bool:
+        if isinstance(stmt, ast.Assign) and isinstance(stmt.value, ast.Name) and stmt.value.id == local:
+            return any(_ast_root_name(target) == root for target in stmt.targets)
+        if not (
+            isinstance(stmt, ast.Expr)
+            and isinstance(stmt.value, ast.Call)
+            and isinstance(stmt.value.func, ast.Attribute)
+            and stmt.value.func.attr in {"append", "appendleft", "__setitem__"}
+            and _ast_root_name(stmt.value.func.value) == root
+        ):
+            return False
+        return any(isinstance(arg, ast.Name) and arg.id == local for arg in stmt.value.args)
+
+    def _returns_value(stmt: ast.stmt, local: str) -> bool:
+        return (
+            isinstance(stmt, ast.Return)
+            and isinstance(stmt.value, ast.Name)
+            and stmt.value.id == local
+        )
+
+    def _stores_input(stmt: ast.stmt, root: str, params: set[str]) -> bool:
+        if isinstance(stmt, ast.Assign) and bool(_expr_names(stmt.value) & params):
+            return any(_ast_root_name(target) == root for target in stmt.targets)
+        if not (
+            isinstance(stmt, ast.Expr)
+            and isinstance(stmt.value, ast.Call)
+            and isinstance(stmt.value.func, ast.Attribute)
+            and stmt.value.func.attr in {"append", "appendleft", "__setitem__"}
+            and _ast_root_name(stmt.value.func.value) == root
+        ):
+            return False
+        return any(bool(_expr_names(arg) & params) for arg in stmt.value.args)
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not is_entrypoint_name(node.name):
+            continue
+
+        params = _param_names(node)
+        input_stores = {
+            root
+            for stmt in ast.walk(node)
+            for root in states
+            if _stores_input(stmt, root, params)
+        }
+        if not input_stores:
+            continue
+
+        for child in ast.walk(node):
+            if not isinstance(child, ast.If):
+                continue
+            if _expr_names(child.test) & params:
+                continue
+            tested = _expr_names(child.test) & input_stores
+            if not tested:
+                continue
+            pop_info = next(
+                (info for stmt in child.body for info in [_pop_assign(stmt)] if info is not None),
+                None,
+            )
+            if pop_info is None:
+                continue
+            local, root = pop_info
+            if root not in tested:
+                continue
+            if not any(_restores_value(stmt, local, root) for stmt in child.body):
+                continue
+            if not any(_returns_value(stmt, local) for stmt in child.body):
+                continue
+            return [{
+                "pattern": "POP_RESTORE_REPLAY",
+                "severity": "critical",
+                "evidence": (
+                    f"{entrypoint_name} pops stored output, restores it, "
+                    "and returns the saved value"
+                ),
+            }]
+
+    return []
+
+
 RE_OBJECT_ID_DATA = re.compile(r"\bdata_id\s*=\s*id\s*\(\s*data\s*\)")
 RE_RESULT_BANK_SET = re.compile(r"_superbatch_results\s*\[\s*(?:did|data_id)\s*\]\s*=")
 RE_RESULT_BANK_RETURN = re.compile(r"return\s+_superbatch_results\s*\[\s*data_id\s*\]")
@@ -3479,6 +3605,10 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
         "LAST_CALL_REPLAY", "result_reuse", "hard", AUTO_FILTER, (),
         AMD_MANUAL_LAST_CALL_REPLAY_FIXTURES, "keep",
     ),
+    "POP_RESTORE_REPLAY": RulePolicy(
+        "POP_RESTORE_REPLAY", "result_reuse", "hard", AUTO_FILTER, (),
+        (), "keep",
+    ),
     "SHAPE_OUTPUT_REPLAY": RulePolicy(
         "SHAPE_OUTPUT_REPLAY", "result_reuse", "hard", AUTO_FILTER, (),
         AMD_PACKAGE_SHAPE_REPLAY_FIXTURES, "keep",
@@ -3762,6 +3892,7 @@ CODE_DETECTORS = [
     detect_decode_mm_ref,
     detect_result_caching,
     detect_last_call_replay,
+    detect_pop_restore_replay,
     detect_shape_output_replay,
     detect_timed_input_replay,
     detect_cuda_graph_replay,
@@ -3800,6 +3931,7 @@ BASE_DETECTOR_SPECS = [
     ("decode_mm_ref", detect_decode_mm_ref),
     ("result_caching", detect_result_caching),
     ("last_call_replay", detect_last_call_replay),
+    ("pop_restore_replay", detect_pop_restore_replay),
     ("shape_output_replay", detect_shape_output_replay),
     ("timed_input_replay", detect_timed_input_replay),
     ("cuda_graph_replay", detect_cuda_graph_replay),
@@ -4696,7 +4828,7 @@ AUDIT_RULE_ORDER = [
     "EVALUATOR_EXPLOIT", "HARNESS_RUNTIME_PATCHING", "MODULE_MUTATION", "GLOBALS_MUTATION", "CODE_REPLACEMENT",
     "FRAME_WALK_ACCESS", "FRAME_WALK_MUTATION", "SYS_MODULES_ACCESS", "GLOBALS_ACCESS", "CODE_ACCESS",
     "TRUSTED_MODULE_IMPORT",
-    "OUTPUT_REPLAY_CACHE", "LAST_CALL_REPLAY", "SHAPE_OUTPUT_REPLAY", "TIMED_INPUT_REPLAY", "CONFIG_CACHE_EXPLOIT", "POINTER_REPLAY", "RESULT_BANK_REPLAY", "PREPROCESS_CACHE", "WORKSPACE_CACHE",
+    "OUTPUT_REPLAY_CACHE", "LAST_CALL_REPLAY", "POP_RESTORE_REPLAY", "SHAPE_OUTPUT_REPLAY", "TIMED_INPUT_REPLAY", "CONFIG_CACHE_EXPLOIT", "POINTER_REPLAY", "RESULT_BANK_REPLAY", "PREPROCESS_CACHE", "WORKSPACE_CACHE",
     "RUNNER_PLAN_CACHE", "CUDA_GRAPH_PYTHON", "CUDA_GRAPH_REPLAY",
     "TIMER_MONKEYPATCH", "FAKE_BENCHMARK_EMIT", "STDIO_REDIRECT", "UNSYNC_MULTISTREAM", "CUDA_EVENT_DISABLE_TIMING",
     "SCALED_MM_REF", "DECODE_MM_REF", "SILENT_FALLBACK", "REFERENCE_PRECOMPUTE_REPLAY", "TORCH_COMPILE_CACHE",
