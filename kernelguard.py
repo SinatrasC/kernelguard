@@ -3025,6 +3025,12 @@ def detect_precision_downgrade(code: str | SubmissionFacts) -> list[dict]:
     return matches
 
 
+RE_GLOB_LINECACHE = re.compile(r'(?:glob|fnmatch|linecache)\s*\.')
+def detect_glob_linecache(code: str | SubmissionFacts) -> list[dict]:
+    facts = ensure_submission_facts(code)
+    if not RE_GLOB_LINECACHE.search(facts.raw_code): return []
+    return [{"pattern": "RUNTIME_PACKAGE_INSTALL", "severity": "medium", "evidence": "glob/fnmatch/linecache — filesystem/line access outside expected scope"}]
+
 # ---------------------------------------------------------------------------
 # Score anomaly detection
 # ---------------------------------------------------------------------------
@@ -3790,6 +3796,7 @@ CODE_DETECTORS = [
     detect_thread_injection,
     detect_lazy_tensor,
     detect_precision_downgrade,
+    detect_glob_linecache,
 ]
 
 BASE_DETECTOR_SPECS = [
@@ -3827,6 +3834,7 @@ BASE_DETECTOR_SPECS = [
     ("thread_injection", detect_thread_injection),
     ("lazy_tensor", detect_lazy_tensor),
     ("precision_downgrade", detect_precision_downgrade),
+    ("glob_linecache", detect_glob_linecache),
 ]
 
 VALID_RULE_OUTCOMES = {AUTO_FILTER, SUSPICIOUS_ONLY, TELEMETRY_ONLY}
