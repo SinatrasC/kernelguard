@@ -638,6 +638,71 @@ def _input_float_return_from_body(body: list[ast.stmt], params: set[str]) -> boo
     return saw_return
 
 
+def _nonlocal_input_float_state(fn: ast.FunctionDef | ast.AsyncFunctionDef, local_none: set[str]) -> Optional[str]:
+    params = {arg.arg for arg in fn.args.args}
+    nonlocal_names = {
+        name
+        for stmt in fn.body
+        if isinstance(stmt, ast.Nonlocal)
+        for name in stmt.names
+    }
+    state_names = nonlocal_names & local_none
+    if not state_names:
+        return None
+
+    for state_name in state_names:
+        has_guard = False
+        has_store = False
+        has_return = False
+
+        for stmt in fn.body:
+            if isinstance(stmt, (ast.Nonlocal, ast.Pass)):
+                continue
+            if isinstance(stmt, ast.If):
+                test = stmt.test
+                has_guard = (
+                    isinstance(test, ast.Compare)
+                    and isinstance(test.left, ast.Name)
+                    and test.left.id == state_name
+                    and len(test.ops) == 1
+                    and isinstance(test.ops[0], ast.IsNot)
+                    and len(test.comparators) == 1
+                    and isinstance(test.comparators[0], ast.Constant)
+                    and test.comparators[0].value is None
+                    and len(stmt.body) == 1
+                    and isinstance(stmt.body[0], ast.Return)
+                    and isinstance(stmt.body[0].value, ast.Name)
+                    and stmt.body[0].value.id == state_name
+                    and not stmt.orelse
+                    and not _body_has_calls(stmt.body)
+                )
+                if not has_guard:
+                    return None
+                continue
+            if (
+                isinstance(stmt, ast.Assign)
+                and len(stmt.targets) == 1
+                and isinstance(stmt.targets[0], ast.Name)
+                and stmt.targets[0].id == state_name
+                and _is_input_float_call(stmt.value, params)
+            ):
+                has_store = True
+                continue
+            if (
+                isinstance(stmt, ast.Return)
+                and isinstance(stmt.value, ast.Name)
+                and stmt.value.id == state_name
+            ):
+                has_return = True
+                continue
+            return None
+
+        if has_guard and has_store and has_return:
+            return state_name
+
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Detectors
 # ---------------------------------------------------------------------------
@@ -1277,6 +1342,38 @@ def detect_input_passthrough_output(code: str | SubmissionFacts) -> list[dict]:
                 "pattern": "INPUT_PASSTHROUGH_OUTPUT",
                 "severity": "critical",
                 "evidence": f"{entrypoint_name} returns an input tensor cast to float without compute",
+            }]
+        local_none = {
+            target.id
+            for stmt in node.body
+            if isinstance(stmt, ast.Assign)
+            and isinstance(stmt.value, ast.Constant)
+            and stmt.value.value is None
+            for target in stmt.targets
+            if isinstance(target, ast.Name)
+        }
+        nonlocal_helpers = {
+            stmt.name
+            for stmt in node.body
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and _nonlocal_input_float_state(stmt, local_none) is not None
+        }
+        for stmt in node.body:
+            if not (
+                isinstance(stmt, ast.Return)
+                and isinstance(stmt.value, ast.Call)
+                and isinstance(stmt.value.func, ast.Name)
+                and stmt.value.func.id in nonlocal_helpers
+                and len(stmt.value.args) == 1
+                and isinstance(stmt.value.args[0], ast.Name)
+                and stmt.value.args[0].id in params
+                and not stmt.value.keywords
+            ):
+                continue
+            return [{
+                "pattern": "INPUT_PASSTHROUGH_OUTPUT",
+                "severity": "critical",
+                "evidence": f"{entrypoint_name} delegates to nonlocal state that stores input.float()",
             }]
 
     for stmt in tree.body:
