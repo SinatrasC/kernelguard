@@ -565,6 +565,13 @@ def _is_input_float_call(expr: ast.AST | None, params: set[str]) -> bool:
     )
 
 
+def _lambda_returns_input_float(expr: ast.AST | None) -> bool:
+    if not isinstance(expr, ast.Lambda):
+        return False
+    params = {arg.arg for arg in expr.args.args}
+    return _is_input_float_call(expr.body, params)
+
+
 def _is_noop_context_call(expr: ast.AST | None) -> bool:
     if not isinstance(expr, ast.Call):
         return False
@@ -1234,6 +1241,8 @@ def detect_input_passthrough_output(code: str | SubmissionFacts) -> list[dict]:
         return []
     entrypoint_name = entrypoint_label(facts.entrypoint_name)
     callable_entrypoint_classes: set[str] = set()
+    dynamic_callable_classes: set[str] = set()
+    dynamic_callable_instances: set[str] = set()
 
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -1250,6 +1259,30 @@ def detect_input_passthrough_output(code: str | SubmissionFacts) -> list[dict]:
                 "severity": "critical",
                 "evidence": f"{entrypoint_name} returns an input tensor cast to float without compute",
             }]
+
+    for stmt in tree.body:
+        if not isinstance(stmt, ast.Assign):
+            continue
+        target_names = {t.id for t in stmt.targets if isinstance(t, ast.Name)}
+        if (
+            isinstance(stmt.value, ast.Call)
+            and isinstance(stmt.value.func, ast.Name)
+            and stmt.value.func.id == "type"
+            and len(stmt.value.args) >= 3
+            and isinstance(stmt.value.args[2], ast.Dict)
+        ):
+            for key, value in zip(stmt.value.args[2].keys, stmt.value.args[2].values):
+                if not (isinstance(key, ast.Constant) and key.value == "__call__"):
+                    continue
+                if _lambda_returns_input_float(value):
+                    dynamic_callable_classes.update(target_names)
+            continue
+        if (
+            isinstance(stmt.value, ast.Call)
+            and isinstance(stmt.value.func, ast.Name)
+            and stmt.value.func.id in dynamic_callable_classes
+        ):
+            dynamic_callable_instances.update(target_names)
 
     for stmt in tree.body:
         if isinstance(stmt, ast.ClassDef) and is_entrypoint_name(stmt.name):
@@ -1277,6 +1310,39 @@ def detect_input_passthrough_output(code: str | SubmissionFacts) -> list[dict]:
                     "severity": "critical",
                     "evidence": f"callable {entrypoint_name} returns an input tensor cast to float without compute",
                 }]
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not is_entrypoint_name(node.name):
+            continue
+        params = {arg.arg for arg in node.args.args}
+
+        for stmt in node.body:
+            if isinstance(stmt, (ast.Import, ast.ImportFrom, ast.Pass)):
+                continue
+            if (
+                isinstance(stmt, ast.Expr)
+                and isinstance(stmt.value, ast.Constant)
+                and isinstance(stmt.value.value, str)
+            ):
+                continue
+            if not (
+                isinstance(stmt, ast.Return)
+                and isinstance(stmt.value, ast.Call)
+                and isinstance(stmt.value.func, ast.Name)
+                and stmt.value.func.id in dynamic_callable_instances
+                and len(stmt.value.args) == 1
+                and isinstance(stmt.value.args[0], ast.Name)
+                and stmt.value.args[0].id in params
+                and not stmt.value.keywords
+            ):
+                break
+            return [{
+                "pattern": "INPUT_PASSTHROUGH_OUTPUT",
+                "severity": "critical",
+                "evidence": f"{entrypoint_name} delegates to a dynamic callable that returns input.float()",
+            }]
 
     return []
 
