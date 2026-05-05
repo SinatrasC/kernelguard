@@ -638,6 +638,48 @@ def _input_float_return_from_body(body: list[ast.stmt], params: set[str]) -> boo
     return saw_return
 
 
+def _global_ifexp_input_float_return(
+    body: list[ast.stmt],
+    params: set[str],
+    global_names: set[str],
+    none_inited: set[str],
+) -> bool:
+    for stmt in body:
+        if isinstance(stmt, (ast.Import, ast.ImportFrom, ast.Pass, ast.Global)):
+            continue
+        if (
+            isinstance(stmt, ast.Expr)
+            and isinstance(stmt.value, ast.Constant)
+            and isinstance(stmt.value.value, str)
+        ):
+            continue
+        if not isinstance(stmt, ast.Return) or not isinstance(stmt.value, ast.IfExp):
+            return False
+
+        expr = stmt.value
+        if not (
+            isinstance(expr.body, ast.Name)
+            and expr.body.id in global_names
+            and expr.body.id in none_inited
+            and _is_input_float_call(expr.orelse, params)
+        ):
+            return False
+
+        test = expr.test
+        return (
+            isinstance(test, ast.Compare)
+            and isinstance(test.left, ast.Name)
+            and test.left.id == expr.body.id
+            and len(test.ops) == 1
+            and isinstance(test.ops[0], ast.IsNot)
+            and len(test.comparators) == 1
+            and isinstance(test.comparators[0], ast.Constant)
+            and test.comparators[0].value is None
+        )
+
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Detectors
 # ---------------------------------------------------------------------------
@@ -1277,6 +1319,20 @@ def detect_input_passthrough_output(code: str | SubmissionFacts) -> list[dict]:
                 "pattern": "INPUT_PASSTHROUGH_OUTPUT",
                 "severity": "critical",
                 "evidence": f"{entrypoint_name} returns an input tensor cast to float without compute",
+            }]
+        global_names = {
+            name
+            for stmt in node.body
+            if isinstance(stmt, ast.Global)
+            for name in stmt.names
+        }
+        if global_names and _global_ifexp_input_float_return(
+            node.body, params, global_names, facts._none_inited
+        ):
+            return [{
+                "pattern": "INPUT_PASSTHROUGH_OUTPUT",
+                "severity": "critical",
+                "evidence": f"{entrypoint_name} returns global sentinel output or input.float() without compute",
             }]
 
     for stmt in tree.body:
