@@ -638,6 +638,70 @@ def _input_float_return_from_body(body: list[ast.stmt], params: set[str]) -> boo
     return saw_return
 
 
+def _is_none_guarded_return(stmt: ast.stmt, names: set[str]) -> bool:
+    if not isinstance(stmt, ast.If):
+        return False
+    if stmt.orelse:
+        return False
+    test = stmt.test
+    if not (
+        isinstance(test, ast.Compare)
+        and isinstance(test.left, ast.Name)
+        and test.left.id in names
+        and len(test.ops) == 1
+        and isinstance(test.ops[0], ast.IsNot)
+        and len(test.comparators) == 1
+        and isinstance(test.comparators[0], ast.Constant)
+        and test.comparators[0].value is None
+    ):
+        return False
+    returns = [child for child in stmt.body if isinstance(child, ast.Return)]
+    return (
+        len(returns) == 1
+        and isinstance(returns[0].value, ast.Name)
+        and returns[0].value.id == test.left.id
+        and not _body_has_calls(stmt.body)
+    )
+
+
+def _optional_cache_input_float_return(
+    body: list[ast.stmt],
+    data_params: set[str],
+    cache_params: set[str],
+) -> bool:
+    aliases: set[str] = set()
+    saw_guard = False
+
+    for stmt in body:
+        if isinstance(stmt, (ast.Import, ast.ImportFrom, ast.Pass)):
+            continue
+        if (
+            isinstance(stmt, ast.Expr)
+            and isinstance(stmt.value, ast.Constant)
+            and isinstance(stmt.value.value, str)
+        ):
+            continue
+        if not saw_guard and _is_none_guarded_return(stmt, cache_params):
+            saw_guard = True
+            continue
+        if (
+            isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name)
+            and _is_input_float_call(stmt.value, data_params)
+        ):
+            aliases.add(stmt.targets[0].id)
+            continue
+        if isinstance(stmt, ast.Return):
+            return saw_guard and (
+                _is_input_float_call(stmt.value, data_params)
+                or (isinstance(stmt.value, ast.Name) and stmt.value.id in aliases)
+            )
+        return False
+
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Detectors
 # ---------------------------------------------------------------------------
@@ -1277,6 +1341,19 @@ def detect_input_passthrough_output(code: str | SubmissionFacts) -> list[dict]:
                 "pattern": "INPUT_PASSTHROUGH_OUTPUT",
                 "severity": "critical",
                 "evidence": f"{entrypoint_name} returns an input tensor cast to float without compute",
+            }]
+        default_args = node.args.args[-len(node.args.defaults):] if node.args.defaults else []
+        cache_params = {
+            arg.arg
+            for arg, default in zip(default_args, node.args.defaults)
+            if isinstance(default, ast.Constant) and default.value is None
+        }
+        data_params = params - cache_params
+        if cache_params and _optional_cache_input_float_return(node.body, data_params, cache_params):
+            return [{
+                "pattern": "INPUT_PASSTHROUGH_OUTPUT",
+                "severity": "critical",
+                "evidence": f"{entrypoint_name} returns optional cached output or input.float() without compute",
             }]
 
     for stmt in tree.body:
