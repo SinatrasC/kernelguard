@@ -572,6 +572,21 @@ def _lambda_returns_input_float(expr: ast.AST | None) -> bool:
     return _is_input_float_call(expr.body, params)
 
 
+def _input_attr_float_storage(expr: ast.AST | None, owners: set[str]) -> Optional[str]:
+    if not (
+        isinstance(expr, ast.Call)
+        and isinstance(expr.func, ast.Attribute)
+        and expr.func.attr == "float"
+        and not expr.args
+        and not expr.keywords
+        and isinstance(expr.func.value, ast.Attribute)
+        and isinstance(expr.func.value.value, ast.Name)
+        and expr.func.value.value.id in owners
+    ):
+        return None
+    return expr.func.value.attr
+
+
 def _is_noop_context_call(expr: ast.AST | None) -> bool:
     if not isinstance(expr, ast.Call):
         return False
@@ -1245,6 +1260,8 @@ def detect_input_passthrough_output(code: str | SubmissionFacts) -> list[dict]:
     dynamic_callable_instances: set[str] = set()
     subclass_hook_bases: set[str] = set()
     subclass_entrypoint_classes: set[str] = set()
+    descriptor_classes: dict[str, str] = {}
+    wrapper_descriptor_attrs: dict[tuple[str, str], str] = {}
 
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -1334,6 +1351,101 @@ def detect_input_passthrough_output(code: str | SubmissionFacts) -> list[dict]:
             "severity": "critical",
             "evidence": f"{entrypoint_name} is installed by __init_subclass__ as input.float()",
         }]
+
+    for stmt in tree.body:
+        if not isinstance(stmt, ast.ClassDef):
+            continue
+        for child in stmt.body:
+            if not isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if child.name != "__get__" or len(child.args.args) < 2:
+                continue
+            owner_name = child.args.args[1].arg
+            returns = [s for s in child.body if isinstance(s, ast.Return)]
+            if len(returns) != 1:
+                continue
+            storage_attr = _input_attr_float_storage(returns[0].value, {owner_name})
+            if storage_attr is not None:
+                descriptor_classes[stmt.name] = storage_attr
+
+    for stmt in tree.body:
+        if not isinstance(stmt, ast.ClassDef):
+            continue
+
+        descriptor_attrs: dict[str, str] = {}
+        for child in stmt.body:
+            if not isinstance(child, ast.Assign):
+                continue
+            if not (
+                isinstance(child.value, ast.Call)
+                and isinstance(child.value.func, ast.Name)
+                and child.value.func.id in descriptor_classes
+            ):
+                continue
+            for target in child.targets:
+                if isinstance(target, ast.Name):
+                    descriptor_attrs[target.id] = descriptor_classes[child.value.func.id]
+
+        if not descriptor_attrs:
+            continue
+
+        init_stores: set[str] = set()
+        for child in stmt.body:
+            if not isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if child.name != "__init__" or not child.args.args:
+                continue
+            self_name = child.args.args[0].arg
+            value_params = {arg.arg for arg in child.args.args[1:]}
+            for assign in ast.walk(child):
+                if not isinstance(assign, ast.Assign):
+                    continue
+                if not (isinstance(assign.value, ast.Name) and assign.value.id in value_params):
+                    continue
+                for target in assign.targets:
+                    if (
+                        isinstance(target, ast.Attribute)
+                        and isinstance(target.value, ast.Name)
+                        and target.value.id == self_name
+                    ):
+                        init_stores.add(target.attr)
+
+        for public_attr, storage_attr in descriptor_attrs.items():
+            if storage_attr in init_stores:
+                wrapper_descriptor_attrs[(stmt.name, public_attr)] = storage_attr
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not is_entrypoint_name(node.name):
+            continue
+        params = {arg.arg for arg in node.args.args}
+        for stmt in node.body:
+            if isinstance(stmt, (ast.Import, ast.ImportFrom, ast.Pass)):
+                continue
+            if (
+                isinstance(stmt, ast.Expr)
+                and isinstance(stmt.value, ast.Constant)
+                and isinstance(stmt.value.value, str)
+            ):
+                continue
+            if not (
+                isinstance(stmt, ast.Return)
+                and isinstance(stmt.value, ast.Attribute)
+                and isinstance(stmt.value.value, ast.Call)
+                and isinstance(stmt.value.value.func, ast.Name)
+                and (stmt.value.value.func.id, stmt.value.attr) in wrapper_descriptor_attrs
+                and len(stmt.value.value.args) == 1
+                and isinstance(stmt.value.value.args[0], ast.Name)
+                and stmt.value.value.args[0].id in params
+                and not stmt.value.value.keywords
+            ):
+                break
+            return [{
+                "pattern": "INPUT_PASSTHROUGH_OUTPUT",
+                "severity": "critical",
+                "evidence": f"{entrypoint_name} returns a descriptor-backed input.float() value",
+            }]
 
     for stmt in tree.body:
         if isinstance(stmt, ast.ClassDef) and is_entrypoint_name(stmt.name):
