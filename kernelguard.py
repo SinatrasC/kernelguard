@@ -579,6 +579,29 @@ def _is_input_reduction_call(expr: ast.AST | None, params: set[str], torch_alias
     )
 
 
+def _is_param_t_call(expr: ast.AST | None, param: str) -> bool:
+    return (
+        isinstance(expr, ast.Call)
+        and isinstance(expr.func, ast.Attribute)
+        and expr.func.attr == "t"
+        and isinstance(expr.func.value, ast.Name)
+        and expr.func.value.id == param
+        and not expr.args
+        and not expr.keywords
+    )
+
+
+def _is_self_matmul_expr(expr: ast.AST | None, params: set[str]) -> bool:
+    if isinstance(expr, ast.BinOp) and isinstance(expr.op, ast.MatMult):
+        return any(
+            isinstance(expr.left, ast.Name)
+            and expr.left.id == param
+            and _is_param_t_call(expr.right, param)
+            for param in params
+        )
+    return False
+
+
 def _lambda_returns_input_float(expr: ast.AST | None) -> bool:
     if not isinstance(expr, ast.Lambda):
         return False
@@ -679,6 +702,40 @@ def _input_reduction_return_from_body(
             continue
         if isinstance(stmt, ast.Return):
             if _is_input_reduction_call(stmt.value, params, torch_aliases):
+                saw_return = True
+                continue
+            if isinstance(stmt.value, ast.Name) and stmt.value.id in aliases:
+                saw_return = True
+                continue
+            return False
+        return False
+
+    return saw_return
+
+
+def _self_matmul_return_from_body(body: list[ast.stmt], params: set[str]) -> bool:
+    aliases: set[str] = set()
+    saw_return = False
+
+    for stmt in body:
+        if isinstance(stmt, (ast.Import, ast.ImportFrom, ast.Pass)):
+            continue
+        if (
+            isinstance(stmt, ast.Expr)
+            and isinstance(stmt.value, ast.Constant)
+            and isinstance(stmt.value.value, str)
+        ):
+            continue
+        if (
+            isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name)
+            and _is_self_matmul_expr(stmt.value, params)
+        ):
+            aliases.add(stmt.targets[0].id)
+            continue
+        if isinstance(stmt, ast.Return):
+            if _is_self_matmul_expr(stmt.value, params):
                 saw_return = True
                 continue
             if isinstance(stmt.value, ast.Name) and stmt.value.id in aliases:
@@ -1587,6 +1644,69 @@ def detect_input_reduction_output(code: str | SubmissionFacts) -> list[dict]:
                 "pattern": "INPUT_REDUCTION_OUTPUT",
                 "severity": "critical",
                 "evidence": f"{entrypoint_name} returns torch.any/all(input) without compute",
+            }]
+
+    return []
+
+
+def detect_partial_self_matmul_output(code: str | SubmissionFacts) -> list[dict]:
+    """Pattern: custom_kernel partial wraps helper returning data @ data.t()."""
+    facts = ensure_submission_facts(code)
+    tree = facts.ast_tree
+    if tree is None:
+        return []
+    helper_names: set[str] = set()
+    partial_aliases = {"partial"}
+    functools_aliases = {"functools"}
+
+    for node in facts._imports:
+        for alias in node.names:
+            if alias.name == "functools":
+                functools_aliases.add(alias.asname or alias.name)
+    for node in facts._import_froms:
+        if node.module != "functools":
+            continue
+        for alias in node.names:
+            if alias.name == "partial":
+                partial_aliases.add(alias.asname or alias.name)
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        params = {arg.arg for arg in node.args.args}
+        if params and _self_matmul_return_from_body(node.body, params):
+            helper_names.add(node.name)
+
+    for stmt in tree.body:
+        if not isinstance(stmt, ast.Assign):
+            continue
+        if not any(isinstance(t, ast.Name) and is_entrypoint_name(t.id) for t in stmt.targets):
+            continue
+        value = stmt.value
+        if not (
+            isinstance(value, ast.Call)
+            and len(value.args) == 1
+            and isinstance(value.args[0], ast.Name)
+            and value.args[0].id in helper_names
+            and not value.keywords
+        ):
+            continue
+        if isinstance(value.func, ast.Name) and value.func.id in partial_aliases:
+            return [{
+                "pattern": "SELF_MATMUL_OUTPUT",
+                "severity": "critical",
+                "evidence": "custom_kernel partial wraps helper returning data @ data.t()",
+            }]
+        if (
+            isinstance(value.func, ast.Attribute)
+            and value.func.attr == "partial"
+            and isinstance(value.func.value, ast.Name)
+            and value.func.value.id in functools_aliases
+        ):
+            return [{
+                "pattern": "SELF_MATMUL_OUTPUT",
+                "severity": "critical",
+                "evidence": "custom_kernel functools.partial wraps helper returning data @ data.t()",
             }]
 
     return []
@@ -3948,6 +4068,10 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
         "INPUT_REDUCTION_OUTPUT", "fake_output", "hard", AUTO_FILTER, (),
         (), "keep",
     ),
+    "SELF_MATMUL_OUTPUT": RulePolicy(
+        "SELF_MATMUL_OUTPUT", "fake_output", "hard", AUTO_FILTER, (),
+        (), "keep",
+    ),
     "TORCH_COMPILE_CACHE": RulePolicy(
         "TORCH_COMPILE_CACHE", "performance_heuristic", "telemetry", TELEMETRY_ONLY, (),
         (), "downgrade",
@@ -4206,6 +4330,7 @@ CODE_DETECTORS = [
     detect_trivial_probe,
     detect_input_passthrough_output,
     detect_input_reduction_output,
+    detect_partial_self_matmul_output,
     detect_torch_compile_cache,
     detect_cuda_graph_python,
     detect_hardcoded_shapes,
@@ -4246,6 +4371,7 @@ BASE_DETECTOR_SPECS = [
     ("trivial_probe", detect_trivial_probe),
     ("input_passthrough_output", detect_input_passthrough_output),
     ("input_reduction_output", detect_input_reduction_output),
+    ("partial_self_matmul_output", detect_partial_self_matmul_output),
     ("torch_compile_cache", detect_torch_compile_cache),
     ("cuda_graph_python", detect_cuda_graph_python),
     ("hardcoded_shapes", detect_hardcoded_shapes),
