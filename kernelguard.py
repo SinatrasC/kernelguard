@@ -565,6 +565,20 @@ def _is_input_float_call(expr: ast.AST | None, params: set[str]) -> bool:
     )
 
 
+def _is_input_reduction_call(expr: ast.AST | None, params: set[str], torch_aliases: set[str]) -> bool:
+    return (
+        isinstance(expr, ast.Call)
+        and isinstance(expr.func, ast.Attribute)
+        and expr.func.attr in {"any", "all"}
+        and isinstance(expr.func.value, ast.Name)
+        and expr.func.value.id in torch_aliases
+        and len(expr.args) == 1
+        and isinstance(expr.args[0], ast.Name)
+        and expr.args[0].id in params
+        and not expr.keywords
+    )
+
+
 def _lambda_returns_input_float(expr: ast.AST | None) -> bool:
     if not isinstance(expr, ast.Lambda):
         return False
@@ -627,6 +641,44 @@ def _input_float_return_from_body(body: list[ast.stmt], params: set[str]) -> boo
             continue
         if isinstance(stmt, ast.Return):
             if _is_input_float_call(stmt.value, params):
+                saw_return = True
+                continue
+            if isinstance(stmt.value, ast.Name) and stmt.value.id in aliases:
+                saw_return = True
+                continue
+            return False
+        return False
+
+    return saw_return
+
+
+def _input_reduction_return_from_body(
+    body: list[ast.stmt],
+    params: set[str],
+    torch_aliases: set[str],
+) -> bool:
+    aliases: set[str] = set()
+    saw_return = False
+
+    for stmt in body:
+        if isinstance(stmt, (ast.Import, ast.ImportFrom, ast.Pass)):
+            continue
+        if (
+            isinstance(stmt, ast.Expr)
+            and isinstance(stmt.value, ast.Constant)
+            and isinstance(stmt.value.value, str)
+        ):
+            continue
+        if (
+            isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name)
+            and _is_input_reduction_call(stmt.value, params, torch_aliases)
+        ):
+            aliases.add(stmt.targets[0].id)
+            continue
+        if isinstance(stmt, ast.Return):
+            if _is_input_reduction_call(stmt.value, params, torch_aliases):
                 saw_return = True
                 continue
             if isinstance(stmt.value, ast.Name) and stmt.value.id in aliases:
@@ -1505,6 +1557,36 @@ def detect_input_passthrough_output(code: str | SubmissionFacts) -> list[dict]:
                 "pattern": "INPUT_PASSTHROUGH_OUTPUT",
                 "severity": "critical",
                 "evidence": f"{entrypoint_name} delegates to a dynamic callable that returns input.float()",
+            }]
+
+    return []
+
+
+def detect_input_reduction_output(code: str | SubmissionFacts) -> list[dict]:
+    """Pattern: entrypoint returns torch.any/all(input) as fake output."""
+    facts = ensure_submission_facts(code)
+    tree = facts.ast_tree
+    if tree is None:
+        return []
+    entrypoint_name = entrypoint_label(facts.entrypoint_name)
+    torch_aliases = {"torch"}
+
+    for node in facts._imports:
+        for alias in node.names:
+            if alias.name == "torch":
+                torch_aliases.add(alias.asname or alias.name)
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not is_entrypoint_name(node.name):
+            continue
+        params = {arg.arg for arg in node.args.args}
+        if params and _input_reduction_return_from_body(node.body, params, torch_aliases):
+            return [{
+                "pattern": "INPUT_REDUCTION_OUTPUT",
+                "severity": "critical",
+                "evidence": f"{entrypoint_name} returns torch.any/all(input) without compute",
             }]
 
     return []
@@ -3862,6 +3944,10 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
         "INPUT_PASSTHROUGH_OUTPUT", "fake_output", "hard", AUTO_FILTER, (),
         (), "keep",
     ),
+    "INPUT_REDUCTION_OUTPUT": RulePolicy(
+        "INPUT_REDUCTION_OUTPUT", "fake_output", "hard", AUTO_FILTER, (),
+        (), "keep",
+    ),
     "TORCH_COMPILE_CACHE": RulePolicy(
         "TORCH_COMPILE_CACHE", "performance_heuristic", "telemetry", TELEMETRY_ONLY, (),
         (), "downgrade",
@@ -4119,6 +4205,7 @@ CODE_DETECTORS = [
     detect_silent_fallback,
     detect_trivial_probe,
     detect_input_passthrough_output,
+    detect_input_reduction_output,
     detect_torch_compile_cache,
     detect_cuda_graph_python,
     detect_hardcoded_shapes,
@@ -4158,6 +4245,7 @@ BASE_DETECTOR_SPECS = [
     ("silent_fallback", detect_silent_fallback),
     ("trivial_probe", detect_trivial_probe),
     ("input_passthrough_output", detect_input_passthrough_output),
+    ("input_reduction_output", detect_input_reduction_output),
     ("torch_compile_cache", detect_torch_compile_cache),
     ("cuda_graph_python", detect_cuda_graph_python),
     ("hardcoded_shapes", detect_hardcoded_shapes),
