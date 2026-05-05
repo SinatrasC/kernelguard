@@ -591,7 +591,14 @@ def _is_param_t_call(expr: ast.AST | None, param: str) -> bool:
     )
 
 
-def _is_self_matmul_expr(expr: ast.AST | None, params: set[str]) -> bool:
+def _is_self_matmul_expr(
+    expr: ast.AST | None,
+    params: set[str],
+    torch_aliases: Optional[set[str]] = None,
+    mm_aliases: Optional[set[str]] = None,
+) -> bool:
+    torch_aliases = torch_aliases or set()
+    mm_aliases = mm_aliases or set()
     if isinstance(expr, ast.BinOp) and isinstance(expr.op, ast.MatMult):
         return any(
             isinstance(expr.left, ast.Name)
@@ -599,6 +606,26 @@ def _is_self_matmul_expr(expr: ast.AST | None, params: set[str]) -> bool:
             and _is_param_t_call(expr.right, param)
             for param in params
         )
+    if not isinstance(expr, ast.Call):
+        return False
+    if len(expr.args) != 2 or expr.keywords:
+        return False
+    for param in params:
+        if not (
+            isinstance(expr.args[0], ast.Name)
+            and expr.args[0].id == param
+            and _is_param_t_call(expr.args[1], param)
+        ):
+            continue
+        if isinstance(expr.func, ast.Name) and expr.func.id in mm_aliases:
+            return True
+        if (
+            isinstance(expr.func, ast.Attribute)
+            and expr.func.attr in {"mm", "matmul"}
+            and isinstance(expr.func.value, ast.Name)
+            and expr.func.value.id in torch_aliases
+        ):
+            return True
     return False
 
 
@@ -713,7 +740,12 @@ def _input_reduction_return_from_body(
     return saw_return
 
 
-def _self_matmul_return_from_body(body: list[ast.stmt], params: set[str]) -> bool:
+def _self_matmul_return_from_body(
+    body: list[ast.stmt],
+    params: set[str],
+    torch_aliases: Optional[set[str]] = None,
+    mm_aliases: Optional[set[str]] = None,
+) -> bool:
     aliases: set[str] = set()
     saw_return = False
 
@@ -730,12 +762,12 @@ def _self_matmul_return_from_body(body: list[ast.stmt], params: set[str]) -> boo
             isinstance(stmt, ast.Assign)
             and len(stmt.targets) == 1
             and isinstance(stmt.targets[0], ast.Name)
-            and _is_self_matmul_expr(stmt.value, params)
+            and _is_self_matmul_expr(stmt.value, params, torch_aliases, mm_aliases)
         ):
             aliases.add(stmt.targets[0].id)
             continue
         if isinstance(stmt, ast.Return):
-            if _is_self_matmul_expr(stmt.value, params):
+            if _is_self_matmul_expr(stmt.value, params, torch_aliases, mm_aliases):
                 saw_return = True
                 continue
             if isinstance(stmt.value, ast.Name) and stmt.value.id in aliases:
@@ -1658,24 +1690,44 @@ def detect_partial_self_matmul_output(code: str | SubmissionFacts) -> list[dict]
     helper_names: set[str] = set()
     partial_aliases = {"partial"}
     functools_aliases = {"functools"}
+    torch_aliases = {"torch"}
+    mm_aliases: set[str] = set()
 
     for node in facts._imports:
         for alias in node.names:
             if alias.name == "functools":
                 functools_aliases.add(alias.asname or alias.name)
+            if alias.name == "torch":
+                torch_aliases.add(alias.asname or alias.name)
     for node in facts._import_froms:
-        if node.module != "functools":
-            continue
-        for alias in node.names:
-            if alias.name == "partial":
-                partial_aliases.add(alias.asname or alias.name)
+        if node.module == "functools":
+            for alias in node.names:
+                if alias.name == "partial":
+                    partial_aliases.add(alias.asname or alias.name)
+        if node.module == "torch":
+            for alias in node.names:
+                if alias.name in {"mm", "matmul"}:
+                    mm_aliases.add(alias.asname or alias.name)
 
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
         params = {arg.arg for arg in node.args.args}
-        if params and _self_matmul_return_from_body(node.body, params):
+        if params and _self_matmul_return_from_body(node.body, params, torch_aliases, mm_aliases):
             helper_names.add(node.name)
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not is_entrypoint_name(node.name):
+            continue
+        params = {arg.arg for arg in node.args.args}
+        if params and _self_matmul_return_from_body(node.body, params, torch_aliases, mm_aliases):
+            return [{
+                "pattern": "SELF_MATMUL_OUTPUT",
+                "severity": "critical",
+                "evidence": "custom_kernel returns data @ data.t() or equivalent self-matmul",
+            }]
 
     for stmt in tree.body:
         if not isinstance(stmt, ast.Assign):
