@@ -1243,6 +1243,8 @@ def detect_input_passthrough_output(code: str | SubmissionFacts) -> list[dict]:
     callable_entrypoint_classes: set[str] = set()
     dynamic_callable_classes: set[str] = set()
     dynamic_callable_instances: set[str] = set()
+    subclass_hook_bases: set[str] = set()
+    subclass_entrypoint_classes: set[str] = set()
 
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -1283,6 +1285,55 @@ def detect_input_passthrough_output(code: str | SubmissionFacts) -> list[dict]:
             and stmt.value.func.id in dynamic_callable_classes
         ):
             dynamic_callable_instances.update(target_names)
+
+    for stmt in tree.body:
+        if not isinstance(stmt, ast.ClassDef):
+            continue
+        for child in stmt.body:
+            if not isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if child.name != "__init_subclass__":
+                continue
+            params = {arg.arg for arg in child.args.args}
+            for assign in ast.walk(child):
+                if not isinstance(assign, ast.Assign):
+                    continue
+                if not _lambda_returns_input_float(assign.value):
+                    continue
+                for target in assign.targets:
+                    if not isinstance(target, ast.Attribute):
+                        continue
+                    if not is_entrypoint_name(target.attr):
+                        continue
+                    if isinstance(target.value, ast.Name) and target.value.id in params:
+                        subclass_hook_bases.add(stmt.name)
+
+    for stmt in tree.body:
+        if not isinstance(stmt, ast.ClassDef):
+            continue
+        if any(
+            isinstance(base, ast.Name) and base.id in subclass_hook_bases
+            for base in stmt.bases
+        ):
+            subclass_entrypoint_classes.add(stmt.name)
+
+    for stmt in tree.body:
+        if not isinstance(stmt, ast.Assign):
+            continue
+        if not any(isinstance(t, ast.Name) and is_entrypoint_name(t.id) for t in stmt.targets):
+            continue
+        if not (
+            isinstance(stmt.value, ast.Attribute)
+            and is_entrypoint_name(stmt.value.attr)
+            and isinstance(stmt.value.value, ast.Name)
+            and stmt.value.value.id in subclass_entrypoint_classes
+        ):
+            continue
+        return [{
+            "pattern": "INPUT_PASSTHROUGH_OUTPUT",
+            "severity": "critical",
+            "evidence": f"{entrypoint_name} is installed by __init_subclass__ as input.float()",
+        }]
 
     for stmt in tree.body:
         if isinstance(stmt, ast.ClassDef) and is_entrypoint_name(stmt.name):
