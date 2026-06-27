@@ -1069,79 +1069,6 @@ def _detect_aliased_cuda_timer_patch(tree: ast.AST) -> list[dict]:
     ``<base>.<attr> = ...`` WRITES whose base resolves to torch.cuda or the Event
     class and whose name resolves to one of {Event, elapsed_time, synchronize}.
     """
-    cuda_aliases: set[str] = set()
-    event_aliases: set[str] = set()
-
-    def is_torch_cuda(expr: ast.AST | None) -> bool:
-        # torch.cuda (attribute) or getattr(torch, 'cuda'/'cu'+'da')
-        if _ast_dotted_name(expr) == "torch.cuda":
-            return True
-        if (
-            isinstance(expr, ast.Call)
-            and isinstance(expr.func, ast.Name)
-            and expr.func.id == "getattr"
-            and len(expr.args) >= 2
-            and _ast_dotted_name(expr.args[0]) == "torch"
-            and _static_string(expr.args[1]) == "cuda"
-        ):
-            return True
-        return isinstance(expr, ast.Name) and expr.id in cuda_aliases
-
-    def is_event_class(expr: ast.AST | None) -> bool:
-        # torch.cuda.Event, <cuda_alias>.Event, or getattr(<cuda>, 'Event'/'Ev'+'ent')
-        if _ast_dotted_name(expr) == "torch.cuda.Event":
-            return True
-        if (
-            isinstance(expr, ast.Attribute)
-            and expr.attr == "Event"
-            and is_torch_cuda(expr.value)
-        ):
-            return True
-        if (
-            isinstance(expr, ast.Call)
-            and isinstance(expr.func, ast.Name)
-            and expr.func.id == "getattr"
-            and len(expr.args) >= 2
-            and is_torch_cuda(expr.args[0])
-            and _static_string(expr.args[1]) == "Event"
-        ):
-            return True
-        return isinstance(expr, ast.Name) and expr.id in event_aliases
-
-    # Variables bound to a foldable string constant, so a name argument such as
-    # ``m = "elapsed" + "_time"; setattr(E, m, w)`` resolves. Conservative: a
-    # name reassigned to anything non-foldable is dropped (value None).
-    str_vars: dict[str, Optional[str]] = {}
-
-    # First pass (source order): record single-hop aliases for torch.cuda and
-    # the Event class so later setattr/assignment writes can resolve their base,
-    # plus the foldable string-variable map.
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Assign):
-            continue
-        for target in node.targets:
-            if not isinstance(target, ast.Name):
-                continue
-            if is_event_class(node.value):
-                event_aliases.add(target.id)
-            elif is_torch_cuda(node.value):
-                cuda_aliases.add(target.id)
-            else:
-                folded = _static_string(node.value)
-                if folded is not None and target.id not in str_vars:
-                    str_vars[target.id] = folded
-                elif target.id in str_vars and str_vars[target.id] != folded:
-                    str_vars[target.id] = None  # reassigned -> not constant
-
-    def resolve_name(expr: ast.AST | None) -> Optional[str]:
-        """A static string literal/concat, or a foldable string variable."""
-        direct = _static_string(expr)
-        if direct is not None:
-            return direct
-        if isinstance(expr, ast.Name):
-            return str_vars.get(expr.id)
-        return None
-
     seen: set[str] = set()
     matches: list[dict] = []
 
@@ -1156,36 +1083,184 @@ def _detect_aliased_cuda_timer_patch(tree: ast.AST) -> list[dict]:
             "evidence": f"aliased CUDA timer write: {base_desc}.{name} reassigned",
         })
 
-    for node in ast.walk(tree):
-        # setattr(<base>, <name>, ...) -- name may be a folded string expression.
-        if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "setattr"
-            and len(node.args) >= 3
-        ):
-            name = resolve_name(node.args[1])
-            if name in _CUDA_TIMER_WRITE_NAMES:
-                base = node.args[0]
-                if is_event_class(base):
-                    flag("torch.cuda.Event", name)
-                elif is_torch_cuda(base):
-                    flag("torch.cuda", name)
-            continue
+    class ScopeState:
+        def __init__(self, parent: "ScopeState | None" = None) -> None:
+            if parent is None:
+                self.torch_aliases = {"torch"}
+                self.cuda_aliases: set[str] = set()
+                self.event_aliases: set[str] = set()
+                self.str_vars: dict[str, Optional[str]] = {}
+            else:
+                self.torch_aliases = set(parent.torch_aliases)
+                self.cuda_aliases = set(parent.cuda_aliases)
+                self.event_aliases = set(parent.event_aliases)
+                self.str_vars = dict(parent.str_vars)
 
-        # <base>.<attr> = ... assignment WRITE (target side only; reads/calls of
-        # elapsed_time are intentionally ignored).
-        if isinstance(node, (ast.Assign, ast.AnnAssign)):
-            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-            for target in targets:
-                if (
-                    isinstance(target, ast.Attribute)
-                    and target.attr in _CUDA_TIMER_WRITE_NAMES
-                ):
-                    if is_event_class(target.value):
-                        flag("torch.cuda.Event", target.attr)
-                    elif is_torch_cuda(target.value):
-                        flag("torch.cuda", target.attr)
+        def clear_name(self, name: str) -> None:
+            self.torch_aliases.discard(name)
+            self.cuda_aliases.discard(name)
+            self.event_aliases.discard(name)
+            self.str_vars.pop(name, None)
+
+    class TimerAliasVisitor(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.scope = ScopeState()
+
+        def is_torch_module(self, expr: ast.AST | None) -> bool:
+            return isinstance(expr, ast.Name) and expr.id in self.scope.torch_aliases
+
+        def is_torch_cuda(self, expr: ast.AST | None) -> bool:
+            if (
+                isinstance(expr, ast.Attribute)
+                and expr.attr == "cuda"
+                and self.is_torch_module(expr.value)
+            ):
+                return True
+            if (
+                isinstance(expr, ast.Call)
+                and isinstance(expr.func, ast.Name)
+                and expr.func.id == "getattr"
+                and len(expr.args) >= 2
+                and self.is_torch_module(expr.args[0])
+                and _static_string(expr.args[1]) == "cuda"
+            ):
+                return True
+            return isinstance(expr, ast.Name) and expr.id in self.scope.cuda_aliases
+
+        def is_event_class(self, expr: ast.AST | None) -> bool:
+            if (
+                isinstance(expr, ast.Attribute)
+                and expr.attr == "Event"
+                and self.is_torch_cuda(expr.value)
+            ):
+                return True
+            if (
+                isinstance(expr, ast.Call)
+                and isinstance(expr.func, ast.Name)
+                and expr.func.id == "getattr"
+                and len(expr.args) >= 2
+                and self.is_torch_cuda(expr.args[0])
+                and _static_string(expr.args[1]) == "Event"
+            ):
+                return True
+            return isinstance(expr, ast.Name) and expr.id in self.scope.event_aliases
+
+        def resolve_name(self, expr: ast.AST | None) -> Optional[str]:
+            direct = _static_string(expr)
+            if direct is not None:
+                return direct
+            if isinstance(expr, ast.Name):
+                return self.scope.str_vars.get(expr.id)
+            return None
+
+        def bind_name(self, name: str, value: ast.AST | None) -> None:
+            if self.is_event_class(value):
+                self.scope.clear_name(name)
+                self.scope.event_aliases.add(name)
+                return
+            if self.is_torch_cuda(value):
+                self.scope.clear_name(name)
+                self.scope.cuda_aliases.add(name)
+                return
+            if self.is_torch_module(value):
+                self.scope.clear_name(name)
+                self.scope.torch_aliases.add(name)
+                return
+
+            folded = _static_string(value)
+            self.scope.clear_name(name)
+            if folded is not None:
+                self.scope.str_vars[name] = folded
+
+        def bind_target(self, target: ast.AST, value: ast.AST | None) -> None:
+            if isinstance(target, ast.Name):
+                self.bind_name(target.id, value)
+            elif isinstance(target, (ast.Tuple, ast.List)):
+                for elt in target.elts:
+                    self.bind_target(elt, None)
+            elif isinstance(target, ast.Starred):
+                self.bind_target(target.value, None)
+
+        def visit_Import(self, node: ast.Import) -> None:
+            for alias in node.names:
+                local = alias.asname or alias.name.split(".")[0]
+                if alias.name == "torch":
+                    self.scope.clear_name(local)
+                    self.scope.torch_aliases.add(local)
+                elif alias.name == "torch.cuda":
+                    self.scope.clear_name(local)
+                    if alias.asname:
+                        self.scope.cuda_aliases.add(local)
+                    else:
+                        self.scope.torch_aliases.add("torch")
+
+        def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+            for alias in node.names:
+                local = alias.asname or alias.name
+                if node.module == "torch" and alias.name == "cuda":
+                    self.scope.clear_name(local)
+                    self.scope.cuda_aliases.add(local)
+                elif node.module == "torch.cuda" and alias.name == "Event":
+                    self.scope.clear_name(local)
+                    self.scope.event_aliases.add(local)
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            self._visit_child_scope(node)
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            self._visit_child_scope(node)
+
+        def _visit_child_scope(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+            outer = self.scope
+            self.scope = ScopeState(outer)
+            for stmt in node.body:
+                self.visit(stmt)
+            self.scope = outer
+
+        def visit_Assign(self, node: ast.Assign) -> None:
+            for target in node.targets:
+                self._check_assignment_target(target)
+            for target in node.targets:
+                self.bind_target(target, node.value)
+            self.visit(node.value)
+
+        def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+            self._check_assignment_target(node.target)
+            self.bind_target(node.target, node.value)
+            if node.value is not None:
+                self.visit(node.value)
+
+        def visit_AugAssign(self, node: ast.AugAssign) -> None:
+            self._check_assignment_target(node.target)
+            self.bind_target(node.target, None)
+            self.visit(node.value)
+
+        def _check_assignment_target(self, target: ast.AST) -> None:
+            if (
+                isinstance(target, ast.Attribute)
+                and target.attr in _CUDA_TIMER_WRITE_NAMES
+            ):
+                if self.is_event_class(target.value):
+                    flag("torch.cuda.Event", target.attr)
+                elif self.is_torch_cuda(target.value):
+                    flag("torch.cuda", target.attr)
+
+        def visit_Call(self, node: ast.Call) -> None:
+            if (
+                isinstance(node.func, ast.Name)
+                and node.func.id == "setattr"
+                and len(node.args) >= 3
+            ):
+                name = self.resolve_name(node.args[1])
+                if name in _CUDA_TIMER_WRITE_NAMES:
+                    base = node.args[0]
+                    if self.is_event_class(base):
+                        flag("torch.cuda.Event", name)
+                    elif self.is_torch_cuda(base):
+                        flag("torch.cuda", name)
+            self.generic_visit(node)
+
+    TimerAliasVisitor().visit(tree)
 
     return matches
 
@@ -3596,6 +3671,13 @@ def _expr_is_frame_derived(expr: ast.AST | None, frame_aliases: set[str]) -> boo
         return False
     if isinstance(expr, ast.Name):
         return expr.id in frame_aliases
+    if (
+        isinstance(expr, ast.Call)
+        and isinstance(expr.func, ast.Attribute)
+        and expr.func.attr == "copy"
+        and _expr_is_frame_derived(expr.func.value, frame_aliases)
+    ):
+        return False
     return any(
         isinstance(sub, ast.Attribute) and sub.attr in ("f_globals", "f_locals")
         for sub in ast.walk(expr)
@@ -3605,6 +3687,46 @@ def _expr_is_frame_derived(expr: ast.AST | None, frame_aliases: set[str]) -> boo
 def _positional_params(fn: "ast.FunctionDef | ast.AsyncFunctionDef") -> list[str]:
     """Positional parameter names of a FunctionDef, in call order."""
     return [arg.arg for arg in (list(fn.args.posonlyargs) + list(fn.args.args))]
+
+
+def _function_param_names(fn: "ast.FunctionDef | ast.AsyncFunctionDef") -> set[str]:
+    return {
+        arg.arg
+        for arg in (
+            list(fn.args.posonlyargs)
+            + list(fn.args.args)
+            + list(fn.args.kwonlyargs)
+        )
+    }
+
+
+def _call_frame_tainted_params(
+    call: ast.Call,
+    fn: "ast.FunctionDef | ast.AsyncFunctionDef",
+    frame_aliases: set[str],
+) -> set[str]:
+    tainted: set[str] = set()
+    positional = _positional_params(fn)
+    all_params = _function_param_names(fn)
+    for idx, arg in enumerate(call.args):
+        if idx >= len(positional):
+            break  # *args spillover -- cannot map positionally
+        if _expr_is_frame_derived(arg, frame_aliases):
+            tainted.add(positional[idx])
+    for keyword in call.keywords:
+        if keyword.arg in all_params and _expr_is_frame_derived(keyword.value, frame_aliases):
+            tainted.add(keyword.arg)
+    return tainted
+
+
+def _module_local_functions(tree: ast.AST) -> dict[str, "ast.FunctionDef | ast.AsyncFunctionDef"]:
+    if not isinstance(tree, ast.Module):
+        return {}
+    return {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
 
 
 def _frame_arg_taint_mutation(tree: ast.AST, frame_aliases: set[str]) -> bool:
@@ -3620,11 +3742,7 @@ def _frame_arg_taint_mutation(tree: ast.AST, frame_aliases: set[str]) -> bool:
         g = sys._getframe(1).f_globals
         _mutate(g, "calculate_stats", wrapper)   # frame dict passed as ARG
     """
-    functions: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {
-        node.name: node
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    }
+    functions = _module_local_functions(tree)
     if not functions:
         return False
 
@@ -3636,12 +3754,9 @@ def _frame_arg_taint_mutation(tree: ast.AST, frame_aliases: set[str]) -> bool:
         callee = functions.get(node.func.id)
         if callee is None:
             continue
-        params = _positional_params(callee)
-        for idx, arg in enumerate(node.args):
-            if idx >= len(params):
-                break  # *args spillover -- cannot map positionally
-            if _expr_is_frame_derived(arg, frame_aliases):
-                tainted_params.setdefault(callee.name, set()).add(params[idx])
+        tainted = _call_frame_tainted_params(node, callee, frame_aliases)
+        if tainted:
+            tainted_params.setdefault(callee.name, set()).update(tainted)
 
     if not tainted_params:
         return False
@@ -3649,9 +3764,10 @@ def _frame_arg_taint_mutation(tree: ast.AST, frame_aliases: set[str]) -> bool:
     for name, params in tainted_params.items():
         fn = functions[name]
         for sub in ast.walk(fn):
-            if not isinstance(sub, ast.Assign):
+            if not isinstance(sub, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
                 continue
-            for target in sub.targets:
+            targets = sub.targets if isinstance(sub, ast.Assign) else [sub.target]
+            for target in targets:
                 if (
                     isinstance(target, ast.Subscript)
                     and isinstance(target.value, ast.Name)
@@ -3671,37 +3787,29 @@ def detect_introspection_exploit(code: str | SubmissionFacts) -> list[dict]:
     matches = []
     seen_patterns: set[str] = set()
     frame_namespace_aliases: set[str] = set()
-    helper_frame_namespace_params: dict[str, set[int]] = {}
+    helper_frame_namespace_params: dict[str, set[str]] = {}
     saw_frame_access = False
     saw_frame_mutation = False
-    function_defs = [
-        node for node in ast.walk(tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    ]
+    module_functions = _module_local_functions(tree)
+    function_defs = list(module_functions.values())
 
     def expr_has_frame_namespace(expr: ast.AST | None) -> bool:
-        if expr is None:
-            return False
-        if isinstance(expr, ast.Name) and expr.id in frame_namespace_aliases:
-            return True
-        return any(
-            isinstance(sub, ast.Attribute) and sub.attr in ("f_globals", "f_locals")
-            for sub in ast.walk(expr)
-        )
+        return _expr_is_frame_derived(expr, frame_namespace_aliases)
 
     for fn in function_defs:
-        param_positions = {arg.arg: idx for idx, arg in enumerate(fn.args.args)}
-        mutated_params: set[int] = set()
+        param_names = _function_param_names(fn)
+        mutated_params: set[str] = set()
         for child in ast.walk(fn):
-            if not isinstance(child, ast.Assign):
+            if not isinstance(child, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
                 continue
-            for target in child.targets:
+            targets = child.targets if isinstance(child, ast.Assign) else [child.target]
+            for target in targets:
                 if (
                     isinstance(target, ast.Subscript)
                     and isinstance(target.value, ast.Name)
-                    and target.value.id in param_positions
+                    and target.value.id in param_names
                 ):
-                    mutated_params.add(param_positions[target.value.id])
+                    mutated_params.add(target.value.id)
         if mutated_params:
             helper_frame_namespace_params[fn.name] = mutated_params
 
@@ -3711,14 +3819,7 @@ def detect_introspection_exploit(code: str | SubmissionFacts) -> list[dict]:
             for target in node.targets:
                 if not isinstance(target, ast.Name):
                     continue
-                value = node.value
-                if (isinstance(value, ast.Attribute) and value.attr in ("f_globals", "f_locals")) or (
-                    isinstance(value, ast.Subscript)
-                    and any(
-                        isinstance(sub, ast.Attribute) and sub.attr in ("f_globals", "f_locals")
-                        for sub in ast.walk(value.value)
-                    )
-                ):
+                if expr_has_frame_namespace(node.value):
                     frame_namespace_aliases.add(target.id)
 
         # inspect.currentframe() / inspect.stack()
@@ -3732,11 +3833,11 @@ def detect_introspection_exploit(code: str | SubmissionFacts) -> list[dict]:
                     saw_frame_access = True
 
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-            mutated_positions = helper_frame_namespace_params.get(node.func.id)
-            if mutated_positions:
-                for idx in mutated_positions:
-                    if idx < len(node.args) and expr_has_frame_namespace(node.args[idx]):
-                        saw_frame_mutation = True
+            mutated_params = helper_frame_namespace_params.get(node.func.id)
+            callee = module_functions.get(node.func.id)
+            if mutated_params and callee is not None:
+                if _call_frame_tainted_params(node, callee, frame_namespace_aliases) & mutated_params:
+                    saw_frame_mutation = True
 
         # f_back, f_globals, f_locals attribute access
         if isinstance(node, ast.Attribute) and node.attr in ("f_back", "f_globals", "f_locals"):
