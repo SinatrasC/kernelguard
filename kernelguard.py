@@ -2426,6 +2426,356 @@ def detect_value_keyed_output_replay(code: str | SubmissionFacts) -> list[dict]:
     return []
 
 
+def detect_content_signature_output_replay(code: str | SubmissionFacts) -> list[dict]:
+    """Detect output replay keyed by host materialized input-value signatures.
+
+    This targets replay caches such as:
+        sig = (tuple(x.shape), tuple(x.flatten()[::k].tolist()))
+        for old_sig, q, l in solved:
+            if old_sig == sig:
+                return q, l
+        q, l = torch.linalg.eigh(x)
+        solved.append((sig, q, l))
+
+    The rule requires the full replay shape: input-derived host signature,
+    persistent store iteration, equality guard, cached-output return, and a later
+    append/store of newly computed outputs. That keeps ordinary value dispatch
+    and compile/preprocess caches out of the hard-filter path.
+    """
+    facts = ensure_submission_facts(code)
+    tree = facts.ast_tree
+    if tree is None or facts.entrypoint_name is None:
+        return []
+
+    function_defs: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {
+        node.name: node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    entrypoint = function_defs.get(facts.entrypoint_name)
+    if entrypoint is None:
+        return []
+
+    persistent_stores: set[str] = set()
+    for stmt in tree.body:
+        if not isinstance(stmt, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
+        value = stmt.value
+        is_store = isinstance(value, (ast.List, ast.Dict, ast.Set))
+        is_store = is_store or (
+            isinstance(value, ast.Call)
+            and _ast_dotted_name(value.func) in {"list", "dict", "set", "collections.deque", "deque"}
+        )
+        if is_store:
+            for target in targets:
+                persistent_stores.update(_target_names(target))
+
+    if not persistent_stores:
+        return []
+
+    def _reachable_functions() -> set[str]:
+        reachable = {facts.entrypoint_name}
+        pending = [facts.entrypoint_name]
+        while pending:
+            current = pending.pop()
+            fn = function_defs.get(current)
+            if fn is None:
+                continue
+            for call in ast.walk(fn):
+                if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Name):
+                    continue
+                callee = call.func.id
+                if callee in function_defs and callee not in reachable:
+                    reachable.add(callee)
+                    pending.append(callee)
+        return reachable
+
+    def _host_materializes_tensor(expr: ast.AST | None) -> bool:
+        if expr is None:
+            return False
+        for call in ast.walk(expr):
+            if (
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and call.func.attr in {"tolist", "item", "numpy"}
+            ):
+                return True
+        return False
+
+    def _input_derived_names(fn: ast.FunctionDef | ast.AsyncFunctionDef, input_names: set[str]) -> set[str]:
+        derived = set(input_names)
+        for stmt in _iter_non_nested_nodes(fn):
+            if not isinstance(stmt, (ast.Assign, ast.AnnAssign)):
+                continue
+            targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
+            value = stmt.value
+            if _expr_names(value) & derived:
+                for target in targets:
+                    derived.update(_target_names(target))
+        return derived
+
+    def _returns_input_host_signature(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+        input_names = _function_input_names(fn)
+        if not input_names:
+            return False
+        derived = _input_derived_names(fn, input_names)
+        for stmt in _iter_non_nested_nodes(fn):
+            if isinstance(stmt, ast.Return) and stmt.value is not None:
+                if _host_materializes_tensor(stmt.value) and (_expr_names(stmt.value) & derived):
+                    return True
+        return False
+
+    signature_helpers = {
+        name
+        for name in _reachable_functions()
+        if name in function_defs and _returns_input_host_signature(function_defs[name])
+    }
+
+    entry_inputs = _function_input_names(entrypoint)
+    entry_derived = _input_derived_names(entrypoint, entry_inputs)
+    signature_vars: set[str] = set()
+
+    for stmt in _iter_non_nested_nodes(entrypoint):
+        if not isinstance(stmt, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
+        value = stmt.value
+        assigned: set[str] = set()
+        for target in targets:
+            assigned.update(_target_names(target))
+
+        direct_signature = _host_materializes_tensor(value) and bool(_expr_names(value) & entry_derived)
+        helper_signature = (
+            isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Name)
+            and value.func.id in signature_helpers
+            and any(_expr_names(arg) & entry_derived for arg in value.args)
+        )
+        if direct_signature or helper_signature:
+            signature_vars.update(assigned)
+            entry_derived.update(assigned)
+
+    if not signature_vars:
+        return []
+
+    computed_output_vars: set[str] = set()
+    for stmt in _iter_non_nested_nodes(entrypoint):
+        if not isinstance(stmt, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
+        value = stmt.value
+        if not isinstance(value, ast.Call):
+            continue
+        if _host_materializes_tensor(value):
+            continue
+        if not (_expr_names(value) & entry_derived):
+            continue
+        assigned: set[str] = set()
+        for target in targets:
+            assigned.update(_target_names(target))
+        computed_output_vars.update(assigned - signature_vars - entry_inputs)
+
+    def _guard_compares_signature(expr: ast.AST | None, stored_key_names: set[str]) -> bool:
+        if expr is None:
+            return False
+        for cmp_node in ast.walk(expr):
+            if not isinstance(cmp_node, ast.Compare):
+                continue
+            if not any(isinstance(op, ast.Eq) for op in cmp_node.ops):
+                continue
+            left_names = _expr_names(cmp_node.left)
+            for comparator in cmp_node.comparators:
+                right_names = _expr_names(comparator)
+                if (
+                    (left_names & stored_key_names and right_names & signature_vars)
+                    or (right_names & stored_key_names and left_names & signature_vars)
+                ):
+                    return True
+        return False
+
+    def _body_returns_cached_outputs(body: list[ast.stmt], cached_output_names: set[str]) -> bool:
+        for stmt in body:
+            for nested in ast.walk(stmt):
+                if isinstance(nested, ast.Return) and nested.value is not None:
+                    if _expr_names(nested.value) & cached_output_names:
+                        return True
+        return False
+
+    replay_hit_outputs: set[str] = set()
+    replay_store_names: set[str] = set()
+
+    for loop in ast.walk(entrypoint):
+        if not isinstance(loop, ast.For):
+            continue
+        store_name = _ast_root_name(loop.iter)
+        if store_name not in persistent_stores:
+            continue
+        if not isinstance(loop.target, (ast.Tuple, ast.List)) or len(loop.target.elts) < 2:
+            continue
+        stored_key_names = _target_names(loop.target.elts[0])
+        cached_output_names: set[str] = set()
+        for elt in loop.target.elts[1:]:
+            cached_output_names.update(_target_names(elt))
+        if not stored_key_names or not cached_output_names:
+            continue
+        for if_node in ast.walk(loop):
+            if not isinstance(if_node, ast.If):
+                continue
+            if _guard_compares_signature(if_node.test, stored_key_names) and _body_returns_cached_outputs(if_node.body, cached_output_names):
+                replay_store_names.add(store_name)
+                replay_hit_outputs.update(cached_output_names)
+
+    if not replay_store_names or not replay_hit_outputs:
+        return []
+
+    def _append_payload(call: ast.Call) -> ast.AST | None:
+        if (
+            isinstance(call.func, ast.Attribute)
+            and call.func.attr in {"append", "extend", "insert"}
+            and _ast_root_name(call.func.value) in replay_store_names
+            and call.args
+        ):
+            return call.args[-1] if call.func.attr == "insert" and len(call.args) >= 2 else call.args[0]
+        return None
+
+    def _payload_stores_signature_and_outputs(payload: ast.AST | None) -> bool:
+        if payload is None:
+            return False
+        if isinstance(payload, (ast.Tuple, ast.List)) and payload.elts:
+            first_names = _expr_names(payload.elts[0])
+            rest_names: set[str] = set()
+            for elt in payload.elts[1:]:
+                rest_names.update(_expr_names(elt))
+            return bool(first_names & signature_vars and rest_names & computed_output_vars)
+        names = _expr_names(payload)
+        return bool(names & signature_vars and names & computed_output_vars)
+
+    stores_new_outputs = False
+    for node in ast.walk(entrypoint):
+        if isinstance(node, ast.Call) and _payload_stores_signature_and_outputs(_append_payload(node)):
+            stores_new_outputs = True
+            break
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Subscript) and _ast_root_name(target) in replay_store_names:
+                    if _payload_stores_signature_and_outputs(node.value):
+                        stores_new_outputs = True
+                        break
+        if stores_new_outputs:
+            break
+
+    if not stores_new_outputs:
+        return []
+
+    return [{
+        "pattern": "OUTPUT_REPLAY_CACHE",
+        "severity": "critical",
+        "evidence": (
+            "Content-signature output replay: input-derived host signature "
+            f"{sorted(signature_vars)} indexes persistent store {sorted(replay_store_names)} "
+            "and returns cached tensor outputs"
+        ),
+    }]
+
+
+def detect_inline_cpp_harness_patching(code: str | SubmissionFacts) -> list[dict]:
+    """Detect Python harness/frame mutation hidden in load_inline C++ strings."""
+    facts = ensure_submission_facts(code)
+    tree = facts.ast_tree
+    if tree is None:
+        return []
+
+    string_aliases: dict[str, str] = {}
+    load_inline_names = {"load_inline"}
+    load_inline_aliases = {"torch.utils.cpp_extension.load_inline"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "torch.utils.cpp_extension":
+            for alias in node.names:
+                if alias.name == "load_inline":
+                    load_inline_names.add(alias.asname or alias.name)
+        elif isinstance(node, ast.Assign) and isinstance(node.value, ast.Name) and node.value.id in load_inline_names:
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    load_inline_names.add(target.id)
+
+        if not isinstance(node, ast.Assign):
+            continue
+        static_value = _static_string(node.value)
+        if static_value is None:
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                string_aliases[target.id] = static_value
+
+    def _strings_from_expr(expr: ast.AST | None) -> list[str]:
+        static_value = _static_string(expr)
+        if static_value is not None:
+            return [static_value]
+        if isinstance(expr, ast.Name) and expr.id in string_aliases:
+            return [string_aliases[expr.id]]
+        if isinstance(expr, (ast.List, ast.Tuple)):
+            out: list[str] = []
+            for elt in expr.elts:
+                out.extend(_strings_from_expr(elt))
+            return out
+        return []
+
+    sources: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        dotted = _ast_dotted_name(node.func)
+        if dotted not in load_inline_names and dotted not in load_inline_aliases:
+            continue
+        if len(node.args) >= 2:
+            sources.extend(_strings_from_expr(node.args[1]))
+        for keyword in node.keywords:
+            if keyword.arg in {"cpp_sources", "cuda_sources", "sources"}:
+                sources.extend(_strings_from_expr(keyword.value))
+
+    matches: list[dict] = []
+    for source in sources:
+        has_python_c_api = bool(re.search(
+            r'\bPy(?:Object|Dict|Mapping|Import|Eval|Frame|Run|Sys|GILState)_',
+            source,
+        ))
+        if not has_python_c_api:
+            continue
+
+        has_mutation_api = bool(re.search(
+            r'\b(?:PyObject_SetAttrString|PyObject_SetItem|PyDict_SetItem(?:String)?|'
+            r'PyMapping_SetItemString|PyRun_SimpleString)\b',
+            source,
+        ))
+        has_frame_api = bool(re.search(r'\b(?:PyEval_GetFrame|PyFrame_|f_globals|f_locals)\b', source))
+        has_harness_target = bool(re.search(
+            r'\b(?:time_kernel|calculate_stats|clear_l2_cache|_clone_data|benchmark|popcorn|kernelbot|main)\b'
+            r'|["\'](?:modules|__main__|main|time_kernel|calculate_stats|clear_l2_cache|_clone_data)["\']',
+            source,
+        ))
+        has_module_lookup = bool(re.search(
+            r'\b(?:PyImport_ImportModule|PySys_GetObject|PyMapping_GetItemString|PyDict_GetItemString)\b'
+            r'|["\'](?:sys|modules|__main__|main)["\']',
+            source,
+        ))
+
+        if has_frame_api and has_mutation_api:
+            matches.append({
+                "pattern": "FRAME_WALK_MUTATION",
+                "severity": "critical",
+                "evidence": "load_inline C++ source uses Python frame API with mutation calls",
+            })
+        elif has_mutation_api and has_module_lookup and has_harness_target:
+            matches.append({
+                "pattern": "HARNESS_RUNTIME_PATCHING",
+                "severity": "critical",
+                "evidence": "load_inline C++ source uses Python C API to mutate harness/module state",
+            })
+
+    return matches
+
+
 def detect_cuda_graph_replay(code: str | SubmissionFacts) -> list[dict]:
     """Pattern 7: CUDA graph replay via ctypes libcudart."""
     facts = ensure_submission_facts(code)
@@ -8483,6 +8833,8 @@ CODE_DETECTORS = [
     detect_result_caching,
     detect_helper_output_replay_cache,
     detect_value_keyed_output_replay,
+    detect_content_signature_output_replay,
+    detect_inline_cpp_harness_patching,
     detect_object_output_cache_replay,
     detect_last_call_replay,
     detect_first_call_state_replay,
@@ -8546,6 +8898,8 @@ BASE_DETECTOR_SPECS = [
     ("result_caching", detect_result_caching),
     ("helper_output_replay_cache", detect_helper_output_replay_cache),
     ("value_keyed_output_replay", detect_value_keyed_output_replay),
+    ("content_signature_output_replay", detect_content_signature_output_replay),
+    ("inline_cpp_harness_patching", detect_inline_cpp_harness_patching),
     ("object_output_cache_replay", detect_object_output_cache_replay),
     ("last_call_replay", detect_last_call_replay),
     ("first_call_state_replay", detect_first_call_state_replay),
