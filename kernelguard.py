@@ -111,11 +111,40 @@ RE_CACHE_GET_ASSIGN = re.compile(
 # "return cache[...]" but exclude compiled-kernel / module caches (legitimate)
 RE_RETURN_CACHE_INDEX = re.compile(
     r'return\s+(?!_?(?:compiled|kernel|module|func|op)_?\w*cache)'
-    r'\w*(?:cache|reuse)\w*\s*\[',
+    r'(?P<cache>\w*(?:cache|reuse)\w*)\s*\[',
     re.IGNORECASE,
 )
 RE_CACHE_STORE_OUTPUT = re.compile(
     r'\w*(?:cache|reuse)\w*\s*\[[^\]]+\]\s*=\s*(?:result|output|out|c_ref)\b',
+    re.IGNORECASE,
+)
+# Cache populated by a `.compile(...)` method call — stores a compiled
+# callable (not an output tensor), so a subsequent `return cache[key]`
+# returns the callable, not a result. Recognizes the standard tile-DSL
+# compile-cache idiom used by TileLang / Triton / CuTeDSL / Pallas:
+#
+#     _KERNEL_CACHE[(M, N, K)] = my_kernel.compile(M=M, N=N, K=K, ...)
+#     _KCACHE[key] = _gemm.compile(...)
+#
+# Variable-name allowlists (e.g. RE_RETURN_CACHE_INDEX's
+# `compiled|kernel|module|func|op` prefix list) miss abbreviated names
+# (e.g. `_KCACHE`, `_CCACHE`, `_TILECACHE`); checking the RHS of the
+# store is more robust because the *value* in the cache is what
+# distinguishes legitimate compile-cache from output replay.
+#
+# Deliberately matches only the `.compile(` method-call form, not a
+# function-call form like `_compile_kernel(out)` — the latter is too
+# easy to forge with an identity passthrough (e.g. attacker defines
+# `_compile_passthrough(x): return x` and writes
+# `_CACHE[key] = _compile_passthrough(output)`). The method-call form
+# requires the cached value to actually have a `.compile()` attribute,
+# which PyTorch tensors do not.
+# Whitespace tolerance: callers apply this against strip_python_strings_and_comments(...)
+# which emits a space between tokens, so source `_gemm.compile(` becomes
+# `_gemm . compile (`. The `\s*` around the `.` covers both forms.
+RE_CACHE_STORES_COMPILED_CALLABLE = re.compile(
+    r'(?P<cache>\w*(?:cache|reuse)\w*)\s*\[[^\]]+\]\s*=\s*'
+    r'[^=\n]*?\s*\.\s*compile\s*\(',
     re.IGNORECASE,
 )
 RE_CPP_CACHE_FAST_RETURN = re.compile(
@@ -217,6 +246,119 @@ def strip_python_comments(code: str) -> str:
     except (tokenize.TokenError, IndentationError, SyntaxError):
         return code
     return tokenize.untokenize(tokens)
+
+
+def strip_python_strings_and_comments(code: str) -> str:
+    """Replace Python COMMENT and STRING tokens with same-length whitespace.
+
+    Used to defeat string-literal / comment decoys: an attacker can plant
+    text matching a legitimate-looking pattern inside a docstring or a
+    `NOTE = "..."` constant to flip a detector signal. Most detectors
+    operate on `python_active` (which strips comments only) — when a
+    detector needs to be robust against in-string decoys, run it against
+    this stripped form instead.
+
+    Preserves line/column offsets so error messages stay roughly intact.
+    Falls back to the original code on tokenize / syntax errors."""
+    try:
+        out = []
+        for tok in tokenize.generate_tokens(io.StringIO(code).readline):
+            if tok.type in (tokenize.COMMENT, tokenize.STRING):
+                out.append(" " * len(tok.string))
+            elif tok.type in (
+                tokenize.NL, tokenize.NEWLINE,
+                tokenize.INDENT, tokenize.DEDENT,
+                tokenize.ENCODING, tokenize.ENDMARKER,
+            ):
+                if tok.type in (tokenize.NL, tokenize.NEWLINE):
+                    out.append("\n")
+            else:
+                out.append(tok.string)
+                out.append(" ")
+        return "".join(out)
+    except (tokenize.TokenError, IndentationError, SyntaxError, ValueError):
+        return code
+
+
+def _compiled_callable_cache_names(scope: str) -> set[str]:
+    outputish_names = {"result", "output", "out", "c_ref"}
+
+    try:
+        tree = ast.parse(scope)
+    except SyntaxError:
+        stripped = strip_python_strings_and_comments(scope)
+        names: set[str] = set()
+        for match in RE_CACHE_STORES_COMPILED_CALLABLE.finditer(stripped):
+            rhs = match.group(0).split("=", 1)[-1]
+            if not re.search(r'\b(?:result|output|out|c_ref)\b', rhs, re.IGNORECASE):
+                names.add(match.group("cache").lower())
+        return names
+
+    local_compile_classes = {
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ClassDef)
+        and any(
+            isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and item.name == "compile"
+            for item in node.body
+        )
+    }
+    local_compile_instances: set[str] = set()
+    outputish_instances: set[str] = set()
+    compiled_caches: set[str] = set()
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if (
+                    isinstance(target, ast.Name)
+                    and isinstance(node.value, ast.Call)
+                    and isinstance(node.value.func, ast.Name)
+                    and node.value.func.id in local_compile_classes
+                ):
+                    local_compile_instances.add(target.id)
+                if (
+                    isinstance(target, ast.Name)
+                    and isinstance(node.value, ast.Call)
+                    and (_expr_names(node.value) & outputish_names)
+                ):
+                    outputish_instances.add(target.id)
+
+    def is_safe_compile_call(expr: ast.AST) -> bool:
+        if not (
+            isinstance(expr, ast.Call)
+            and isinstance(expr.func, ast.Attribute)
+            and expr.func.attr == "compile"
+        ):
+            return False
+        if _expr_names(expr) & outputish_names:
+            return False
+        receiver = expr.func.value
+        if (
+            isinstance(receiver, ast.Call)
+            and isinstance(receiver.func, ast.Name)
+            and receiver.func.id in local_compile_classes
+        ):
+            return False
+        if isinstance(receiver, ast.Name) and receiver.id in local_compile_instances:
+            return False
+        if isinstance(receiver, ast.Name) and receiver.id in outputish_instances:
+            return False
+        return True
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        if not is_safe_compile_call(node.value):
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Subscript):
+                root = _ast_root_name(target.value)
+                if root and re.search(r'(?:cache|reuse)', root, re.IGNORECASE):
+                    compiled_caches.add(root.lower())
+
+    return compiled_caches
 
 
 def extract_function_block(code: str, func_name: str) -> str:
@@ -1768,8 +1910,28 @@ def detect_result_caching(code: str | SubmissionFacts) -> list[dict]:
         workspace_signals.append("id(data) cache key")
     if RE_DATA_PTR_CACHE_KEY.search(cache_scope):
         workspace_signals.append("data_ptr() cache key")
-    if RE_RETURN_CACHE_INDEX.search(cache_scope):
-        output_replay_signals.append("direct return from cache[...]")
+    returned_caches = [
+        match.group("cache").lower()
+        for match in RE_RETURN_CACHE_INDEX.finditer(cache_scope)
+    ]
+    if returned_caches:
+        # Suppress when the cache provably stores a compiled callable rather
+        # than an output tensor — `cache[key] = factory.compile(...)` is the
+        # standard tile-DSL compile-cache idiom (TileLang, Triton, CuTeDSL,
+        # Pallas). The subsequent `return cache[key]` returns the callable,
+        # not a cached result, so it isn't output replay. See
+        # RE_CACHE_STORES_COMPILED_CALLABLE for the rationale on why the
+        # method-call form is the only one allowlisted (forgery resistance).
+        #
+        # Strip strings AND comments from the scope before matching: an
+        # attacker can plant a decoy `_CACHE[key] = foo.compile(...)`
+        # inside a module-level docstring / constant string to enable
+        # suppression while keeping a real output-replay cache in the
+        # active code. cache_scope is already comment-stripped via
+        # strip_python_comments; this adds string-literal stripping.
+        compiled_caches = _compiled_callable_cache_names(cache_scope)
+        if any(cache_name not in compiled_caches for cache_name in returned_caches):
+            output_replay_signals.append("direct return from cache[...]")
     if stores_output and output_replay_signals:
         output_replay_signals.append("cache[...] stores output/result tensor")
     elif stores_output:
